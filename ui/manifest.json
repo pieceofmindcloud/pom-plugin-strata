@@ -1,0 +1,41 @@
+{
+  "schema": "pom-plugin-ui/v1",
+  "plugin_code": "strata",
+  "description": {
+    "en": "Runs a whole Qwen3.8-Flash-Next model (architecture qwen4exp) on this machine with the Strata engine instead of llama.cpp: deploy it with the Strata inference service and the POM pipeline sends prompts to Strata, on one or more GPUs of this machine. Includes Strata's live GPU and speed monitor.",
+    "pt-BR": "Executa um modelo Qwen3.8-Flash-Next inteiro (arquitetura qwen4exp) nesta máquina com o motor Strata no lugar do llama.cpp: implante com o serviço de inferência Strata e a pipeline do POM manda os prompts ao Strata, em uma ou mais placas desta máquina. Inclui o monitor de GPU e velocidade do Strata em tempo real."
+  },
+  "documentation": {
+    "guides": [
+      {
+        "id": "overview",
+        "title": { "en": "Strata in POM", "pt-BR": "Strata no POM" },
+        "asset": "docs/README.md"
+      }
+    ],
+    "reference": []
+  },
+  "menu": [
+    {
+      "id": "strata",
+      "label": { "en": "Strata", "pt-BR": "Strata" },
+      "icon": "cpu",
+      "to": "/status",
+      "roles": ["admin"],
+      "children": [
+        { "id": "status", "label": { "en": "Status", "pt-BR": "Estado" }, "icon": "gauge", "to": "/status" },
+        { "id": "monitor", "label": { "en": "Monitor", "pt-BR": "Monitor" }, "icon": "activity", "to": "/monitor" }
+      ]
+    }
+  ],
+  "routes": [
+    { "path": "/status", "screen": "status", "roles": ["admin"] },
+    { "path": "/monitor", "screen": "monitor", "full_bleed": true, "roles": ["admin"] }
+  ],
+  "screens": {
+    "status": { "module": "ui/screens.js", "export": "status", "styles": ["ui/plugin.css"] },
+    "monitor": { "module": "ui/screens.js", "export": "monitor", "styles": ["ui/plugin.css"] }
+  },
+  "i18n": { "en": "i18n/en.json", "pt-BR": "i18n/pt-BR.json" },
+  "assets": ["ui/screens.js", "ui/plugin.css", "i18n/en.json", "i18n/pt-BR.json", "docs/README.md"]
+}

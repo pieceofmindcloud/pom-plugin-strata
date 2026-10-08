@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "plugin_code": "strata",
+  "plugin_abi": 1,
+  "feature_set": ["strata.inference"]
+}

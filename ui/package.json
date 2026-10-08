@@ -1,0 +1,15 @@
+{
+  "name": "pom-plugin-strata-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Embedded UI of the POM Strata plugin.",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  }
+}

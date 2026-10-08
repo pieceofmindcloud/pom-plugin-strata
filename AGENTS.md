@@ -1,0 +1,14 @@
+# Project agent memory
+
+- The plugin never edits Strata's sources. `strata.lock` pins the commit; `cmake/pom-static-cuda.cmake` (passed with `-DCMAKE_PROJECT_INCLUDE`) swaps CUDA::cudart/cublas/cublasLt for the static libraries, and `runtime/pom_strata_server.py` adds `/pom/generate` by wrapping `serve.server.make_handler`. Keep both outside Strata's tree.
+- The engine must link no CUDA shared library (`docker/build-runtime-in-container.sh` refuses it): a POM node image only has the driver. Build the runtime in the POM's own CUDA image (`docker/runtime.Dockerfile`); the Python packages target the node image's Python 3.12.
+- `query` must return at once. Every child process (pack tool, Strata's server) is started from the manager thread in `src/engine.rs`, in its own process group with the parent-death signal; starting one from a short-lived thread would kill it when that thread ends.
+- The plugin host uses its own stdin/stdout for IPC: children get `Stdio::null()` and write to `<plugin dir>/run/strata-server.log`.
+- `engine.*` operations are for the local POM node only; the API key leaves the library only through `engine.upstream` and is never in `rpc.status`, `host.services`, logs or the screens. `src/proxy.rs` adds it on the way to Strata and drops the browser's credentials, `Origin` and `Referer`.
+- The generation contract with the POM gateway (`/pom/generate`, NDJSON `t`/`p`/`done`/`error`, reasoning inside `<think>`) is documented in the POM repository, `docs/subsystems/inference.md` section 7.1. Change both sides together.
+- `ui/src/host/runtime.ts` is the only place that touches `__POM_HOST__`. Class names use the `pb-` prefix, which `ui/build.mjs` renames to the plugin code.
+- Checks: `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `scripts/build-ui.sh`. A runtime change: `scripts/build-runtime.sh`, then run `runtime/pom_strata_server.py --engine mock` inside the POM image to check the route without a GPU.
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project. Do not repeat what the codebase already shows; point to the authoritative file or command instead. Prefer rewriting or pruning existing entries over appending new ones. When updating this file, preserve this bar for all agents and keep entries concise.
