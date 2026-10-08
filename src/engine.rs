@@ -350,6 +350,32 @@ impl Group {
         })
     }
 
+    /// Copies the child's output, line by line, to the Strata log file and to
+    /// this process's stderr. The POM reads the plugin host's stderr into the
+    /// node's log, which is what reaches the network's admins as the process
+    /// log - the same path llama.cpp's lines take.
+    fn forward_output(&mut self, log: &Path) {
+        let streams: Vec<Box<dyn std::io::Read + Send>> = [
+            self.child
+                .stdout
+                .take()
+                .map(|out| Box::new(out) as Box<dyn std::io::Read + Send>),
+            self.child
+                .stderr
+                .take()
+                .map(|err| Box::new(err) as Box<dyn std::io::Read + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for stream in streams {
+            let log = log.to_path_buf();
+            let _ = thread::Builder::new()
+                .name("pom-plugin-strata-output".into())
+                .spawn(move || copy_lines(stream, &log));
+        }
+    }
+
     fn exited(&mut self) -> Option<std::process::ExitStatus> {
         self.child.try_wait().ok().flatten()
     }
@@ -577,24 +603,9 @@ impl Manager {
         }
     }
 
-    fn log_file(&self) -> Result<std::fs::File, String> {
-        let path = self
-            .shared
-            .lock()
-            .map(|snapshot| snapshot.log.clone())
-            .map_err(|_| "state lock")?;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|error| error.to_string())
-    }
-
     fn python_command(&self, runtime: &Path) -> Result<Command, String> {
         let python = std::env::var_os("STRATA_PYTHON").unwrap_or_else(|| "python3".into());
         let mut command = Command::new(python);
-        let log = self.log_file()?;
-        let log_err = log.try_clone().map_err(|error| error.to_string())?;
         command
             .env(
                 "PYTHONPATH",
@@ -612,8 +623,8 @@ impl Manager {
             )
             .env("TMPDIR", self.base.join("run"))
             .current_dir(self.base.join("run"))
-            .stdout(log)
-            .stderr(log_err);
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         Ok(command)
     }
 
@@ -661,7 +672,14 @@ impl Manager {
             command.arg("--compat-bf16");
         }
         match Group::spawn(&mut command) {
-            Ok(group) => {
+            Ok(mut group) => {
+                group.forward_output(
+                    &self
+                        .shared
+                        .lock()
+                        .map(|snapshot| snapshot.log.clone())
+                        .unwrap_or_default(),
+                );
                 self.set_phase(
                     Phase::Preparing,
                     Some("preparing the model for Strata".into()),
@@ -817,7 +835,14 @@ impl Manager {
             request.model_label
         ));
         match Group::spawn(&mut command) {
-            Ok(group) => {
+            Ok(mut group) => {
+                group.forward_output(
+                    &self
+                        .shared
+                        .lock()
+                        .map(|snapshot| snapshot.log.clone())
+                        .unwrap_or_default(),
+                );
                 self.update(|snapshot| {
                     snapshot.port = Some(port);
                     snapshot.request = Some(request.clone());
@@ -892,6 +917,27 @@ impl Manager {
                 }
             }
         }
+    }
+}
+
+fn copy_lines(stream: Box<dyn std::io::Read + Send>, log: &Path) {
+    use std::io::{BufRead, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .ok();
+    let reader = std::io::BufReader::new(stream);
+    for line in reader.split(b'\n').map_while(Result::ok) {
+        let line = String::from_utf8_lossy(&line);
+        let line = line.trim_end_matches('\r');
+        if let Some(file) = file.as_mut() {
+            let _ = writeln!(file, "{line}");
+        }
+        // One write per line, so lines of the two streams never interleave.
+        let _ = std::io::stderr()
+            .lock()
+            .write_all(format!("[strata] {}\n", line.trim_start_matches("[strata] ")).as_bytes());
     }
 }
 
