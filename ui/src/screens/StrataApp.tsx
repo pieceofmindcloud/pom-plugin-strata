@@ -20,8 +20,9 @@ function initialTab(): Tab {
   }
 }
 
-/** The single Strata screen. With no model served it is the engine's status;
- * while a model is served, Strata's own app and the status are tabs. */
+/** The single Strata screen. With no model served, or on an earlier stage of a
+ * split model, it is the engine's status; while this machine serves a model,
+ * Strata's own app and the status are tabs. */
 export function StrataApp() {
   const { t } = usePluginI18n();
   const { status, failed } = useStatus();
@@ -35,7 +36,9 @@ export function StrataApp() {
     }
   };
 
-  if (status?.state !== "ready") {
+  // Strata's app runs on the machine that serves the requests; an earlier
+  // stage of a split model has only the engine, so it shows the status alone.
+  if (status?.state !== "ready" || status.earlierStage) {
     return (
       <div className="pb-scroll">
         <StatusView status={status} failed={failed} />

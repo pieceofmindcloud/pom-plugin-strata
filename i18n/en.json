@@ -31,5 +31,6 @@
   "autoScrollDisable": "Disable automatic scrolling",
   "copyLog": "Copy log",
   "logCopied": "Log copied",
-  "logCopyFailed": "Could not copy the log"
+  "logCopyFailed": "Could not copy the log",
+  "earlierStageHint": "This machine runs an earlier stage of a model split across machines: Strata's engine alone, which hands its layers' work to the next machine. Strata's app, with the chat and the monitor, is on the machine of the last stage, which serves the requests."
 }

@@ -210,6 +210,9 @@ impl Snapshot {
             "gpus": self.request.as_ref().map(|request| request.gpus.clone()),
             "n_ctx": self.context.or(self.request.as_ref().map(|request| request.context)),
             "busy": self.busy,
+            // An earlier stage of a split model runs the engine alone: no
+            // server, so no Strata app to open; the last stage has it.
+            "earlier_stage": self.port.is_none() && self.link_port.is_some(),
             "runtime": {
                 "ready": self.runtime.is_some(),
                 "version": self.runtime_version,
@@ -1257,6 +1260,7 @@ mod tests {
         assert_eq!(snapshot.upstream_json()["status"], "starting");
         snapshot.phase = Phase::Ready;
         assert_eq!(snapshot.upstream_json()["port"], 1234);
+        assert_eq!(snapshot.status_json()["earlier_stage"], false);
         assert!(snapshot.status_json().to_string().find("\"k\"").is_none());
         assert_eq!(snapshot.service()["kind"], "inference");
         assert_eq!(snapshot.service()["status"], "waiting");
@@ -1264,6 +1268,8 @@ mod tests {
         snapshot.port = None;
         snapshot.link_port = Some(4321);
         assert_eq!(snapshot.upstream_json()["status"], "error");
+        // An earlier stage has no Strata app for the screen to open.
+        assert_eq!(snapshot.status_json()["earlier_stage"], true);
         assert_eq!(snapshot.link_json()["port"], 4321);
         assert!(snapshot.link_json().get("token").is_none());
         snapshot.phase = Phase::Loading;

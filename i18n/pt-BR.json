@@ -31,5 +31,6 @@
   "autoScrollDisable": "Desligar rolagem automática",
   "copyLog": "Copiar log",
   "logCopied": "Log copiado",
-  "logCopyFailed": "Não foi possível copiar o log"
+  "logCopyFailed": "Não foi possível copiar o log",
+  "earlierStageHint": "Esta máquina roda um estágio anterior de um modelo dividido entre máquinas: só o motor do Strata, que entrega o trabalho das camadas dela à próxima máquina. O app do Strata, com o chat e o monitor, fica na máquina do último estágio, que atende as requisições."
 }
