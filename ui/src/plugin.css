@@ -74,7 +74,8 @@
   overflow: auto;
 }
 
-/* The single screen's tabs, drawn as POM-JEV's with the panel's theme tokens. */
+/* The single screen's tabs: the panel's tab tokens (`--tab-*`, POM host 5),
+   with the older theme colours where the host has none. */
 .pb-shell {
   display: flex;
   flex-direction: column;
@@ -88,8 +89,8 @@
   flex: 0 0 auto;
   gap: 2px;
   padding: 6px 12px 0;
-  border-bottom: 1px solid rgb(var(--line));
-  background: rgb(var(--ink));
+  border-bottom: 1px solid var(--tab-line, rgb(var(--line)));
+  background: var(--tab-bar, rgb(var(--ink)));
 }
 
 .pb-shell-tab {
@@ -100,7 +101,7 @@
   border: 1px solid transparent;
   border-bottom: 0;
   border-radius: 10px 10px 0 0;
-  color: rgb(var(--faint));
+  color: var(--tab-ink, rgb(var(--faint)));
   background: transparent;
   font-size: 12.5px;
   font-weight: 700;
@@ -109,24 +110,24 @@
 }
 
 .pb-shell-tab span {
-  color: rgb(var(--sky));
+  color: var(--tab-icon, rgb(var(--sky)));
   font: 700 10.5px/1 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .pb-shell-tab:hover {
-  color: rgb(var(--fg));
+  color: var(--tab-ink-on, rgb(var(--fg)));
 }
 
 .pb-shell-tab-on {
   margin-bottom: -1px;
-  color: rgb(var(--fg));
-  border-color: rgb(var(--line));
-  background: rgb(var(--surface));
-  box-shadow: inset 0 2px 0 rgb(var(--aqua));
+  color: var(--tab-ink-on, rgb(var(--fg)));
+  border-color: var(--tab-line, rgb(var(--line)));
+  background: var(--tab-card, rgb(var(--surface)));
+  box-shadow: inset 0 2px 0 var(--tab-accent, rgb(var(--aqua)));
 }
 
 .pb-shell-tab:focus-visible {
-  outline: 2px solid rgb(var(--sky));
+  outline: 2px solid var(--tab-icon, rgb(var(--sky)));
   outline-offset: -2px;
 }
 
