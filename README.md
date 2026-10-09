@@ -32,8 +32,8 @@ POM documentation screen).
 
 | Operation | Who | What |
 |---|---|---|
-| `host.services` | POM | the `inference` service, its state and `architectures: ["qwen4exp"]` |
-| `engine.load` | the local POM node | loads a model: `model_path`, `model_label`, `n_ctx`, `max_sessions`, `kv`, `gpus` |
+| `host.services` | POM | the `inference` service, its state, `architectures: ["qwen4exp"]` and the engine `settings` (`src/settings.rs`) |
+| `engine.load` | the local POM node | loads a model: `model_path`, `model_label`, `n_ctx`, `max_sessions`, `kv`, `gpus`, `settings` (applied with Strata's `serve/runconfig.py` rules by the bridge) |
 | `engine.unload` | the local POM node | stops Strata and gives the GPU back |
 | `engine.status` | the local POM node | `idle`, `installing`, `preparing`, `loading`, `ready`, `stopping` or `error`, with `detail` and `n_ctx` |
 | `engine.upstream` | the local POM node | port and token of Strata's server on loopback, while ready |

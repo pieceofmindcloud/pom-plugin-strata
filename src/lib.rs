@@ -16,6 +16,7 @@ pub mod engine;
 pub mod gguf;
 pub mod proxy;
 pub mod runtime;
+pub mod settings;
 
 use engine::{Engine, LoadRequest};
 use proxy::UiServer;

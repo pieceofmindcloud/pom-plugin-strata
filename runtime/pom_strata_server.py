@@ -211,7 +211,28 @@ def make_handler(original):
     return factory
 
 
+def apply_pom_settings(argv: list[str]) -> None:
+    """The deployment's engine settings (`pom_settings` in the run config, written by the plugin) applied with
+    Strata's own rules (serve/runconfig.py); a value Strata refuses stops the start with Strata's message."""
+    if "--config" not in argv[:-1]:
+        return
+    path = Path(argv[argv.index("--config") + 1])
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    settings = cfg.pop("pom_settings", None)
+    if not settings:
+        return
+    from serve import runconfig
+    try:
+        cfg, changed = runconfig.apply(cfg, settings)
+    except ValueError as e:
+        print(f"[pom] engine setting refused: {e}", flush=True)
+        raise SystemExit(2)
+    print(f"[pom] engine settings: {', '.join(changed) or 'no change'}", flush=True)
+    path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+
+
 def main() -> int:
+    apply_pom_settings(sys.argv)
     S.make_handler = make_handler(S.make_handler)
     return S.main()
 

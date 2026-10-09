@@ -44,6 +44,8 @@ pub struct LoadRequest {
     pub sessions: u32,
     /// `int8`, `q4_0` or `k8v4`.
     pub kv: String,
+    /// Engine settings the deployment chose (`crate::settings`).
+    pub settings: serde_json::Map<String, Value>,
 }
 
 impl LoadRequest {
@@ -98,6 +100,7 @@ impl LoadRequest {
             gpus,
             sessions,
             kv,
+            settings: crate::settings::select(&value["settings"]),
         })
     }
 }
@@ -216,6 +219,7 @@ impl Snapshot {
             "version": self.runtime_version,
             "detail": detail.map(|text| text.chars().take(190).collect::<String>()),
             "architectures": [gguf::STRATA_ARCHITECTURE],
+            "settings": crate::settings::schema(),
         })
     }
 }
@@ -584,6 +588,19 @@ impl Manager {
         }
     }
 
+    /// The last line Strata wrote: why it stopped, most of the time.
+    fn last_log_line(&self) -> Option<String> {
+        let path = self.shared.lock().ok()?.log.clone();
+        let text = std::fs::read(path).ok()?;
+        let start = text.len().saturating_sub(8 * 1024);
+        String::from_utf8_lossy(&text[start..])
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("[pom] starting"))
+            .map(|line| line.chars().take(300).collect())
+    }
+
     fn fail(&mut self, error: String) {
         self.append_log(&format!("[pom] {error}"));
         self.set_phase(Phase::Error, Some(error));
@@ -811,6 +828,10 @@ impl Manager {
         if request.sessions > 1 {
             config["parallel"] = json!(request.sessions);
         }
+        // Applied by the bridge with Strata's own rules (serve/runconfig.py).
+        if !request.settings.is_empty() {
+            config["pom_settings"] = Value::Object(request.settings.clone());
+        }
         let config_path = self.base.join("run/strata.json");
         if let Err(error) = write_private(
             &config_path,
@@ -883,7 +904,11 @@ impl Manager {
                 if let Some(status) = group.exited() {
                     self.work = Work::None;
                     self.update(|snapshot| snapshot.port = None);
-                    return self.fail(format!("Strata stopped ({status}); see the Strata log"));
+                    let reason = self
+                        .last_log_line()
+                        .map(|line| format!(": {line}"))
+                        .unwrap_or_default();
+                    return self.fail(format!("Strata stopped ({status}){reason}"));
                 }
                 let (port, key) = match self.shared.lock() {
                     Ok(snapshot) => (snapshot.port, snapshot.api_key.clone()),
