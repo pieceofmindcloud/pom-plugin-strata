@@ -17,13 +17,15 @@ stop handling) and streams the generated text back, one JSON object per line:
 
     {"t": "<text>"}               generated text, in order
     {"p": [read, total]}          prompt progress while the prompt is read
-    {"done": {...}}               the end: finish, token counts, timings
+    {"done": {...}}               the end: finish, token counts, timings (with the
+                                  MTP drafts, draft_n / draft_n_accepted), stop_sequence
     {"error": "..."}              the request failed
 
 Reasoning comes back inside <think> ... </think>, the way the POM chat and the
 POM tool-call parser read a llama.cpp pipeline's raw output. Tools are not
 given to Strata's parser: the POM renders its own tool block into the prompt
-and parses the calls out of the text.
+and parses the calls out of the text. Strata's parser still takes the calls
+out of the output; they go back into the text in the template's own form.
 
     GET /pom/status               loaded, model, context, busy (no prompts)
 """
@@ -68,11 +70,29 @@ def generation_request(req: dict) -> tuple[str, bool, bool, int, dict]:
         max_tokens, sampling
 
 
+def tool_call_text(name: str, arguments: dict) -> str:
+    """A parsed tool call as the model wrote it (the qwen4exp template's XML form), which the POM parses."""
+    out = [f"<tool_call>\n<function={name}>\n"]
+    for key, value in (arguments or {}).items():
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        out.append(f"<parameter={key}>\n{value}\n</parameter>\n")
+    out.append("</function>\n</tool_call>")
+    return "".join(out)
+
+
 class ThinkWrapper:
     """Turns Strata's parsed events back into the raw text a llama.cpp pipeline returns."""
 
     def __init__(self):
         self.open = False
+
+    def event(self, ev) -> str:
+        """One of Strata's events as raw text. A tool call is whole only in its final `tool_call` event; the
+        streamed `tool_start` / `tool_args` pieces come again inside it."""
+        if ev.kind == "tool_call" and ev.call is not None:
+            return self.text("content", "\n\n" + tool_call_text(ev.call.name, ev.call.arguments))
+        return self.text(ev.kind, ev.text or "")
 
     def text(self, kind: str, text: str) -> str:
         if not text:
@@ -182,7 +202,7 @@ def make_handler(original):
                             progress = getattr(svc.engine, "progress", None)
                             self._line({"p": list(progress)} if progress else {"p": None})
                         elif kind == "event":
-                            text = think.text(x.kind, x.text or "")
+                            text = think.event(x)
                             if text:
                                 self._line({"t": text})
                         elif kind == "done":
@@ -195,6 +215,7 @@ def make_handler(original):
                                 "completion_tokens": x.get("completion_tokens", 0),
                                 "cached_tokens": x.get("reused") or 0,
                                 "timings": x.get("timings"),
+                                "stop_sequence": x.get("stop_sequence"),
                             }})
                 except OSError:
                     self._note(outcome="disconnected")
