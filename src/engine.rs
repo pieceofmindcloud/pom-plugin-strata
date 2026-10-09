@@ -937,10 +937,12 @@ impl Manager {
             "api_key": api_key,
             "open_browser": false,
         });
-        match request.gpus.as_slice() {
-            [] => {}
-            [one] => config["gpu"] = json!(one),
-            many => config["gpu"] = json!(many),
+        // A stage of a split model runs on one GPU: the engine refuses
+        // --layer-split beside --stage-prev, and the bridge adds it for a list.
+        match (request.gpus.as_slice(), model.stage.is_some()) {
+            ([], _) => {}
+            ([first, ..], true) | ([first], false) => config["gpu"] = json!(first),
+            (many, false) => config["gpu"] = json!(many),
         }
         config["gpus_asked"] = json!(!request.gpus.is_empty());
         if request.sessions > 1 {
