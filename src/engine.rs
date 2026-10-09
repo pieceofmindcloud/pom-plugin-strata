@@ -46,6 +46,49 @@ pub struct LoadRequest {
     pub kv: String,
     /// Engine settings the deployment chose (`crate::settings`).
     pub settings: serde_json::Map<String, Value>,
+    /// A POM slice runs as one stage of a split across machines: the link
+    /// the POM gives (`{}` for the first stage, which makes its own secret).
+    pub link: Option<Link>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Link {
+    /// The earlier stage's secret, which a later stage presents to it.
+    pub token: Option<String>,
+    /// For a later stage: the loopback port where this node relays the link
+    /// to the earlier stage's machine.
+    pub prev_port: Option<u16>,
+}
+
+impl Link {
+    fn from_json(value: &Value) -> Result<Option<Self>, String> {
+        if value.is_null() {
+            return Ok(None);
+        }
+        let token = match &value["token"] {
+            Value::Null => None,
+            token => Some(
+                token
+                    .as_str()
+                    .filter(|token| {
+                        (16..=256).contains(&token.len())
+                            && token.bytes().all(|b| b.is_ascii_graphic())
+                    })
+                    .ok_or("link.token is malformed")?
+                    .to_owned(),
+            ),
+        };
+        let prev_port = match &value["prev_port"] {
+            Value::Null => None,
+            port => Some(
+                port.as_u64()
+                    .and_then(|port| u16::try_from(port).ok())
+                    .filter(|port| *port > 0)
+                    .ok_or("link.prev_port is not a port")?,
+            ),
+        };
+        Ok(Some(Self { token, prev_port }))
+    }
 }
 
 impl LoadRequest {
@@ -101,6 +144,7 @@ impl LoadRequest {
             sessions,
             kv,
             settings: crate::settings::select(&value["settings"]),
+            link: Link::from_json(&value["link"])?,
         })
     }
 }
@@ -145,6 +189,10 @@ pub struct Snapshot {
     /// The context Strata reports once loaded.
     pub context: Option<u32>,
     pub port: Option<u16>,
+    /// A stage server's loopback port (an earlier stage of a split model).
+    pub link_port: Option<u16>,
+    /// The secret of this machine's earlier stage, from the load on.
+    pub link_token: Option<String>,
     pub api_key: String,
     pub busy: bool,
     pub since: Instant,
@@ -177,9 +225,29 @@ impl Snapshot {
             (Phase::Ready, Some(port)) => {
                 json!({"status": "ready", "port": port, "token": self.api_key})
             }
+            (_, None) if self.link_port.is_some() => json!({
+                "status": "error",
+                "error": "this machine runs an earlier stage of the model; the last stage serves the requests",
+            }),
             (Phase::Error, _) => json!({"status": "error", "error": self.detail}),
             _ => json!({"status": "starting"}),
         }
+    }
+
+    /// Where the POM node relays the stage link of a split model to, while
+    /// this machine's earlier stage is ready (`engine.link`).
+    /// The secret goes with every answer once a load gave this machine an
+    /// earlier stage: the POM hands it only to the next stage's machine.
+    pub fn link_json(&self) -> Value {
+        let mut answer = match (self.phase, self.link_port) {
+            (Phase::Ready, Some(port)) => json!({"status": "ready", "port": port}),
+            (Phase::Error, _) => json!({"status": "error", "error": self.detail}),
+            _ => json!({"status": "starting"}),
+        };
+        if let Some(token) = &self.link_token {
+            answer["token"] = json!(token);
+        }
+        answer
     }
 
     /// The service the POM draws next to this machine.
@@ -219,6 +287,8 @@ impl Snapshot {
             "version": self.runtime_version,
             "detail": detail.map(|text| text.chars().take(190).collect::<String>()),
             "architectures": [gguf::STRATA_ARCHITECTURE],
+            // A POM slice of a model runs as one of two stages on two machines.
+            "stages": true,
             "settings": crate::settings::schema(),
         })
     }
@@ -266,6 +336,8 @@ impl Engine {
             request: None,
             context: None,
             port: None,
+            link_port: None,
+            link_token: None,
             api_key: random_key(),
             busy: false,
             since: Instant::now(),
@@ -419,8 +491,17 @@ impl Group {
 
 enum Work {
     None,
-    Packing { group: Group, request: LoadRequest },
-    Serving { group: Group },
+    Packing {
+        group: Group,
+        request: LoadRequest,
+    },
+    Serving {
+        group: Group,
+    },
+    /// The engine alone, as the stage server of an earlier stage.
+    Staging {
+        group: Group,
+    },
 }
 
 struct Manager {
@@ -572,7 +653,7 @@ impl Manager {
         self.waiting = None;
         match std::mem::replace(&mut self.work, Work::None) {
             Work::None => {}
-            Work::Packing { group, .. } | Work::Serving { group, .. } => {
+            Work::Packing { group, .. } | Work::Serving { group, .. } | Work::Staging { group } => {
                 self.set_phase(Phase::Stopping, None);
                 group.stop(STOP_GRACE);
             }
@@ -581,6 +662,8 @@ impl Manager {
             snapshot.request = None;
             snapshot.context = None;
             snapshot.port = None;
+            snapshot.link_port = None;
+            snapshot.link_token = None;
             snapshot.busy = false;
         });
         if self.installer.is_none() {
@@ -665,6 +748,30 @@ impl Manager {
             Ok(model) => model,
             Err(error) => return self.fail(error),
         };
+        if let Some(stage) = model.stage {
+            if !stage.first() && !stage.last() {
+                return self.fail(format!(
+                    "Strata splits a model in two stages; this slice holds the middle layers {}-{}",
+                    stage.start, stage.end
+                ));
+            }
+            match &request.link {
+                None => return self.fail("a POM slice needs the stage link the POM gives".into()),
+                Some(link)
+                    if !stage.first() && (link.prev_port.is_none() || link.token.is_none()) =>
+                {
+                    return self.fail(
+                        "a later stage needs the relay to the earlier stage and its secret".into(),
+                    )
+                }
+                Some(_) if stage.first() => {
+                    // The earlier stage's secret, which the POM asks before the engine is up.
+                    let token = random_key();
+                    self.update(|snapshot| snapshot.link_token = Some(token));
+                }
+                Some(_) => {}
+            }
+        }
         let pack = self.pack_dir(&request.model_path);
         if pack_ready(&pack) {
             return self.serve(runtime, request, &model, pack);
@@ -684,8 +791,9 @@ impl Manager {
             .arg(&request.model_path)
             .arg("--out")
             .arg(&pack);
-        if model.shards.len() > 2 {
+        if model.shards.len() > 2 || model.stage.is_some() {
             // Unsloth's files keep small projections as Q8_0; the engine reads them as BF16.
+            // (A slice no longer says how many files its model had: the flag only converts what needs it.)
             command.arg("--compat-bf16");
         }
         match Group::spawn(&mut command) {
@@ -787,9 +895,16 @@ impl Manager {
             ]
             .map(str::to_owned),
         );
-        if let Some(mtp) = self.mtp_dir(&request.model_path) {
+        let stage_server = model.stage.is_some_and(|stage| !stage.last());
+        if stage_server {
+            // The drafter belongs to the last stage, with the head.
+        } else if let Some(mtp) = self.mtp_dir(&request.model_path) {
             args.extend(["--spec", "4", "--spec-min-p", "0.5", "--mtp"].map(str::to_owned));
             args.push(mtp.display().to_string());
+        }
+        if let Some(port) = request.link.as_ref().and_then(|link| link.prev_port) {
+            args.push("--stage-prev".into());
+            args.push(format!("127.0.0.1:{port}"));
         }
         args.push("--max-context".into());
         args.push(request.context.to_string());
@@ -800,6 +915,9 @@ impl Manager {
         if request.context >= KV_STREAM_FROM {
             args.push("--kv-resident".into());
             args.push(KV_RESIDENT.into());
+        }
+        if stage_server {
+            return self.serve_stage(runtime, request, args, port);
         }
         let api_key = self
             .shared
@@ -827,6 +945,9 @@ impl Manager {
         config["gpus_asked"] = json!(!request.gpus.is_empty());
         if request.sessions > 1 {
             config["parallel"] = json!(request.sessions);
+        }
+        if let Some(token) = request.link.as_ref().and_then(|link| link.token.as_ref()) {
+            config["env"] = json!({"STRATA_STAGE_TOKEN": token});
         }
         // Applied by the bridge with Strata's own rules (serve/runconfig.py).
         if !request.settings.is_empty() {
@@ -878,9 +999,99 @@ impl Manager {
         }
     }
 
+    /// An earlier stage of a split model: the engine alone, answering the
+    /// later stage's machine (through the POM's relay) on a loopback port. No
+    /// server, no head, no requests of its own.
+    fn serve_stage(
+        &mut self,
+        runtime: PathBuf,
+        request: LoadRequest,
+        args: Vec<String>,
+        port: u16,
+    ) {
+        let Some(token) = self
+            .shared
+            .lock()
+            .ok()
+            .and_then(|snapshot| snapshot.link_token.clone())
+        else {
+            return self.fail("the earlier stage has no link secret".into());
+        };
+        let mut command = Command::new(runtime.join("engine/strata"));
+        command
+            .arg("--serve")
+            .arg("--stage-serve")
+            .arg(format!("127.0.0.1:{port}"))
+            .args(&args)
+            .env("STRATA_STAGE_TOKEN", &token)
+            .current_dir(self.base.join("run"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // One GPU per stage: a stage is not split again across this machine's cards.
+        if let Some(gpu) = request.gpus.first() {
+            command.env("CUDA_VISIBLE_DEVICES", gpu.to_string());
+        }
+        self.append_log(&format!(
+            "[pom] starting Strata as an earlier stage of {} on 127.0.0.1:{port}",
+            request.model_label
+        ));
+        match Group::spawn(&mut command) {
+            Ok(mut group) => {
+                group.forward_output(
+                    &self
+                        .shared
+                        .lock()
+                        .map(|snapshot| snapshot.log.clone())
+                        .unwrap_or_default(),
+                );
+                self.update(|snapshot| {
+                    snapshot.link_port = Some(port);
+                    snapshot.request = Some(request.clone());
+                });
+                self.set_phase(
+                    Phase::Loading,
+                    Some(format!("loading {} (earlier stage)", request.model_label)),
+                );
+                self.work = Work::Staging { group };
+            }
+            Err(error) => self.fail(format!("Strata did not start: {error}")),
+        }
+    }
+
+    /// Whether the stage server on `port` has said it listens.
+    fn stage_listening(&self, port: u16) -> bool {
+        let Ok(path) = self.shared.lock().map(|snapshot| snapshot.log.clone()) else {
+            return false;
+        };
+        let Ok(text) = std::fs::read(path) else {
+            return false;
+        };
+        let start = text.len().saturating_sub(256 * 1024);
+        String::from_utf8_lossy(&text[start..]).contains(&format!("listening on 127.0.0.1:{port} "))
+    }
+
     fn poll_work(&mut self) {
         match &mut self.work {
             Work::None => {}
+            Work::Staging { group } => {
+                if let Some(status) = group.exited() {
+                    self.work = Work::None;
+                    self.update(|snapshot| snapshot.link_port = None);
+                    let reason = self
+                        .last_log_line()
+                        .map(|line| format!(": {line}"))
+                        .unwrap_or_default();
+                    return self.fail(format!("Strata stopped ({status}){reason}"));
+                }
+                let (phase, port) = match self.shared.lock() {
+                    Ok(snapshot) => (snapshot.phase, snapshot.link_port),
+                    Err(_) => return,
+                };
+                if phase != Phase::Ready && port.is_some_and(|port| self.stage_listening(port)) {
+                    self.append_log("[pom] Strata's earlier stage is ready");
+                    self.set_phase(Phase::Ready, None);
+                }
+            }
             Work::Packing { group, request } => {
                 let Some(status) = group.exited() else {
                     return;
@@ -1034,6 +1245,8 @@ mod tests {
             request: None,
             context: None,
             port: Some(1234),
+            link_port: None,
+            link_token: None,
             api_key: "k".into(),
             busy: false,
             since: Instant::now(),
@@ -1045,5 +1258,45 @@ mod tests {
         assert!(snapshot.status_json().to_string().find("\"k\"").is_none());
         assert_eq!(snapshot.service()["kind"], "inference");
         assert_eq!(snapshot.service()["status"], "waiting");
+        assert_eq!(snapshot.service()["stages"], true);
+        snapshot.port = None;
+        snapshot.link_port = Some(4321);
+        assert_eq!(snapshot.upstream_json()["status"], "error");
+        assert_eq!(snapshot.link_json()["port"], 4321);
+        assert!(snapshot.link_json().get("token").is_none());
+        snapshot.phase = Phase::Loading;
+        snapshot.link_token = Some("s".repeat(32));
+        assert_eq!(snapshot.link_json()["status"], "starting");
+        assert_eq!(snapshot.link_json()["token"], "s".repeat(32));
+    }
+
+    #[test]
+    fn a_stage_link_is_read_and_checked() {
+        let token = "t".repeat(32);
+        let request = LoadRequest::from_json(&json!({
+            "model_path": "/m/tail.gguf",
+            "link": {"token": token, "prev_port": 4100}
+        }))
+        .unwrap();
+        let link = request.link.unwrap();
+        assert_eq!(link.prev_port, Some(4100));
+        assert_eq!(link.token.as_deref(), Some(token.as_str()));
+        let first = LoadRequest::from_json(&json!({"model_path": "/m/head.gguf", "link": {}}))
+            .unwrap()
+            .link
+            .unwrap();
+        assert_eq!((first.token, first.prev_port), (None, None));
+        for bad in [
+            json!({"token": "short"}),
+            json!({"token": token, "prev_port": 0}),
+        ] {
+            assert!(
+                LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "link": bad})).is_err()
+            );
+        }
+        assert!(LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"}))
+            .unwrap()
+            .link
+            .is_none());
     }
 }

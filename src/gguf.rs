@@ -24,6 +24,10 @@ pub struct Header {
     pub split_count: Option<u64>,
     /// Set on a POM slice: the first layer it holds of the original model.
     pub pom_start_layer: Option<u64>,
+    /// Set on a POM slice: the last layer it holds of the original model.
+    pub pom_end_layer: Option<u64>,
+    /// Set on a POM slice: the original model's layer count.
+    pub pom_original_block_count: Option<u64>,
     pub tensors: Vec<String>,
 }
 
@@ -151,10 +155,10 @@ pub fn read_header(path: &Path) -> std::io::Result<Header> {
             ("general.architecture", Value::Text(text)) => header.architecture = Some(text),
             ("split.no", Value::Integer(number)) => header.split_no = Some(number),
             ("split.count", Value::Integer(number)) => header.split_count = Some(number),
-            (key, Value::Integer(number))
-                if key.ends_with(".start_layer") && key.starts_with("pom.") =>
-            {
-                header.pom_start_layer = Some(number)
+            ("pom.start_layer", Value::Integer(number)) => header.pom_start_layer = Some(number),
+            ("pom.end_layer", Value::Integer(number)) => header.pom_end_layer = Some(number),
+            ("pom.original_block_count", Value::Integer(number)) => {
+                header.pom_original_block_count = Some(number)
             }
             (key, Value::Integer(number)) if key.ends_with(".block_count") => {
                 block_counts.push((key.trim_end_matches(".block_count").to_owned(), number))
@@ -218,6 +222,26 @@ pub fn shards_of(first: &Path) -> Result<Vec<PathBuf>, String> {
         .collect()
 }
 
+/// The layers a POM slice holds of the whole model, which Strata runs as one
+/// stage of a split across machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stage {
+    pub start: u64,
+    /// The last layer it holds (inclusive).
+    pub end: u64,
+    pub total: u64,
+}
+
+impl Stage {
+    pub fn first(&self) -> bool {
+        self.start == 0
+    }
+
+    pub fn last(&self) -> bool {
+        self.end + 1 == self.total
+    }
+}
+
 /// What the plugin knows about a model before Strata reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
@@ -225,9 +249,12 @@ pub struct Model {
     /// The shard that holds the n-gram table, when there is one.
     pub ple_shard: Option<PathBuf>,
     pub layers: u64,
+    /// Set for a POM slice: the layers it holds.
+    pub stage: Option<Stage>,
 }
 
-/// Checks that `first` is a whole model Strata can run and finds its shards.
+/// Checks that `first` is a model (or a POM slice of one) Strata can run and
+/// finds its shards.
 pub fn inspect(first: &Path) -> Result<Model, String> {
     let shards = shards_of(first)?;
     let header = read_header(first).map_err(|error| format!("{}: {error}", first.display()))?;
@@ -240,11 +267,23 @@ pub fn inspect(first: &Path) -> Result<Model, String> {
         }
         None => return Err("the model declares no architecture".into()),
     }
-    if header.pom_start_layer.is_some() {
-        return Err("this is a POM slice; Strata serves a whole model".into());
+    let stage = match (
+        header.pom_start_layer,
+        header.pom_end_layer,
+        header.pom_original_block_count,
+    ) {
+        (None, None, None) => None,
+        (Some(start), Some(end), Some(total)) if start <= end && end < total => {
+            Some(Stage { start, end, total })
+        }
+        _ => return Err("this POM slice declares an inconsistent layer range".into()),
+    };
+    if stage.is_some() && shards.len() > 1 {
+        return Err("a POM slice is one file".into());
     }
-    let layers = header
-        .block_count
+    let layers = stage
+        .map(|stage| stage.total)
+        .or(header.block_count)
         .ok_or("the model declares no layer count")?;
     let mut ple_shard = None;
     for shard in &shards {
@@ -264,6 +303,7 @@ pub fn inspect(first: &Path) -> Result<Model, String> {
         shards,
         ple_shard,
         layers,
+        stage,
     })
 }
 
@@ -338,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn other_architectures_slices_and_missing_parts_are_refused() {
+    fn other_architectures_broken_slices_and_missing_parts_are_refused() {
         let dir = temp_dir("refused");
         let llama = dir.join("llama.gguf");
         write_model(&llama, "llama", &[], &[]);
@@ -352,6 +392,39 @@ mod tests {
         let second = dir.join("m-00002-of-00003.gguf");
         write_model(&second, "qwen4exp", &[], &[]);
         assert!(inspect(&second).unwrap_err().contains("first part"));
+    }
+
+    #[test]
+    fn a_pom_slice_is_a_stage_of_the_whole_model() {
+        let dir = temp_dir("slice");
+        let tail = dir.join("tail.gguf");
+        write_model(
+            &tail,
+            "qwen4exp",
+            &[
+                ("pom.start_layer", 27),
+                ("pom.end_layer", 47),
+                ("pom.original_block_count", 48),
+            ],
+            &["blk.0.attn_q.weight", "output.weight"],
+        );
+        let model = inspect(&tail).unwrap();
+        let stage = model.stage.unwrap();
+        assert_eq!((stage.start, stage.end, model.layers), (27, 47, 48));
+        assert!(stage.last() && !stage.first());
+        let head = dir.join("head.gguf");
+        write_model(
+            &head,
+            "qwen4exp",
+            &[
+                ("pom.start_layer", 0),
+                ("pom.end_layer", 26),
+                ("pom.original_block_count", 48),
+            ],
+            &[PLE_TENSOR],
+        );
+        let stage = inspect(&head).unwrap().stage.unwrap();
+        assert!(stage.first() && !stage.last());
     }
 
     #[test]

@@ -13,7 +13,9 @@ machine with one or more consumer cards and enough RAM.
    machine then shows the **Strata** inference service on the dashboard.
 2. Open **Deploy**, choose the model, and in **Inference service** pick
    **Strata**. Only `qwen4exp` models and only machines with this plugin are
-   offered, and the deployment is a whole model on one machine.
+   offered. The deployment is a whole model on one machine, or the two layer
+   slices of a model on two machines (see "A model split across two
+   machines").
 3. The settings of the deployment apply: the context size, the GPUs of the
    machine (one or more: Strata splits the layers between them), the
    concurrent requests and the KV cache type.
@@ -38,6 +40,19 @@ one when it finds a prepared draft layer (`mtp/rt/experts.bin`, the layout
 Strata's own setup writes) in the plugin directory or up to three folders
 above the model file. Without one Strata runs without speculation.
 
+## A model split across two machines
+
+Choose **Slices** with the Strata service to run a model that one machine
+cannot hold on two: each machine loads its POM slice in Strata. The first
+slice (from layer 0) runs as a stage server: for every prompt piece and every
+draft window it answers with the hidden state of its last layer instead of
+tokens. The second slice (to the last layer) serves the requests, with the
+head, the sampling and the MTP draft layer, and asks the first machine for
+those hidden states. The POM carries them between the machines, signed, over
+the route it already uses between its nodes: neither Strata listens beyond
+loopback. Every request starts from position 0 on both machines (no prompt
+cache in this mode). Slices made by the POM's slicer load as they are.
+
 ## Where things live on a node
 
 - `<POM database dir>/strata/packs/<model>` - the model prepared for Strata.
@@ -47,8 +62,8 @@ above the model file. Without one Strata runs without speculation.
 
 ## Limits
 
-- One model per machine, served whole. Passing the hidden state between two
-  Strata machines (a pipeline of Strata stages) is not part of this version.
+- A model runs on one machine, or split in two slices on two machines (one
+  GPU each); three or more stages are not supported.
 - Strata runs on NVIDIA cards of compute capability 7.5 or newer; this build
   carries code for sm_86 and sm_120 (the POM default).
 - Images are not sent to Strata.

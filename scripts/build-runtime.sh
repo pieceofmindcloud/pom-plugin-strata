@@ -15,11 +15,13 @@ archs="${CUDA_ARCHITECTURES:-86;120}"
 cuda_version="${CUDA_VERSION:-13.4.1}"
 strata_source="${STRATA_SOURCE_DIR:-}"
 archive=0
+worktree=0
 version="${RUNTIME_VERSION:-}"
 
 usage() {
   printf '%s\n' \
-    'Usage: scripts/build-runtime.sh [--archive] [--version <semver>]' \
+    'Usage: scripts/build-runtime.sh [--archive] [--worktree] [--version <semver>]' \
+    '  --worktree builds STRATA_SOURCE_DIR as it is on disk (development; incremental, not for a release)' \
     'Environment: CUDA_ARCHITECTURES (default "86;120", the POM default),' \
     '  CUDA_VERSION (default 13.4.1, the POM default),' \
     '  STRATA_SOURCE_DIR (a local Strata git checkout to take the locked commit from).'
@@ -28,6 +30,7 @@ usage() {
 while (($# > 0)); do
   case "$1" in
     --archive) archive=1; shift ;;
+    --worktree) worktree=1; shift ;;
     --version) version="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'build-runtime: unknown option %s\n' "$1" >&2; exit 2 ;;
@@ -35,6 +38,13 @@ while (($# > 0)); do
 done
 
 work="$root/build/runtime-src"
+if ((worktree)); then
+  [[ -n "$strata_source" && -f "$strata_source/third_party/llama.cpp/ggml/CMakeLists.txt" ]] \
+    || { echo 'build-runtime: --worktree needs STRATA_SOURCE_DIR with third_party/llama.cpp' >&2; exit 2; }
+  ((archive == 0)) || { echo 'build-runtime: --worktree builds are not releases (no --archive)' >&2; exit 2; }
+  work="$strata_source"
+  STRATA_COMMIT="$(git -C "$strata_source" rev-parse HEAD)-dirty"
+else
 rm -rf "$work"
 mkdir -p "$work"
 
@@ -61,6 +71,8 @@ else
   curl -fsSL "https://github.com/ggml-org/llama.cpp/archive/${LLAMA_CPP_COMMIT}.tar.gz" \
     | tar -xz -C "$work/third_party"
   mv "$work/third_party/llama.cpp-${LLAMA_CPP_COMMIT}" "$llama"
+fi
+
 fi
 
 image="pom-plugin-strata-runtime:cuda${cuda_version}"

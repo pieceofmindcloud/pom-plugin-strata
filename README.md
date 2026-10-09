@@ -2,7 +2,8 @@
 
 POM plugin that serves a whole **Qwen3.8-Flash-Next** model (GGUF
 architecture `qwen4exp`) with the [Strata](https://github.com/Niko1221/Strata)
-engine instead of llama.cpp. A machine with the plugin publishes the
+engine (the fork in `strata.lock`, which adds the stage split) instead of
+llama.cpp. A machine with the plugin publishes the
 `inference` service "Strata"; a deployment that picks that service runs the
 model on that machine's NVIDIA cards (one or more: Strata splits the layers),
 and the POM pipeline sends each prompt to Strata, which streams the tokens back.
@@ -79,8 +80,9 @@ pins; the node downloads and verifies the runtime on first use.
 
 ## Known limits
 
-- One whole model per machine. Passing the hidden state between Strata
-  instances (Strata as a pipeline stage) is a later step.
+- A whole model on one machine, or two layer slices on two machines (the
+  stage link of the Strata fork pinned in `strata.lock`); no prompt cache in
+  split mode.
 - Linux x86_64 with NVIDIA cards of compute capability 7.5 or newer; this
   build carries sm_86 and sm_120 code.
 - The model is prepared once per file into `<POM database dir>/strata/packs/`

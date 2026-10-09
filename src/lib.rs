@@ -154,6 +154,7 @@ fn query_inner(state: &PluginState, request: &[u8]) -> Result<Value, String> {
         }
         "engine.status" => Ok(engine(state)?.snapshot().status_json()),
         "engine.upstream" => Ok(engine(state)?.snapshot().upstream_json()),
+        "engine.link" => Ok(engine(state)?.snapshot().link_json()),
         // Where the POM plugin proxy finds Strata's web app and monitor.
         "ui.upstream" => match &state.ui {
             Some(ui) => Ok(json!({"status": "ready", "port": ui.port, "token": ui.token})),
