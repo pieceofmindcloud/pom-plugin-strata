@@ -1,4 +1,7 @@
-use std::{env, fs, path::Path};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 fn content_type(name: &str) -> &'static str {
     match Path::new(name)
@@ -14,14 +17,30 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
+/// Where the built UI is: the POM's local rebuild builds it in
+/// `POM_PLUGIN_OUT_DIR` (`scripts/dev-ui.sh`, the source is read-only there),
+/// any other build in the source's `ui/dist` (`scripts/build-ui.sh`).
+fn ui_dist(root: &str) -> PathBuf {
+    println!("cargo:rerun-if-env-changed=POM_PLUGIN_OUT_DIR");
+    env::var("POM_PLUGIN_OUT_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|out| Path::new(&out).join("ui-build/ui/dist"))
+        .filter(|dist| dist.join("screens.js").is_file())
+        .unwrap_or_else(|| Path::new(root).join("ui/dist"))
+}
+
 /// A release build without the built interface would install a plugin that
 /// runs but shows no menu. Refuse it here, where the reason can be said.
-fn require_built_ui(root: &str) {
-    println!("cargo:rerun-if-changed=ui/dist/screens.js");
+fn require_built_ui(root: &str, dist: &Path) {
+    println!(
+        "cargo:rerun-if-changed={}",
+        dist.join("screens.js").display()
+    );
     let release = env::var("PROFILE").is_ok_and(|profile| profile == "release");
-    let built = ["ui/dist/screens.js", "ui/dist/plugin.css"]
+    let built = ["screens.js", "plugin.css"]
         .iter()
-        .all(|file| Path::new(root).join(file).is_file());
+        .all(|file| dist.join(file).is_file());
     if release && !built {
         panic!(
             "the plugin interface is not built: run scripts/build-ui.sh in {root} \
@@ -69,7 +88,8 @@ fn runtime_release(root: &str) -> String {
 
 fn main() {
     let root = env::var("CARGO_MANIFEST_DIR").expect("manifest directory");
-    require_built_ui(&root);
+    let dist = ui_dist(&root);
+    require_built_ui(&root, &dist);
     let out = env::var("OUT_DIR").expect("output directory");
     fs::write(
         Path::new(&out).join("runtime_release.rs"),
@@ -79,13 +99,13 @@ fn main() {
 
     let mut entries = Vec::new();
     for (directory, prefix, extensions) in [
-        ("ui/dist", "ui", &["js", "css"][..]),
-        ("ui", "ui", &["png"][..]),
-        ("ui/dist/i18n", "i18n", &["json"][..]),
-        ("docs", "docs", &["md"][..]),
+        (dist.clone(), "ui", &["js", "css"][..]),
+        (Path::new(&root).join("ui"), "ui", &["png"][..]),
+        (dist.join("i18n"), "i18n", &["json"][..]),
+        (Path::new(&root).join("docs"), "docs", &["md"][..]),
     ] {
-        println!("cargo:rerun-if-changed={directory}");
-        let Ok(files) = fs::read_dir(Path::new(&root).join(directory)) else {
+        println!("cargo:rerun-if-changed={}", directory.display());
+        let Ok(files) = fs::read_dir(&directory) else {
             continue;
         };
         for file in files.flatten() {

@@ -7,6 +7,7 @@
 - `engine.*` operations are for the local POM node only (`engine.link` gives an earlier stage's loopback port and secret, which the POM hands only to the next stage's machine); the API key leaves the library only through `engine.upstream` and is never in `rpc.status`, `host.services`, logs or the screens. `src/proxy.rs` adds it on the way to Strata and drops the browser's credentials, `Origin` and `Referer`.
 - The generation contract with the POM gateway (`/pom/generate`, NDJSON `t`/`p`/`done`/`error`, reasoning inside `<think>`) is documented in the POM repository, `docs/subsystems/inference.md` section 7.1. Change both sides together.
 - `ui/src/host/runtime.ts` is the only place that touches `__POM_HOST__`. Class names use the `pb-` prefix, which `ui/build.mjs` renames to the plugin code.
+- The POM's local development rebuild runs `development.rebuild` from `ui/manifest.json` (`scripts/dev-ui.sh`) with the source read-only: it builds the UI in `POM_PLUGIN_OUT_DIR`, where `build.rs` takes it. It does not touch `build/runtime`: after changing `runtime/pom_strata_server.py`, run `scripts/build-runtime.sh` (or `install -m 0644 runtime/pom_strata_server.py build/runtime/`) on the machine, or Strata keeps running the old bridge.
 - Checks: `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `scripts/build-ui.sh`. A runtime change: `scripts/build-runtime.sh`, then run `runtime/pom_strata_server.py --engine mock` inside the POM image to check the route without a GPU.
 
 ## Maintaining this file

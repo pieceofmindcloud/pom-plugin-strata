@@ -31,5 +31,8 @@
     "strata": { "module": "ui/screens.js", "export": "strata", "styles": ["ui/plugin.css"] }
   },
   "i18n": { "en": "i18n/en.json", "pt-BR": "i18n/pt-BR.json" },
+  "development": {
+    "rebuild": [{ "run": ["scripts/dev-ui.sh"], "os": ["linux", "macos"] }]
+  },
   "assets": ["ui/screens.js", "ui/plugin.css", "i18n/en.json", "i18n/pt-BR.json", "docs/README.md"]
 }
