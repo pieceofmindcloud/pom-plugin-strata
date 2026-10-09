@@ -128,6 +128,28 @@ export function StatusView({ status, failed }: { status: StrataStatus | null; fa
   );
 }
 
+/** Copies text with the async API, which a page served over plain HTTP does not have, falling back to a hidden
+ * textarea and `execCommand("copy")` (as pom-plugin-logs). */
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+    const helper = document.createElement("textarea");
+    helper.value = text;
+    helper.style.position = "fixed";
+    helper.style.opacity = "0";
+    document.body.appendChild(helper);
+    helper.select();
+    const ok = document.execCommand("copy");
+    helper.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 /** Within this many pixels of the end the log counts as followed (the POM's log console uses the same). */
 const NEAR_BOTTOM = 32;
 /** Strata's own tag at the start of a line: `[pom]`, `[strata]`, `strata serve:`. */
@@ -163,14 +185,7 @@ function LogTerminal({ lines }: { lines: string[] }) {
       terminal.current?.scrollTo({ top: terminal.current.scrollHeight, behavior: "auto" });
     }
   };
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(lines.join("\n"));
-      setCopied("copied");
-    } catch {
-      setCopied("failed");
-    }
-  };
+  const copy = async () => setCopied((await copyText(lines.join("\n"))) ? "copied" : "failed");
 
   return (
     <Panel className="pb-panel pb-log-panel">
