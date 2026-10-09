@@ -166,7 +166,7 @@ fn query_inner(state: &PluginState, request: &[u8]) -> Result<Value, String> {
             let engine = engine(state)?;
             let mut status = engine.snapshot().status_json();
             if request["profile"] == "admin" {
-                status["log"] = json!(engine.log_tail(60));
+                status["log"] = json!(engine.log_tail(500));
             }
             Ok(status)
         }

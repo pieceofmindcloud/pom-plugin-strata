@@ -379,7 +379,7 @@ impl Engine {
         let Ok(text) = std::fs::read(&path) else {
             return Vec::new();
         };
-        let start = text.len().saturating_sub(64 * 1024);
+        let start = text.len().saturating_sub(256 * 1024);
         String::from_utf8_lossy(&text[start..])
             .lines()
             .rev()

@@ -23,5 +23,13 @@
   "unreachable": "The plugin did not answer. Check that it is active on this machine.",
   "monitorTitle": "Strata monitor",
   "tab.strata": "Strata",
-  "tab.status": "Status"
+  "tab.status": "Status",
+  "live": "Live",
+  "autoScrollOn": "Auto-scroll: on",
+  "autoScrollOff": "Auto-scroll: off",
+  "autoScrollEnable": "Enable automatic scrolling",
+  "autoScrollDisable": "Disable automatic scrolling",
+  "copyLog": "Copy log",
+  "logCopied": "Log copied",
+  "logCopyFailed": "Could not copy the log"
 }

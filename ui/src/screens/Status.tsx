@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { rpc, ui, usePluginI18n } from "../host/runtime";
 
 export type State = "idle" | "installing" | "preparing" | "loading" | "ready" | "stopping" | "error";
@@ -75,7 +75,7 @@ export function StatusView({ status, failed }: { status: StrataStatus | null; fa
   const { PageHeader, Panel, PanelHeader, Badge, KeyValue } = ui();
 
   return (
-    <div className="pb-page pb-page-pad">
+    <div className="pb-page pb-page-pad pb-status">
       <PageHeader title={t("title")} subtitle={t("subtitle")} />
 
       {failed && !status && <p className="pb-note pb-note-error" role="alert">{t("unreachable")}</p>}
@@ -121,14 +121,90 @@ export function StatusView({ status, failed }: { status: StrataStatus | null; fa
             </div>
           </Panel>
 
-          {status.log && (
-            <Panel className="pb-panel">
-              <PanelHeader title={t("log")} />
-              <pre className="pb-log">{status.log.length > 0 ? status.log.join("\n") : t("none")}</pre>
-            </Panel>
-          )}
+          {status.log && <LogTerminal lines={status.log} />}
         </>
       )}
     </div>
+  );
+}
+
+/** Within this many pixels of the end the log counts as followed (the POM's log console uses the same). */
+const NEAR_BOTTOM = 32;
+/** Strata's own tag at the start of a line: `[pom]`, `[strata]`, `strata serve:`. */
+const TAG = /^(\[[a-z]+\]|strata [a-z]+:)/;
+
+/** Strata's log as a terminal filling the rest of the screen, as the POM's deployment log console: it follows
+ * the end while it is at the end, stops when the reader scrolls up, and copies what it shows. */
+function LogTerminal({ lines }: { lines: string[] }) {
+  const { t } = usePluginI18n();
+  const { Panel, PanelHeader, Badge } = ui();
+  const terminal = useRef<HTMLDivElement>(null);
+  const atBottom = useRef(true);
+  const [follow, setFollow] = useState(true);
+  const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
+  const last = lines[lines.length - 1] ?? "";
+
+  useEffect(() => {
+    const box = terminal.current;
+    if (box && follow && atBottom.current) box.scrollTo({ top: box.scrollHeight, behavior: "auto" });
+  }, [follow, lines.length, last]);
+
+  const onScroll = () => {
+    const box = terminal.current;
+    if (!box) return;
+    atBottom.current = box.scrollHeight - (box.scrollTop + box.clientHeight) <= NEAR_BOTTOM;
+    if (!atBottom.current) setFollow(false);
+  };
+  const toggle = () => {
+    const next = !follow;
+    setFollow(next);
+    if (next) {
+      atBottom.current = true;
+      terminal.current?.scrollTo({ top: terminal.current.scrollHeight, behavior: "auto" });
+    }
+  };
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      setCopied("copied");
+    } catch {
+      setCopied("failed");
+    }
+  };
+
+  return (
+    <Panel className="pb-panel pb-log-panel">
+      <PanelHeader title={t("log")} actions={<Badge tone="aqua">{t("live")}</Badge>} />
+      <div className="pb-term-wrap">
+        <div className="pb-term-actions">
+          <button
+            type="button"
+            className="pb-term-button"
+            aria-pressed={follow}
+            title={t(follow ? "autoScrollDisable" : "autoScrollEnable")}
+            onClick={toggle}
+          >
+            <span aria-hidden="true">⤓</span>
+            {t(follow ? "autoScrollOn" : "autoScrollOff")}
+          </button>
+          <button type="button" className="pb-term-button" onClick={() => void copy()}>
+            <span aria-hidden="true">{copied === "copied" ? "✓" : "⧉"}</span>
+            {t(copied === "copied" ? "logCopied" : copied === "failed" ? "logCopyFailed" : "copyLog")}
+          </button>
+        </div>
+        <div ref={terminal} className="pb-term" role="log" aria-live="polite" onScroll={onScroll}>
+          {lines.length === 0 && <div className="pb-term-line pb-term-empty">{t("none")}</div>}
+          {lines.map((line, index) => {
+            const tag = TAG.exec(line)?.[0];
+            return (
+              <div key={index} className="pb-term-line">
+                {tag && <span className="pb-term-tag">{tag}</span>}
+                {tag ? line.slice(tag.length) : line}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </Panel>
   );
 }

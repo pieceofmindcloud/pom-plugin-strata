@@ -42,16 +42,95 @@
   overflow-wrap: anywhere;
 }
 
-.pb-log {
-  margin: 0;
-  padding: 12px 16px 16px;
-  max-height: 360px;
+/* The status fills the screen; the log takes the height the engine panel leaves. */
+.pb-status {
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  height: 100%;
+  min-height: 0;
   overflow: auto;
+}
+
+.pb-log-panel {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 320px;
+}
+
+/* A terminal, as the POM's deployment log console. */
+.pb-term-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  background: #000;
+}
+
+.pb-term {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  padding: 56px 16px 16px;
+  color: #d1fae5;
   font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: .72rem;
-  line-height: 1.5;
+  font-size: .76rem;
+  line-height: 1.5rem;
+}
+
+.pb-term-line {
+  padding: 2px 8px;
+  border-radius: 4px;
   white-space: pre-wrap;
-  color: rgb(var(--muted));
+  overflow-wrap: anywhere;
+}
+
+.pb-term-line:hover {
+  background: rgba(255, 255, 255, .045);
+}
+
+.pb-term-tag {
+  color: #67e8f9;
+}
+
+.pb-term-empty {
+  color: #64748b;
+}
+
+.pb-term-actions {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 1;
+  display: flex;
+  gap: 8px;
+}
+
+.pb-term-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, .2);
+  border-radius: 6px;
+  color: #e2e8f0;
+  background: rgba(255, 255, 255, .1);
+  font-size: .75rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.pb-term-button:hover {
+  border-color: rgba(255, 255, 255, .35);
+  background: rgba(255, 255, 255, .2);
+  color: #fff;
+}
+
+.pb-term-button:focus-visible {
+  outline: 2px solid rgba(67, 224, 200, .7);
+  outline-offset: 1px;
 }
 
 .pb-frame {
@@ -71,7 +150,6 @@
 .pb-scroll {
   height: 100%;
   min-height: 0;
-  overflow: auto;
 }
 
 /* The single screen's tabs: the panel's tab tokens (`--tab-*`, POM host 5),
