@@ -116,6 +116,13 @@ class ThinkWrapper:
         return ""
 
 
+def fit_budget(max_tokens: int, room: int) -> int:
+    """The tokens to generate: the POM's ceiling (0 = none) within the room the prompt leaves. The POM fits
+    max_tokens to the context with its own count of the prompt; Strata counts it after its chat template, so
+    the ceiling can be a few tokens over, and Strata never shortens a request by itself (#545)."""
+    return room if max_tokens <= 0 else min(max_tokens, room)
+
+
 def raw_ids(svc, prompt: str, max_tokens: int) -> tuple[list[int], int]:
     """A completion prompt as it is (no template), with Strata's context check."""
     ids = svc.tok.encode(prompt, parse_special=True)
@@ -125,7 +132,7 @@ def raw_ids(svc, prompt: str, max_tokens: int) -> tuple[list[int], int]:
     room = ctx - S.CTX_SLACK - len(ids)
     if room < 1:
         raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context ({ctx})")
-    return ids, room if max_tokens <= 0 else min(max_tokens, room)
+    return ids, fit_budget(max_tokens, room)
 
 
 def make_handler(original):
@@ -185,7 +192,9 @@ def make_handler(original):
                 svc.load()
                 if chat:
                     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
-                    ids, thinking, max_new = svc.prepare(messages, None, {"enable_thinking": thinking}, max_tokens)
+                    # No limit asked: prepare answers the room the templated prompt leaves.
+                    ids, thinking, room = svc.prepare(messages, None, {"enable_thinking": thinking}, None)
+                    max_new = fit_budget(max_tokens, room)
                 else:
                     ids, max_new = raw_ids(svc, prompt, max_tokens)
                     thinking = False

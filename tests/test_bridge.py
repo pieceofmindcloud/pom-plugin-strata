@@ -41,6 +41,13 @@ def test_non_string_arguments_are_json():
     assert '<parameter=o>\n{"a": [1]}\n</parameter>' in B.tool_call_text("f", {"o": {"a": [1]}})
 
 
+def test_the_poms_ceiling_fits_the_room_the_templated_prompt_leaves():
+    # The POM fit 249993 to the context with its own count; the template left 249926.
+    assert B.fit_budget(249993, 249926) == 249926
+    assert B.fit_budget(512, 249926) == 512
+    assert B.fit_budget(0, 249926) == 249926
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
