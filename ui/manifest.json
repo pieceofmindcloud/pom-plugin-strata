@@ -20,21 +20,15 @@
       "id": "strata",
       "label": { "en": "Strata", "pt-BR": "Strata" },
       "icon": "cpu",
-      "to": "/status",
-      "roles": ["admin"],
-      "children": [
-        { "id": "status", "label": { "en": "Status", "pt-BR": "Estado" }, "icon": "gauge", "to": "/status" },
-        { "id": "monitor", "label": { "en": "Monitor", "pt-BR": "Monitor" }, "icon": "activity", "to": "/monitor" }
-      ]
+      "to": "/strata",
+      "roles": ["admin"]
     }
   ],
   "routes": [
-    { "path": "/status", "screen": "status", "roles": ["admin"] },
-    { "path": "/monitor", "screen": "monitor", "full_bleed": true, "roles": ["admin"] }
+    { "path": "/strata", "screen": "strata", "full_bleed": true, "roles": ["admin"] }
   ],
   "screens": {
-    "status": { "module": "ui/screens.js", "export": "status", "styles": ["ui/plugin.css"] },
-    "monitor": { "module": "ui/screens.js", "export": "monitor", "styles": ["ui/plugin.css"] }
+    "strata": { "module": "ui/screens.js", "export": "strata", "styles": ["ui/plugin.css"] }
   },
   "i18n": { "en": "i18n/en.json", "pt-BR": "i18n/pt-BR.json" },
   "assets": ["ui/screens.js", "ui/plugin.css", "i18n/en.json", "i18n/pt-BR.json", "docs/README.md"]

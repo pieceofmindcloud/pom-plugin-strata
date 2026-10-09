@@ -26,7 +26,7 @@ POM documentation screen).
 | `cmake/pom-static-cuda.cmake` | links Strata with the static cudart/cuBLAS/cuBLASLt, as the POM links llama.cpp |
 | `docker/` | the runtime build image (the POM's `nvidia/cuda:13.4.1-devel-ubuntu24.04`) and its script |
 | `strata.lock` | the Strata repository and commit, and the llama.cpp commit Strata pins |
-| `ui/`, `i18n/`, `docs/` | `pom-plugin-ui/v1` manifest, Status and Monitor screens, catalogs and the guide |
+| `ui/`, `i18n/`, `docs/` | `pom-plugin-ui/v1` manifest, the Strata screen (status, and Strata's app while a model is served), catalogs and the guide |
 | `scripts/` | runtime build, UI build, library build and release packaging |
 
 ## Operations

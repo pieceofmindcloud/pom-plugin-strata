@@ -69,13 +69,13 @@ export function useStatus() {
   return { status, failed };
 }
 
-export function Status() {
+/** The engine's state, model, cards and log, from one `useStatus` poll. */
+export function StatusView({ status, failed }: { status: StrataStatus | null; failed: boolean }) {
   const { t } = usePluginI18n();
   const { PageHeader, Panel, PanelHeader, Badge, KeyValue } = ui();
-  const { status, failed } = useStatus();
 
   return (
-    <div className="pb-page">
+    <div className="pb-page pb-page-pad">
       <PageHeader title={t("title")} subtitle={t("subtitle")} />
 
       {failed && !status && <p className="pb-note pb-note-error" role="alert">{t("unreachable")}</p>}

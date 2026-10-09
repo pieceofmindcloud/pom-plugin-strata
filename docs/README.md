@@ -29,9 +29,9 @@ machine with one or more consumer cards and enough RAM.
    to Strata, which streams the tokens back.
 6. **Undeploy** stops Strata and gives the GPU and the RAM back.
 
-The plugin screens show the engine state and Strata's log (**Strata, Status**)
-and Strata's own web app with its live GPU, speed and cache monitor
-(**Strata, Monitor**). Both are for the administrator.
+The **Strata** screen, for the administrator, shows the engine state and
+Strata's log. While a model is served it has two tabs: **Strata**, Strata's
+own web app with its live GPU, speed and cache monitor, and **Status**.
 
 ## Speculative decoding (MTP)
 

@@ -63,6 +63,84 @@
   background: #fff;
 }
 
-.pb-frame-wait {
-  padding: 24px;
+
+.pb-page-pad {
+  padding: 20px 24px 24px;
+}
+
+.pb-scroll {
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* The single screen's tabs, drawn as POM-JEV's with the panel's theme tokens. */
+.pb-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.pb-shell-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  padding: 6px 12px 0;
+  border-bottom: 1px solid rgb(var(--line));
+  background: rgb(var(--ink));
+}
+
+.pb-shell-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 10px 10px 0 0;
+  color: rgb(var(--faint));
+  background: transparent;
+  font-size: 12.5px;
+  font-weight: 700;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.pb-shell-tab span {
+  color: rgb(var(--sky));
+  font: 700 10.5px/1 "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.pb-shell-tab:hover {
+  color: rgb(var(--fg));
+}
+
+.pb-shell-tab-on {
+  margin-bottom: -1px;
+  color: rgb(var(--fg));
+  border-color: rgb(var(--line));
+  background: rgb(var(--surface));
+  box-shadow: inset 0 2px 0 rgb(var(--aqua));
+}
+
+.pb-shell-tab:focus-visible {
+  outline: 2px solid rgb(var(--sky));
+  outline-offset: -2px;
+}
+
+.pb-shell-panel {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.pb-shell-panel > .pb-frame {
+  flex: 1 1 auto;
+}
+
+.pb-frame[hidden] {
+  display: none;
 }

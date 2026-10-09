@@ -22,7 +22,6 @@
   "none": "-",
   "unreachable": "O plugin não respondeu. Verifique se ele está ativo nesta máquina.",
   "monitorTitle": "Monitor do Strata",
-  "monitorIdle": "O monitor do Strata abre enquanto um modelo estiver implantado nesta máquina com o serviço de inferência Strata.",
-  "monitorStarting": "O monitor do Strata abre assim que o modelo terminar de carregar.",
-  "monitorUnavailable": "O Strata não está rodando: {error}"
+  "tab.strata": "Strata",
+  "tab.status": "Estado"
 }
