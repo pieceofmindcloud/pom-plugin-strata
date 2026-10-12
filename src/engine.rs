@@ -58,6 +58,10 @@ pub struct Link {
     /// For a later stage: the loopback port where this node relays the link
     /// to the earlier stage's machine.
     pub prev_port: Option<u16>,
+    /// For a later stage: how many frames the POM's relay keeps in flight at
+    /// once (the deployment's `prefill_max_inflight_chunks`), so the engine
+    /// asks for as many prompt pieces ahead.
+    pub max_inflight: Option<u32>,
 }
 
 impl Link {
@@ -87,7 +91,21 @@ impl Link {
                     .ok_or("link.prev_port is not a port")?,
             ),
         };
-        Ok(Some(Self { token, prev_port }))
+        let max_inflight = match &value["max_inflight"] {
+            Value::Null => None,
+            count => Some(
+                count
+                    .as_u64()
+                    .and_then(|count| u32::try_from(count).ok())
+                    .filter(|count| *count > 0)
+                    .ok_or("link.max_inflight is not a positive count")?,
+            ),
+        };
+        Ok(Some(Self {
+            token,
+            prev_port,
+            max_inflight,
+        }))
     }
 }
 
@@ -951,8 +969,16 @@ impl Manager {
         if request.sessions > 1 {
             config["parallel"] = json!(request.sessions);
         }
+        let mut env = serde_json::Map::new();
         if let Some(token) = request.link.as_ref().and_then(|link| link.token.as_ref()) {
-            config["env"] = json!({"STRATA_STAGE_TOKEN": token});
+            env.insert("STRATA_STAGE_TOKEN".into(), json!(token));
+        }
+        // The POM's micro-pipelining: as many prompt pieces ahead as its relay keeps in flight.
+        if let Some(count) = request.link.as_ref().and_then(|link| link.max_inflight) {
+            env.insert("STRATA_STAGE_INFLIGHT".into(), json!(count.to_string()));
+        }
+        if !env.is_empty() {
+            config["env"] = Value::Object(env);
         }
         // Applied by the bridge with Strata's own rules (serve/runconfig.py).
         if !request.settings.is_empty() {
@@ -1283,11 +1309,12 @@ mod tests {
         let token = "t".repeat(32);
         let request = LoadRequest::from_json(&json!({
             "model_path": "/m/tail.gguf",
-            "link": {"token": token, "prev_port": 4100}
+            "link": {"token": token, "prev_port": 4100, "max_inflight": 4}
         }))
         .unwrap();
         let link = request.link.unwrap();
         assert_eq!(link.prev_port, Some(4100));
+        assert_eq!(link.max_inflight, Some(4));
         assert_eq!(link.token.as_deref(), Some(token.as_str()));
         let first = LoadRequest::from_json(&json!({"model_path": "/m/head.gguf", "link": {}}))
             .unwrap()
@@ -1297,6 +1324,7 @@ mod tests {
         for bad in [
             json!({"token": "short"}),
             json!({"token": token, "prev_port": 0}),
+            json!({"token": token, "prev_port": 4100, "max_inflight": 0}),
         ] {
             assert!(
                 LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "link": bad})).is_err()

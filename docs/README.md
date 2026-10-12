@@ -50,8 +50,23 @@ tokens. The second slice (to the last layer) serves the requests, with the
 head, the sampling and the MTP draft layer, and asks the first machine for
 those hidden states. The POM carries them between the machines, signed, over
 the route it already uses between its nodes: neither Strata listens beyond
-loopback. Every request starts from position 0 on both machines (no prompt
-cache in this mode). Slices made by the POM's slicer load as they are.
+loopback. Slices made by the POM's slicer load as they are.
+
+The POM's own settings for a split model apply here as for llama.cpp, in the
+same section of the deploy inspector:
+
+- **Prompt pieces in flight** (`prefill_max_inflight_chunks`): the second
+  machine asks the first for that many prompt pieces ahead, so both read the
+  prompt at once.
+- **Hidden-state precision**: the hidden states cross between the machines in
+  that precision (f16 by default; f32, f8, int4) and reach Strata as f32.
+
+The prompt cache works across the two machines: the first keeps its own
+checkpoints where the second keeps them, and a request continues on both from
+the same tokens. The `reused` count of a request is then real; each machine's
+Strata log says where it continued from ("continues after N tokens"). When
+the first machine holds no state for those tokens, the request reads the
+prompt from the start on both.
 
 ## Where things live on a node
 

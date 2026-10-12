@@ -81,8 +81,8 @@ pins; the node downloads and verifies the runtime on first use.
 ## Known limits
 
 - A whole model on one machine, or two layer slices on two machines (the
-  stage link of the Strata fork pinned in `strata.lock`); no prompt cache in
-  split mode.
+  stage link of the Strata fork pinned in `strata.lock`, carried by the POM
+  with its pieces in flight and hidden-state precision).
 - Linux x86_64 with NVIDIA cards of compute capability 7.5 or newer; this
   build carries sm_86 and sm_120 code.
 - The model is prepared once per file into `<POM database dir>/strata/packs/`
