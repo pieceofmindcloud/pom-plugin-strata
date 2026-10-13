@@ -2,5 +2,5 @@
 # The llama.cpp commit is the one Strata's setup.py pins (LLAMA_CPP_COMMIT);
 # only its ggml (engine build) and gguf-py (pack tools) are used.
 STRATA_REPOSITORY=https://github.com/pieceofmindcloud/Strata.git
-STRATA_COMMIT=2f5b1d763043cf99a65ae46b87f29d8142cb0355
+STRATA_COMMIT=8b37df35dc526160e10f390a8b22899153796888
 LLAMA_CPP_COMMIT=3cf03257f219afbe7334045ff7c6a06ac68c627d

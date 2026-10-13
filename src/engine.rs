@@ -52,6 +52,9 @@ pub struct LoadRequest {
     /// A POM slice runs as one stage of a split across machines: the link
     /// the POM gives (`{}` for the first stage, which makes its own secret).
     pub link: Option<Link>,
+    /// Where the bridge keeps the conversation sessions (`POM_STRATA_SESSIONS`):
+    /// the node's KV snapshot folder, so the KV cache clear empties them.
+    pub session_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -196,6 +199,16 @@ impl LoadRequest {
             kv,
             settings: crate::settings::select(&value["settings"]),
             link: Link::from_json(&value["link"])?,
+            session_dir: match value["session_dir"].as_str().filter(|dir| !dir.is_empty()) {
+                Some(dir) => {
+                    let dir = PathBuf::from(dir);
+                    if !dir.is_absolute() {
+                        return Err("session_dir must be absolute".into());
+                    }
+                    Some(dir)
+                }
+                None => None,
+            },
         })
     }
 }
@@ -1087,6 +1100,9 @@ impl Manager {
             .arg(&config_path)
             .arg("--port")
             .arg(port.to_string());
+        if let Some(dir) = &request.session_dir {
+            command.env("POM_STRATA_SESSIONS", dir);
+        }
         self.append_log(&format!(
             "[pom] starting Strata for {} on 127.0.0.1:{port}",
             request.model_label
