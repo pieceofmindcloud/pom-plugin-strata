@@ -118,6 +118,7 @@ def save_turn(svc, key: str, prompt: list[int], locked: bool = True, held: list[
     slot is still the turn's own, its window is open).  Without them the slot is found by its held tokens.
     None: no slot holds the turn."""
     if not getattr(svc, "batch", 0):
+        print(f"pom: session {key}: the engine reports no batch slots, not saved", file=sys.stderr, flush=True)
         return None
     deadline = time.monotonic() + 5
     with svc.slot_cv:
