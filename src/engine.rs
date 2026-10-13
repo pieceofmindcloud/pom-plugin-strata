@@ -997,6 +997,10 @@ impl Manager {
         } else if let Some(mtp) = self.mtp_dir(&request.model_path) {
             args.extend(["--spec", "4", "--spec-min-p", "0.5", "--mtp"].map(str::to_owned));
             args.push(mtp.display().to_string());
+        } else {
+            // No drafter for this model (a slice without one): the native IQ engine still needs a verify window
+            // (--spec T >= 2); the windows come from suffix matches in the context.
+            args.extend(["--spec", "4"].map(str::to_owned));
         }
         if let Some(port) = request.link.as_ref().and_then(|link| link.prev_port) {
             args.push("--stage-prev".into());
