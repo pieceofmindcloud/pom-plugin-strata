@@ -75,16 +75,18 @@ def session_path(key: str, kind: str) -> str:
     return str(session_dir() / P.file_name(key, kind))
 
 
-def engine_session(svc, action: str, key: str, slot: int, ids: list[int] | None = None, locked: bool = True) -> dict:
+def engine_session(svc, action: str, key: str, slot: int, ids: list[int] | None = None, locked: bool = True,
+                   in_turn: bool = False) -> dict:
     """One keyed session step on a batch slot: the whole session, or its delta (`*_delta`).  `locked`: under the service
     FIFO.  A turn's own save runs inside the turn's `run`, which holds the FIFO, so it passes `locked=False`: the
     engine has finished the turn by then (its slot is free), and nothing else is sent meanwhile."""
     kind = "delta" if action.endswith("_delta") else "full"
     path = session_path(key, kind)
+    extra = {"in_turn": True} if in_turn else {}
     if not locked:
-        return svc.engine.session_file(action, path, slot=slot, ids=ids)
+        return svc.engine.session_file(action, path, slot=slot, ids=ids, **extra)
     with svc.fifo:
-        return svc.engine.session_file(action, path, slot=slot, ids=ids)
+        return svc.engine.session_file(action, path, slot=slot, ids=ids, **extra)
 
 
 def restore_for_prompt(svc, ids: list[int]) -> None:
@@ -108,31 +110,36 @@ def restore_for_prompt(svc, ids: list[int]) -> None:
     slot_bases[slot] = (key, sessions[key])
 
 
-def save_turn(svc, key: str, prompt: list[int], locked: bool = True) -> dict | None:
-    """After a turn that ran in a batch slot: the slot saves the conversation under `key`.  When the slot's base is
-    still this conversation's, the delta from that base is cut first (the peers apply it to their whole session), then
-    the whole session is saved, which becomes the next base.  None: no slot holds the turn."""
+def save_turn(svc, key: str, prompt: list[int], locked: bool = True, held: list[int] | None = None,
+              slot: int | None = None, in_turn: bool = False) -> dict | None:
+    """A turn that ran in a batch slot: the slot saves the conversation under `key`.  When the slot's base is still this
+    conversation's, the delta from that base is cut first (the peers apply it to their whole session), then the whole
+    session is saved, which becomes the next base.  `slot`/`held` come from the engine's turn hook (`in_turn`: the
+    slot is still the turn's own, its window is open).  Without them the slot is found by its held tokens.
+    None: no slot holds the turn."""
     if not getattr(svc, "batch", 0):
         return None
     deadline = time.monotonic() + 5
     with svc.slot_cv:
-        while any(svc.slot_busy) and time.monotonic() < deadline:
+        while time.monotonic() < deadline and any(b for x, b in enumerate(svc.slot_busy) if x != slot):
             svc.slot_cv.wait(0.05)
-        slot = P.slot_for_turn(prompt, svc.slot_held)
-        held = list(svc.slot_held[slot]) if slot is not None else []
+        if slot is None:
+            slot = P.slot_for_turn(prompt, svc.slot_held)
+            held = list(svc.slot_held[slot]) if slot is not None else []
     if slot is None:
         return None
+    held = list(held or [])
     base = slot_bases.get(slot)
     base_ids = base[1] if base and base[0] == key and P.base_holds(held, base[1]) else None
     folder = session_dir()
     delta = False
     if base_ids is not None:
         try:
-            engine_session(svc, "save_delta", key, slot, locked=locked)
+            engine_session(svc, "save_delta", key, slot, locked=locked, in_turn=in_turn)
             delta = True
         except S.SessionRefused as e:
             print(f"pom: session {key}: no delta this turn: {e}", file=sys.stderr, flush=True)
-    whole = engine_session(svc, "save", key, slot, locked=locked)
+    whole = engine_session(svc, "save", key, slot, locked=locked, in_turn=in_turn)
     P.write_json(folder / P.file_name(key, "full_ids"), whole["ids"])
     if delta:
         P.write_json(folder / P.file_name(key, "delta_meta"), {"base": base_ids, "ids": whole["ids"]})
@@ -477,9 +484,19 @@ def make_handler(original):
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 think = ThinkWrapper()
+                turn: dict = {}
+
+                def turn_hook(slot, held):
+                    # the engine's turn is ending in `slot`, which still holds it: save it there
+                    turn["ran"] = True
+                    try:
+                        turn["saved"] = save_turn(svc, session, list(ids), held=held, slot=slot, in_turn=True)
+                    except (S.SessionRefused, S.EngineDied, ValueError) as e:
+                        print(f"pom: session {session} not saved: {e}", file=sys.stderr, flush=True)
                 try:
                     for kind, x in svc.run(ids, thinking, None, max_new, sampling, cancel,
-                                           keep_slot=session is not None):
+                                           keep_slot=session is not None,
+                                           turn_hook=turn_hook if session is not None else None):
                         if kind == "ping":
                             progress = getattr(svc.engine, "progress", None)
                             self._line({"p": list(progress)} if progress else {"p": None})
@@ -491,13 +508,11 @@ def make_handler(original):
                             tail = think.close()
                             if tail:
                                 self._line({"t": tail})
-                            # the turn is saved before its done line: the POM syncs the peers from the files it finds
-                            saved = None
-                            if session is not None:
-                                try:
-                                    saved = save_turn(svc, session, list(ids), locked=False)
-                                except (S.SessionRefused, S.EngineDied, ValueError) as e:
-                                    print(f"pom: session {session} not saved: {e}", file=sys.stderr, flush=True)
+                            # the turn was saved in its slot window (the hook below); the done line reports it
+                            saved = turn.get("saved")
+                            if session is not None and "ran" not in turn:
+                                print(f"pom: session {session}: the turn did not run in a batch slot, not saved",
+                                      file=sys.stderr, flush=True)
                             self._line({"done": {
                                 **({"session": {"key": session, "saved": saved}} if saved else {}),
                                 "finish": x.get("finish"),

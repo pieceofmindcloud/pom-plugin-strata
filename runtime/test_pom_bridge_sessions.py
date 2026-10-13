@@ -29,7 +29,7 @@ class FakeEngine:
         self.base = {}          # slot -> tokens of the base (last save or restore)
         self.calls = []
 
-    def session_file(self, action, path, slot=None, ids=None):
+    def session_file(self, action, path, slot=None, ids=None, in_turn=False):
         self.calls.append((action, Path(path).name, slot))
         held = self.svc.slot_held
         if action == "save":
@@ -113,6 +113,15 @@ class BridgeSessions(unittest.TestCase):
         result = B.save_turn(svc, "conv", [1, 2, 3, 4])
         self.assertEqual(result["delta"], False)
         self.assertFalse(any(call[0] == "save_delta" and call[1] == "conv.strsdlt" for call in svc.engine.calls))
+
+    def test_a_turn_hook_saves_in_its_own_slot_while_it_is_busy(self):
+        svc = FakeService()
+        svc.slot_held[0] = [1, 2, 3, 4]
+        svc.slot_busy[0] = True                  # the turn's own slot, its window still open
+        result = B.save_turn(svc, "conv", [1, 2, 3], held=[1, 2, 3, 4], slot=0, in_turn=True)
+        self.assertEqual(result, {"ids": [1, 2, 3, 4], "delta": False})
+        self.assertEqual(P.read_ids(self.folder / "conv.ids.json"), [1, 2, 3, 4])
+        self.assertTrue(svc.slot_busy[0])        # the save does not free the turn's slot
 
     def test_a_restore_takes_the_longest_saved_start_of_the_prompt(self):
         svc = FakeService()
