@@ -28,11 +28,16 @@ and parses the calls out of the text. Strata's parser still takes the calls
 out of the output; they go back into the text in the template's own form.
 
     GET /pom/status               loaded, model, context, busy (no prompts)
+
+    POST /pom/session             a session file in the session folder (no paths: one file name)
+    {"action": "save" | "restore" | "save_delta" | "restore_delta", "filename": "conv-1.strsdlt"}
+    -> {"tokens", "bytes", "ms"}; a delta is cut from, and applied to, the base the engine holds.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 from pathlib import Path
@@ -48,6 +53,14 @@ from serve import server as S  # noqa: E402
 # (llama-engine `apply_chat_template`). The same here, so a model answers the
 # same prompt the same way whichever engine serves it.
 SYSTEM_PROMPT = "You are a helpful assistant."
+SESSION_ACTIONS = ("save", "restore", "save_delta", "restore_delta")
+
+
+def session_dir() -> Path:
+    """The folder session files live in: POM_STRATA_SESSIONS, else /data/strata/sessions."""
+    path = Path(os.environ.get("POM_STRATA_SESSIONS", "/data/strata/sessions"))
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
                  "repeat_penalty", "seed")
 
@@ -152,6 +165,16 @@ def make_handler(original):
                 super().do_GET()
 
             def do_POST(self):
+                if self.path.split("?")[0].rstrip("/") == "/pom/session":
+                    if self._authorized():
+                        try:
+                            req = json.loads(self._body() or b"{}")
+                            if not isinstance(req, dict):
+                                raise ValueError("send a JSON object")
+                            self._pom_session(req)
+                        except ValueError as e:
+                            self._json(400, {"error": str(e)})
+                    return
                 if self.path.split("?")[0].rstrip("/") != "/pom/generate":
                     return super().do_POST()
                 if not self._authorized():
@@ -180,6 +203,45 @@ def make_handler(original):
                             record["state"] = "error" if record.get("error") else record.get("outcome",
                                                                                                "completed")
                         svc.request_trace.record = None
+
+            def _pom_session(self, req: dict) -> None:
+                action = req.get("action")
+                if action not in SESSION_ACTIONS:
+                    raise ValueError("action must be save, restore, save_delta or restore_delta")
+                why = S.slot_filename_problem(req.get("filename"))
+                if why:
+                    raise ValueError(f"filename {why}")
+                path = str(session_dir() / req["filename"])
+                if action.startswith("restore") and not os.path.lexists(path):
+                    self._json(404, {"error": f"no session named {req['filename']}"})
+                    return
+                with svc.status_lock:
+                    svc.status["queued"] += 1
+                waiting = True
+                try:
+                    with svc.fifo:
+                        with svc.status_lock:
+                            svc.status["queued"] -= 1
+                        waiting = False
+                        if not svc.loaded():
+                            self._json(503, {"error": "the model is not loaded"})
+                            return
+                        with svc.status_lock:
+                            svc.status.update(busy=True, phase=action.replace("_", " "), started=S.time.time())
+                        try:
+                            result = svc.engine.session_file(action, path)
+                        except S.SessionRefused as e:
+                            self._json(e.status, {"error": str(e), "kind": e.kind, "published": bool(e.published)})
+                            return
+                        finally:
+                            with svc.status_lock:
+                                svc.status["busy"] = False
+                finally:
+                    if waiting:
+                        with svc.status_lock:
+                            svc.status["queued"] -= 1
+                self._json(200, {"tokens": result.get("tokens"), "bytes": result.get("bytes"),
+                                 "ms": result.get("ms")})
 
             def _line(self, obj) -> None:
                 self.wfile.write(json.dumps(obj, ensure_ascii=False).encode() + b"\n")
