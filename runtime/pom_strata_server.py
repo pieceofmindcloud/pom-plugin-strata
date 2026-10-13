@@ -89,17 +89,25 @@ def engine_session(svc, action: str, key: str, slot: int, ids: list[int] | None 
         return svc.engine.session_file(action, path, slot=slot, ids=ids, **extra)
 
 
+def batch_engine(svc):
+    """The engine that owns the batch slots (`svc.engine`: StrataEngine keeps batch, slot_cv, slot_busy, slot_held and
+    pick_slot), or None when it runs no batch. The service itself has none of them."""
+    engine = getattr(svc, "engine", None)
+    return engine if engine is not None and getattr(engine, "batch", 0) else None
+
+
 def restore_for_prompt(svc, ids: list[int]) -> None:
     """Before a turn: a saved session that starts the prompt further than any slot holds it is restored into a free
     slot, so the engine reads only the rest.  A session that cannot be restored leaves the slots as they were."""
-    if not getattr(svc, "batch", 0) or not svc.loaded():
+    engine = batch_engine(svc)
+    if engine is None or not svc.loaded():
         return
     sessions = P.read_sessions(session_dir())
     if not sessions:
         return
-    with svc.slot_cv:
-        key = P.choose_restore(ids, sessions, svc.slot_held)
-        slot = svc.pick_slot(ids) if key is not None else None
+    with engine.slot_cv:
+        key = P.choose_restore(ids, sessions, engine.slot_held)
+        slot = engine.pick_slot(ids) if key is not None else None
     if key is None or slot is None:
         return
     try:
@@ -117,16 +125,17 @@ def save_turn(svc, key: str, prompt: list[int], locked: bool = True, held: list[
     session is saved, which becomes the next base.  `slot`/`held` come from the engine's turn hook (`in_turn`: the
     slot is still the turn's own, its window is open).  Without them the slot is found by its held tokens.
     None: no slot holds the turn."""
-    if not getattr(svc, "batch", 0):
-        print(f"pom: session {key}: the engine reports no batch slots, not saved", file=sys.stderr, flush=True)
+    engine = batch_engine(svc)
+    if engine is None:
+        print(f"pom: session {key}: the engine runs no batch slots, not saved", file=sys.stderr, flush=True)
         return None
     deadline = time.monotonic() + 5
-    with svc.slot_cv:
-        while time.monotonic() < deadline and any(b for x, b in enumerate(svc.slot_busy) if x != slot):
-            svc.slot_cv.wait(0.05)
+    with engine.slot_cv:
+        while time.monotonic() < deadline and any(b for x, b in enumerate(engine.slot_busy) if x != slot):
+            engine.slot_cv.wait(0.05)
         if slot is None:
-            slot = P.slot_for_turn(prompt, svc.slot_held)
-            held = list(svc.slot_held[slot]) if slot is not None else []
+            slot = P.slot_for_turn(prompt, engine.slot_held)
+            held = list(engine.slot_held[slot]) if slot is not None else []
     if slot is None:
         return None
     held = list(held or [])
@@ -161,8 +170,11 @@ def apply_delta(svc, key: str) -> dict:
     if meta is None or base is None or meta[0] != base:
         raise ValueError("the whole session here is not the base of the delta")
     _, ids = meta
-    with svc.slot_cv:
-        slot = svc.pick_slot(ids)
+    engine = batch_engine(svc)
+    if engine is None:
+        raise ValueError("the engine runs no batch slots")
+    with engine.slot_cv:
+        slot = engine.pick_slot(ids)
     if slot is None:
         raise ValueError("no free batch slot to apply the delta in")
     engine_session(svc, "restore", key, slot, ids=base)

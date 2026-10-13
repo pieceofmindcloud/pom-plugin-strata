@@ -22,12 +22,32 @@ except ImportError as error:  # no Strata checkout on the path: the engine-facin
 
 class FakeEngine:
     """Slots hold tokens; a save writes the slot's tokens to the file, a restore reads them back; deltas are the tail
-    after the base the slot last saved or restored, and a delta is refused when the slot holds no base."""
+    after the base the slot last saved or restored, and a delta is refused when the slot holds no base.  As in the
+    real StrataEngine, the batch state is here, not on the service."""
 
     def __init__(self, svc):
         self.svc = svc
         self.base = {}          # slot -> tokens of the base (last save or restore)
         self.calls = []
+
+    @property
+    def batch(self):
+        return self.svc._slots
+
+    @property
+    def slot_cv(self):
+        return self.svc.slot_cv
+
+    @property
+    def slot_busy(self):
+        return self.svc.slot_busy
+
+    @property
+    def slot_held(self):
+        return self.svc.slot_held
+
+    def pick_slot(self, prompt):
+        return self.svc.pick_slot(prompt)
 
     def session_file(self, action, path, slot=None, ids=None, in_turn=False):
         self.calls.append((action, Path(path).name, slot))
@@ -58,8 +78,10 @@ class FakeEngine:
 
 
 class FakeService:
+    """The service has no batch attribute of its own: as in the real server, the batch lives on `engine`."""
+
     def __init__(self, slots=2):
-        self.batch = slots
+        self._slots = slots
         self.slot_cv = threading.Condition()
         self.slot_busy = [False] * slots
         self.slot_held = [[] for _ in range(slots)]
