@@ -73,18 +73,28 @@ follow the POM's defaults. Without `STRATA_SOURCE_DIR` the script clones
 library finds `build/runtime` through the source mount, so nothing has to be
 downloaded.
 
-**Releases** attach three files to the GitHub release `v<version>`: the
-library, `pom-plugin-linux-x86_64.json` and
-`strata-runtime-linux-x86_64.tar.gz`, whose URL, size and SHA-256 the library
-pins; the node downloads and verifies the runtime on first use.
+**AMD cards** run the HIP runtime: `scripts/build-runtime.sh --hip` builds it
+in ROCm's image into `build/runtime-hip` (with `--native` and `ROCM_PATH`, on
+the host, e.g. with AMD's TheRock wheels), carrying the ROCm libraries the
+engine needs.
+
+**Releases** are made by the `Publish release` workflow
+(`.github/workflows/release.yml`): it builds both runtimes for the NVIDIA and
+AMD families on their own runners and attaches four files to the GitHub
+release `v<version>`: the library, `pom-plugin-linux-x86_64.json`,
+`strata-runtime-linux-x86_64.tar.gz` and
+`strata-runtime-hip-linux-x86_64.tar.gz`, whose URLs, sizes and SHA-256 the
+library pins; a node downloads and verifies the runtime its GPUs need on first
+use.
 
 ## Known limits
 
-- A whole model on one machine, or two layer slices on two machines (the
+- A whole model on one machine, or layer slices on several machines (the
   stage link of the Strata fork pinned in `strata.lock`, carried by the POM
-  with its pieces in flight and hidden-state precision).
-- Linux x86_64 with NVIDIA cards of compute capability 7.5 or newer; this
-  build carries sm_86 and sm_120 code.
+  with its pieces in flight and hidden-state precision); a machine's slice
+  runs on all its GPUs of one vendor.
+- Linux x86_64 with NVIDIA cards of compute capability 7.5 or newer (CUDA) or
+  wave32 AMD cards (HIP).
 - The model is prepared once per file into `<POM database dir>/strata/packs/`
   (about 1.5 GB for the IQ3_XXS file). The MTP draft layer is used only when a
   prepared one is found (see the guide).

@@ -49,41 +49,47 @@ fn require_built_ui(root: &str, dist: &Path) {
     }
 }
 
-/// The Strata runtime this library runs: the release asset pinned by the
-/// package script, and the development directory next to this source.
+/// The Strata runtimes this library runs, one per GPU backend: the release
+/// assets pinned by the package script (`STRATA_RUNTIME_*` for CUDA,
+/// `STRATA_RUNTIME_HIP_*` for HIP), and the development directories next to
+/// this source.
 fn runtime_release(root: &str) -> String {
-    for key in [
-        "STRATA_RUNTIME_URL",
-        "STRATA_RUNTIME_SHA256",
-        "STRATA_RUNTIME_SIZE",
+    let mut out = String::new();
+    for (prefix, constant, dev) in [
+        ("STRATA_RUNTIME", "RUNTIME", "build/runtime"),
+        ("STRATA_RUNTIME_HIP", "RUNTIME_HIP", "build/runtime-hip"),
     ] {
-        println!("cargo:rerun-if-env-changed={key}");
+        for key in ["URL", "SHA256", "SIZE"] {
+            println!("cargo:rerun-if-env-changed={prefix}_{key}");
+        }
+        let read = |key: &str| {
+            env::var(format!("{prefix}_{key}"))
+                .ok()
+                .filter(|value| !value.is_empty())
+        };
+        let url = read("URL").unwrap_or_default();
+        let sha = read("SHA256").unwrap_or_default();
+        let size: u64 = read("SIZE")
+            .map(|value| value.parse().expect("the runtime SIZE must be a number"))
+            .unwrap_or(0);
+        if !url.is_empty() {
+            assert!(url.starts_with("https://"), "{prefix}_URL must be https");
+            assert!(
+                sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "{prefix}_SHA256 must be a SHA-256 hex digest"
+            );
+            assert!(size > 0, "{prefix}_SIZE is required with the URL");
+        }
+        let dev = Path::new(root).join(dev);
+        out.push_str(&format!(
+            "pub static {constant}_URL: &str = {url:?};\n\
+             pub static {constant}_SHA256: &str = {sha:?};\n\
+             pub static {constant}_SIZE: u64 = {size};\n\
+             pub static DEV_{constant}_DIR: &str = {:?};\n",
+            dev.to_string_lossy()
+        ));
     }
-    let read = |key: &str| env::var(key).ok().filter(|value| !value.is_empty());
-    let url = read("STRATA_RUNTIME_URL").unwrap_or_default();
-    let sha = read("STRATA_RUNTIME_SHA256").unwrap_or_default();
-    let size: u64 = read("STRATA_RUNTIME_SIZE")
-        .map(|value| value.parse().expect("STRATA_RUNTIME_SIZE must be a number"))
-        .unwrap_or(0);
-    if !url.is_empty() {
-        assert!(
-            url.starts_with("https://"),
-            "STRATA_RUNTIME_URL must be https"
-        );
-        assert!(
-            sha.len() == 64 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "STRATA_RUNTIME_SHA256 must be a SHA-256 hex digest"
-        );
-        assert!(size > 0, "STRATA_RUNTIME_SIZE is required with the URL");
-    }
-    let dev = Path::new(root).join("build/runtime");
-    format!(
-        "pub static RUNTIME_URL: &str = {url:?};\n\
-         pub static RUNTIME_SHA256: &str = {sha:?};\n\
-         pub static RUNTIME_SIZE: u64 = {size};\n\
-         pub static DEV_RUNTIME_DIR: &str = {:?};\n",
-        dev.to_string_lossy()
-    )
+    out
 }
 
 fn main() {

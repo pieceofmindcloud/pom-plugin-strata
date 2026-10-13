@@ -13,12 +13,40 @@
 //! 3. The release asset pinned at build time (`STRATA_RUNTIME_URL`, size and
 //!    SHA-256), downloaded once into the plugin directory and verified before
 //!    it is unpacked.
+//!
+//! One runtime per GPU backend: CUDA for NVIDIA cards (the above) and HIP for
+//! AMD ones - `STRATA_RUNTIME_HIP_DIR`, `build/runtime-hip`,
+//! `STRATA_RUNTIME_HIP_URL` - which carries the ROCm libraries the engine
+//! needs in its `lib/` (a POM node has none). A process runs one backend.
 
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 include!(concat!(env!("OUT_DIR"), "/runtime_release.rs"));
+
+/// The GPU backend a runtime's engine was built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Cuda,
+    Hip,
+}
+
+impl Backend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Cuda => "cuda",
+            Backend::Hip => "hip",
+        }
+    }
+
+    fn release(self) -> (&'static str, &'static str, u64) {
+        match self {
+            Backend::Cuda => (RUNTIME_URL, RUNTIME_SHA256, RUNTIME_SIZE),
+            Backend::Hip => (RUNTIME_HIP_URL, RUNTIME_HIP_SHA256, RUNTIME_HIP_SIZE),
+        }
+    }
+}
 
 /// What a usable runtime directory must contain.
 pub fn is_runtime(dir: &Path) -> bool {
@@ -41,41 +69,47 @@ pub fn version_of(dir: &Path) -> Option<String> {
 }
 
 /// A runtime that needs no download, when there is one.
-pub fn local_runtime() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("STRATA_RUNTIME_DIR").map(PathBuf::from) {
+pub fn local_runtime(backend: Backend) -> Option<PathBuf> {
+    let (variable, dev) = match backend {
+        Backend::Cuda => ("STRATA_RUNTIME_DIR", DEV_RUNTIME_DIR),
+        Backend::Hip => ("STRATA_RUNTIME_HIP_DIR", DEV_RUNTIME_HIP_DIR),
+    };
+    if let Some(dir) = std::env::var_os(variable).map(PathBuf::from) {
         return is_runtime(&dir).then_some(dir);
     }
-    let dev = PathBuf::from(DEV_RUNTIME_DIR);
+    let dev = PathBuf::from(dev);
     is_runtime(&dev).then_some(dev)
 }
 
 /// The directory a pinned release is unpacked into.
-pub fn installed_dir(base: &Path) -> Option<PathBuf> {
-    (!RUNTIME_SHA256.is_empty()).then(|| {
-        base.join("runtime")
-            .join(&RUNTIME_SHA256[..16])
-            .join("runtime")
-    })
+pub fn installed_dir(base: &Path, backend: Backend) -> Option<PathBuf> {
+    let (_, sha, _) = backend.release();
+    (!sha.is_empty()).then(|| base.join("runtime").join(&sha[..16]).join("runtime"))
 }
 
-pub fn has_release() -> bool {
-    !RUNTIME_URL.is_empty()
+pub fn has_release(backend: Backend) -> bool {
+    !backend.release().0.is_empty()
 }
 
 /// Downloads, verifies and unpacks the pinned runtime. `progress` gets the
 /// bytes read so far and the expected total.
-pub fn install(base: &Path, progress: &dyn Fn(u64, u64)) -> Result<PathBuf, String> {
-    let target = installed_dir(base).ok_or("this build pins no Strata runtime")?;
+pub fn install(
+    base: &Path,
+    backend: Backend,
+    progress: &dyn Fn(u64, u64),
+) -> Result<PathBuf, String> {
+    let (url, sha, size) = backend.release();
+    let target = installed_dir(base, backend).ok_or("this build pins no Strata runtime")?;
     if is_runtime(&target) {
         return Ok(target);
     }
     let holder = target.parent().ok_or("bad runtime directory")?;
     std::fs::create_dir_all(holder).map_err(|error| error.to_string())?;
     let archive = holder.join("runtime.tar.gz.part");
-    let response = ureq::get(RUNTIME_URL)
+    let response = ureq::get(url)
         .call()
         .map_err(|error| format!("download failed: {error}"))?;
-    let mut reader = response.into_reader().take(RUNTIME_SIZE + 1);
+    let mut reader = response.into_reader().take(size + 1);
     let mut file = std::fs::File::create(&archive).map_err(|error| error.to_string())?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
@@ -90,11 +124,11 @@ pub fn install(base: &Path, progress: &dyn Fn(u64, u64)) -> Result<PathBuf, Stri
         hasher.update(&buffer[..read]);
         std::io::Write::write_all(&mut file, &buffer[..read]).map_err(|error| error.to_string())?;
         read_total += read as u64;
-        progress(read_total, RUNTIME_SIZE);
+        progress(read_total, size);
     }
     drop(file);
     let digest = format!("{:x}", hasher.finalize());
-    if read_total != RUNTIME_SIZE || digest != RUNTIME_SHA256 {
+    if read_total != size || digest != sha {
         let _ = std::fs::remove_file(&archive);
         return Err("the downloaded runtime does not match the pinned size and SHA-256".into());
     }

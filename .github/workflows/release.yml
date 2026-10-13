@@ -1,0 +1,126 @@
+name: Publish release
+
+# Manual entry point. The Strata runtime is built twice, on runners of their
+# own (each image needs most of a runner's disk): CUDA for the NVIDIA families
+# a POM node may have, and HIP for the AMD ones. The library is then built
+# pinned to both archives, and the three go to the GitHub release v<version>.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version, without the v (e.g. 0.2.0)'
+        type: string
+        required: true
+      prerelease:
+        description: 'Publish as a prerelease'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  # Turing to Blackwell: what CUDA 13 compiles for.
+  CUDA_ARCHITECTURES: '75;80;86;89;90;100;120'
+  # RDNA2 to RDNA4 and Strix Halo, the wave32 families Strata's HIP kernels target.
+  HIP_ARCHITECTURES: 'gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201'
+
+jobs:
+  runtime:
+    name: Runtime ${{ matrix.backend }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - backend: cuda
+            flags: ''
+            asset: strata-runtime-linux-x86_64.tar.gz
+          - backend: hip
+            flags: '--hip'
+            asset: strata-runtime-hip-linux-x86_64.tar.gz
+    steps:
+      # The CUDA and ROCm build images take tens of GB.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build the ${{ matrix.backend }} runtime
+        shell: bash
+        run: |
+          ./scripts/build-runtime.sh --archive --version "${{ inputs.version }}" ${{ matrix.flags }}
+          test -f "dist-release/${{ matrix.asset }}"
+        env:
+          RUNTIME_VERSION: ${{ inputs.version }}
+          BUILD_JOBS: '4'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.backend }}
+          path: dist-release/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: Package ${{ inputs.version }}
+    needs: runtime
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The plugin screens are bundled and embedded in the library.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-*
+          path: runtimes
+          merge-multiple: true
+
+      - name: Build and package
+        id: package
+        shell: bash
+        run: |
+          ./scripts/package.sh --platform linux-x86_64 --version "${{ inputs.version }}" \
+            --repository "${{ github.repository }}" | tee package.txt
+          mkdir -p release
+          cp "$(sed -n 's/^artifact=//p' package.txt)" \
+             "$(sed -n 's/^public_manifest=//p' package.txt)" \
+             runtimes/strata-runtime-linux-x86_64.tar.gz \
+             runtimes/strata-runtime-hip-linux-x86_64.tar.gz release/
+        env:
+          STRATA_RUNTIME_ARCHIVE: runtimes/strata-runtime-linux-x86_64.tar.gz
+          STRATA_RUNTIME_HIP_ARCHIVE: runtimes/strata-runtime-hip-linux-x86_64.tar.gz
+
+      - name: Test
+        shell: bash
+        run: cargo test --locked
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
+          files: release/*

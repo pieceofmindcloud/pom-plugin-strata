@@ -40,6 +40,9 @@ pub struct LoadRequest {
     pub context: u32,
     /// GPU indices as this node numbers them; empty = Strata's default (0).
     pub gpus: Vec<u32>,
+    /// The node's AMD cards as HIP numbers them (`gpu_devices`): the HIP
+    /// runtime runs on them when the node has no NVIDIA card.
+    pub amd_gpus: Vec<u32>,
     /// Concurrent requests (Strata's `parallel` batch slots).
     pub sessions: u32,
     /// `int8`, `q4_0` or `k8v4`.
@@ -110,6 +113,24 @@ impl Link {
 }
 
 impl LoadRequest {
+    /// The backend this load runs on: CUDA on the node's NVIDIA cards, HIP on
+    /// its AMD ones when it has no NVIDIA card (a process runs one backend).
+    pub fn backend(&self) -> runtime::Backend {
+        if self.gpus.is_empty() && !self.amd_gpus.is_empty() {
+            runtime::Backend::Hip
+        } else {
+            runtime::Backend::Cuda
+        }
+    }
+
+    /// The cards of this load, numbered as its backend's runtime numbers them.
+    pub fn backend_gpus(&self) -> &[u32] {
+        match self.backend() {
+            runtime::Backend::Cuda => &self.gpus,
+            runtime::Backend::Hip => &self.amd_gpus,
+        }
+    }
+
     pub fn from_json(value: &Value) -> Result<Self, String> {
         let model_path = value["model_path"]
             .as_str()
@@ -144,6 +165,17 @@ impl LoadRequest {
                     .collect()
             })
             .unwrap_or_default();
+        let amd_gpus = value["gpu_devices"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter(|device| device["vendor"] == "amd")
+                    .filter_map(|device| device["ordinal"].as_u64())
+                    .filter(|ordinal| *ordinal < 64)
+                    .map(|ordinal| ordinal as u32)
+                    .collect()
+            })
+            .unwrap_or_default();
         let sessions = value["max_sessions"]
             .as_u64()
             .map(|sessions| sessions.clamp(1, 8) as u32)
@@ -159,6 +191,7 @@ impl LoadRequest {
             model_label,
             context,
             gpus,
+            amd_gpus,
             sessions,
             kv,
             settings: crate::settings::select(&value["settings"]),
@@ -201,6 +234,8 @@ pub struct Snapshot {
     pub phase: Phase,
     pub detail: Option<String>,
     pub runtime: Option<PathBuf>,
+    /// The HIP runtime (AMD cards), when there is one.
+    pub runtime_hip: Option<PathBuf>,
     pub runtime_version: Option<String>,
     pub runtime_error: Option<String>,
     pub request: Option<LoadRequest>,
@@ -308,7 +343,7 @@ impl Snapshot {
             "version": self.runtime_version,
             "detail": detail.map(|text| text.chars().take(190).collect::<String>()),
             "architectures": [gguf::STRATA_ARCHITECTURE],
-            // A POM slice of a model runs as one of two stages on two machines.
+            // A POM slice of a model runs as one stage of a split across machines.
             "stages": true,
             "settings": crate::settings::schema(),
         })
@@ -352,6 +387,7 @@ impl Engine {
             phase: Phase::Idle,
             detail: None,
             runtime: None,
+            runtime_hip: None,
             runtime_version: None,
             runtime_error: None,
             request: None,
@@ -530,7 +566,7 @@ struct Manager {
     shared: Arc<Mutex<Snapshot>>,
     commands: Receiver<Command_>,
     work: Work,
-    installer: Option<Receiver<Result<PathBuf, String>>>,
+    installer: Option<(runtime::Backend, Receiver<Result<PathBuf, String>>)>,
     /// A load asked while the runtime was not ready yet.
     waiting: Option<LoadRequest>,
 }
@@ -574,7 +610,17 @@ impl Manager {
     }
 
     fn find_runtime(&mut self) {
-        if let Some(dir) = runtime::local_runtime() {
+        // the HIP runtime is looked for, never downloaded, here: a load on AMD cards installs it (load)
+        let hip = runtime::local_runtime(runtime::Backend::Hip).or_else(|| {
+            runtime::installed_dir(&self.base, runtime::Backend::Hip)
+                .filter(|dir| runtime::is_runtime(dir))
+        });
+        self.update(|snapshot| snapshot.runtime_hip = hip);
+        let cuda = runtime::local_runtime(runtime::Backend::Cuda).or_else(|| {
+            runtime::installed_dir(&self.base, runtime::Backend::Cuda)
+                .filter(|dir| runtime::is_runtime(dir))
+        });
+        if let Some(dir) = cuda {
             let version = runtime::version_of(&dir);
             self.update(|snapshot| {
                 snapshot.runtime = Some(dir);
@@ -582,16 +628,7 @@ impl Manager {
             });
             return;
         }
-        if let Some(dir) = runtime::installed_dir(&self.base).filter(|dir| runtime::is_runtime(dir))
-        {
-            let version = runtime::version_of(&dir);
-            self.update(|snapshot| {
-                snapshot.runtime = Some(dir);
-                snapshot.runtime_version = version;
-            });
-            return;
-        }
-        if !runtime::has_release() {
+        if !runtime::has_release(runtime::Backend::Cuda) {
             self.update(|snapshot| {
                 snapshot.runtime_error = Some(
                     "no Strata runtime: this is a development build without build/runtime \
@@ -601,20 +638,26 @@ impl Manager {
             });
             return;
         }
+        self.install(runtime::Backend::Cuda);
+    }
+
+    /// Downloads the pinned runtime of `backend` on a thread (poll_installer).
+    fn install(&mut self, backend: runtime::Backend) {
         let (sender, receiver) = channel();
         let base = self.base.clone();
         let shared = Arc::clone(&self.shared);
         self.set_phase(
             Phase::Installing,
-            Some("downloading the Strata runtime".into()),
+            Some(format!("downloading the Strata {} runtime", backend.name())),
         );
         let _ = thread::Builder::new()
             .name("pom-plugin-strata-install".into())
             .spawn(move || {
-                let result = runtime::install(&base, &|done, total| {
+                let result = runtime::install(&base, backend, &|done, total| {
                     if let Ok(mut snapshot) = shared.lock() {
                         snapshot.detail = Some(format!(
-                            "downloading the Strata runtime: {} of {} MB",
+                            "downloading the Strata {} runtime: {} of {} MB",
+                            backend.name(),
                             done >> 20,
                             total >> 20
                         ));
@@ -622,7 +665,7 @@ impl Manager {
                 });
                 let _ = sender.send(result);
             });
-        self.installer = Some(receiver);
+        self.installer = Some((backend, receiver));
     }
 
     fn run(mut self) {
@@ -643,14 +686,22 @@ impl Manager {
     }
 
     fn poll_installer(&mut self) {
-        let Some(receiver) = &self.installer else {
+        let Some((backend, receiver)) = &self.installer else {
             return;
         };
+        let backend = *backend;
         let Ok(result) = receiver.try_recv() else {
             return;
         };
         self.installer = None;
         match result {
+            Ok(dir) if backend == runtime::Backend::Hip => {
+                self.update(|snapshot| snapshot.runtime_hip = Some(dir));
+                self.set_phase(Phase::Idle, None);
+                if let Some(request) = self.waiting.take() {
+                    self.load(request);
+                }
+            }
             Ok(dir) => {
                 let version = runtime::version_of(&dir);
                 self.update(|snapshot| {
@@ -752,6 +803,30 @@ impl Manager {
     fn load(&mut self, request: LoadRequest) {
         self.unload();
         self.update(|snapshot| snapshot.request = Some(request.clone()));
+        if request.backend() == runtime::Backend::Hip {
+            let hip = self
+                .shared
+                .lock()
+                .ok()
+                .and_then(|snapshot| snapshot.runtime_hip.clone());
+            let Some(runtime) = hip else {
+                if self.installer.is_some() {
+                    self.waiting = Some(request);
+                    return;
+                }
+                if runtime::has_release(runtime::Backend::Hip) {
+                    self.waiting = Some(request);
+                    self.install(runtime::Backend::Hip);
+                    return;
+                }
+                return self.fail(
+                    "this node's GPUs are AMD and there is no Strata HIP runtime \
+                     (scripts/build-runtime.sh --hip in the plugin source)"
+                        .into(),
+                );
+            };
+            return self.load_with(runtime, request);
+        }
         let Some(runtime) = self.runtime() else {
             if self.installer.is_some() {
                 self.waiting = Some(request);
@@ -765,17 +840,16 @@ impl Manager {
                 .unwrap_or_else(|| "the Strata runtime is not installed".into());
             return self.fail(error);
         };
+        self.load_with(runtime, request)
+    }
+
+    /// The load once the runtime of its backend is here.
+    fn load_with(&mut self, runtime: PathBuf, request: LoadRequest) {
         let model = match gguf::inspect(&request.model_path) {
             Ok(model) => model,
             Err(error) => return self.fail(error),
         };
         if let Some(stage) = model.stage {
-            if !stage.first() && !stage.last() {
-                return self.fail(format!(
-                    "Strata splits a model in two stages; this slice holds the middle layers {}-{}",
-                    stage.start, stage.end
-                ));
-            }
             match &request.link {
                 None => return self.fail("a POM slice needs the stage link the POM gives".into()),
                 Some(link)
@@ -785,8 +859,9 @@ impl Manager {
                         "a later stage needs the relay to the earlier stage and its secret".into(),
                     )
                 }
-                Some(_) if stage.first() => {
-                    // The earlier stage's secret, which the POM asks before the engine is up.
+                // A stage before the last (the first or a middle one) serves the next: its own secret, which the
+                // POM asks before the engine is up. A middle stage also presents the earlier one's (link.token).
+                Some(_) if !stage.last() => {
                     let token = random_key();
                     self.update(|snapshot| snapshot.link_token = Some(token));
                 }
@@ -958,14 +1033,19 @@ impl Manager {
             "api_key": api_key,
             "open_browser": false,
         });
-        // A stage of a split model runs on one GPU: the engine refuses
-        // --layer-split beside --stage-prev, and the bridge adds it for a list.
-        match (request.gpus.as_slice(), model.stage.is_some()) {
-            ([], _) => {}
-            ([first, ..], true) | ([first], false) => config["gpu"] = json!(first),
-            (many, false) => config["gpu"] = json!(many),
+        // Several GPUs share the model (or this stage's layers): the bridge adds the layer split for a list.
+        // The cards are numbered as the backend's runtime numbers them (HIP_VISIBLE_DEVICES for AMD).
+        match request.backend_gpus() {
+            [] => {}
+            [first] => config["gpu"] = json!(first),
+            many => config["gpu"] = json!(many),
         }
-        config["gpus_asked"] = json!(!request.gpus.is_empty());
+        config["gpus_asked"] = json!(!request.backend_gpus().is_empty());
+        if request.backend() == runtime::Backend::Hip {
+            config["backend"] = json!("hip");
+            // the ROCm libraries the HIP runtime carries (a POM node has none)
+            config["lib_dirs"] = json!([runtime.join("lib").display().to_string()]);
+        }
         if request.sessions > 1 {
             config["parallel"] = json!(request.sessions);
         }
@@ -1058,9 +1138,40 @@ impl Manager {
             .current_dir(self.base.join("run"))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // One GPU per stage: a stage is not split again across this machine's cards.
-        if let Some(gpu) = request.gpus.first() {
-            command.env("CUDA_VISIBLE_DEVICES", gpu.to_string());
+        // A middle stage: the earlier stage's secret, and how many prompt pieces it asks of it at once.
+        if let Some(link) = request.link.as_ref() {
+            if let Some(prev) = &link.token {
+                command.env("STRATA_STAGE_PREV_TOKEN", prev);
+            }
+            if let Some(count) = link.max_inflight {
+                command.env("STRATA_STAGE_INFLIGHT", count.to_string());
+            }
+        }
+        // This node's GPUs for the stage: several share its layers (the engine places them, --layer-split auto).
+        let gpus = request.backend_gpus();
+        if !gpus.is_empty() {
+            let list: Vec<String> = gpus.iter().map(u32::to_string).collect();
+            if request.backend() == runtime::Backend::Hip {
+                command.env("HIP_VISIBLE_DEVICES", list.join(","));
+            } else {
+                // numbered as nvidia-smi and the node number them, not fastest first
+                command
+                    .env("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+                    .env("CUDA_VISIBLE_DEVICES", list.join(","));
+            }
+            if gpus.len() > 1 {
+                command.args(["--layer-split", "auto"]);
+            }
+        }
+        if request.backend() == runtime::Backend::Hip {
+            let lib = runtime.join("lib");
+            let path = match std::env::var_os("LD_LIBRARY_PATH") {
+                Some(old) if !old.is_empty() => {
+                    format!("{}:{}", lib.display(), old.to_string_lossy())
+                }
+                _ => lib.display().to_string(),
+            };
+            command.env("LD_LIBRARY_PATH", path);
         }
         self.append_log(&format!(
             "[pom] starting Strata as an earlier stage of {} on 127.0.0.1:{port}",
@@ -1271,6 +1382,7 @@ mod tests {
             phase: Phase::Loading,
             detail: None,
             runtime: None,
+            runtime_hip: None,
             runtime_version: None,
             runtime_error: None,
             request: None,
@@ -1302,6 +1414,26 @@ mod tests {
         snapshot.link_token = Some("s".repeat(32));
         assert_eq!(snapshot.link_json()["status"], "starting");
         assert_eq!(snapshot.link_json()["token"], "s".repeat(32));
+    }
+
+    #[test]
+    fn a_node_with_only_amd_cards_runs_the_hip_runtime() {
+        let amd = |ordinal: u32| json!({"vendor": "amd", "ordinal": ordinal, "index": ordinal + 1});
+        let nvidia = json!({"vendor": "nvidia", "ordinal": 0, "index": 0});
+        let both = LoadRequest::from_json(&json!({
+            "model_path": "/m/x.gguf", "gpus": [0], "gpu_devices": [nvidia, amd(0)]
+        }))
+        .unwrap();
+        assert_eq!(both.backend(), runtime::Backend::Cuda);
+        assert_eq!(both.backend_gpus(), &[0]);
+        let radeon = LoadRequest::from_json(&json!({
+            "model_path": "/m/x.gguf", "gpus": [], "gpu_devices": [amd(0), amd(1)]
+        }))
+        .unwrap();
+        assert_eq!(radeon.backend(), runtime::Backend::Hip);
+        assert_eq!(radeon.backend_gpus(), &[0, 1]);
+        let none = LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"})).unwrap();
+        assert_eq!(none.backend(), runtime::Backend::Cuda);
     }
 
     #[test]

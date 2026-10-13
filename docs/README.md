@@ -40,15 +40,25 @@ one when it finds a prepared draft layer (`mtp/rt/experts.bin`, the layout
 Strata's own setup writes) in the plugin directory or up to three folders
 above the model file. Without one Strata runs without speculation.
 
-## A model split across two machines
+## A model split across machines
 
 Choose **Slices** with the Strata service to run a model that one machine
-cannot hold on two: each machine loads its POM slice in Strata. The first
-slice (from layer 0) runs as a stage server: for every prompt piece and every
+cannot hold on several: each machine loads its POM slice in Strata. Every
+slice before the last runs as a stage server: for every prompt piece and every
 draft window it answers with the hidden state of its last layer instead of
-tokens. The second slice (to the last layer) serves the requests, with the
-head, the sampling and the MTP draft layer, and asks the first machine for
-those hidden states. The POM carries them between the machines, signed, over
+tokens; a middle slice first asks the slice before it for its own. The last
+slice (to the last layer) serves the requests, with the head, the sampling and
+the MTP draft layer, and asks the slice before it for those hidden states.
+
+A machine with several GPUs runs its slice on all of them: Strata places the
+slice's layers across the cards (`--layer-split auto`) and the first and last
+card meet the machines before and after it.
+
+A node whose GPUs are AMD runs the HIP runtime (ROCm, its libraries carried
+in the runtime); a node with NVIDIA cards runs the CUDA one. One Strata
+process runs one backend, so a machine with both kinds takes two POM nodes
+(one per kind) and two slices, and the hidden state crosses between them like
+between machines. The AMD node's container needs `/dev/kfd` and `/dev/dri`. The POM carries them between the machines, signed, over
 the route it already uses between its nodes: neither Strata listens beyond
 loopback. Slices made by the POM's slicer load as they are.
 
@@ -77,8 +87,9 @@ prompt from the start on both.
 
 ## Limits
 
-- A model runs on one machine, or split in two slices on two machines (one
-  GPU each); three or more stages are not supported.
-- Strata runs on NVIDIA cards of compute capability 7.5 or newer; this build
-  carries code for sm_86 and sm_120 (the POM default).
+- One Strata process runs one GPU backend: CUDA for NVIDIA cards of compute
+  capability 7.5 or newer, HIP for the wave32 AMD families (RDNA2 to RDNA4,
+  Strix Halo). A release carries both runtimes for those families; a
+  development build only the architectures of `CUDA_ARCHITECTURES` /
+  `HIP_ARCHITECTURES` (default sm_86 and sm_120, and gfx1101).
 - Images are not sent to Strata.

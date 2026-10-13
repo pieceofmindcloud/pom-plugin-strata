@@ -4,7 +4,13 @@
 # and the per-platform manifest of POM's "Add from GitHub" flow.
 #
 # Upload every file it prints to the GitHub release v<version> of this
-# repository: the library, pom-plugin-linux-x86_64.json and the runtime archive.
+# repository: the library, pom-plugin-linux-x86_64.json and the runtime
+# archives (CUDA, and HIP for AMD cards).
+#
+# STRATA_RUNTIME_ARCHIVE / STRATA_RUNTIME_HIP_ARCHIVE: runtime archives built
+# beforehand (scripts/build-runtime.sh --archive [--hip], as the release
+# workflow builds them on their own runners); without them both are built here.
+# STRATA_PACKAGE_HIP=0 leaves the HIP runtime out.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -32,11 +38,32 @@ command -v jq >/dev/null 2>&1 || die 'jq is required'
 [[ "$(jq -er '.plugin_code' "$root/ui/manifest.json")" == "$(jq -er '.plugin_code' "$root/release/manifest.json")" ]] \
   || die 'release manifest plugin code does not match the UI manifest'
 
-runtime_output="$(RUNTIME_VERSION="$version" "$root/scripts/build-runtime.sh" --archive --version "$version")"
-runtime_asset="$(printf '%s\n' "$runtime_output" | sed -n 's/^runtime_asset=//p')"
-export STRATA_RUNTIME_SHA256="$(printf '%s\n' "$runtime_output" | sed -n 's/^runtime_sha256=//p')"
-export STRATA_RUNTIME_SIZE="$(printf '%s\n' "$runtime_output" | sed -n 's/^runtime_size=//p')"
+# archive=, sha256 and size of a runtime archive: the one given, or built now
+runtime_pin() {
+  local given="$1"; shift
+  if [[ -n "$given" ]]; then
+    [[ -f "$given" ]] || die "no runtime archive at $given"
+    printf 'runtime_asset=%s\nruntime_sha256=%s\nruntime_size=%s\n' "$given" \
+      "$(sha256sum "$given" | awk '{print $1}')" "$(wc -c < "$given" | tr -d '[:space:]')"
+  else
+    RUNTIME_VERSION="$version" "$root/scripts/build-runtime.sh" --archive --version "$version" "$@"
+  fi
+}
+field() { printf '%s\n' "$1" | sed -n "s/^$2=//p"; }
+
+runtime_output="$(runtime_pin "${STRATA_RUNTIME_ARCHIVE:-}")"
+runtime_asset="$(field "$runtime_output" runtime_asset)"
+export STRATA_RUNTIME_SHA256="$(field "$runtime_output" runtime_sha256)"
+export STRATA_RUNTIME_SIZE="$(field "$runtime_output" runtime_size)"
 export STRATA_RUNTIME_URL="https://github.com/${repository}/releases/download/v${version}/$(basename "$runtime_asset")"
+hip_asset=""
+if [[ "${STRATA_PACKAGE_HIP:-1}" != 0 ]]; then
+  hip_output="$(runtime_pin "${STRATA_RUNTIME_HIP_ARCHIVE:-}" --hip)"
+  hip_asset="$(field "$hip_output" runtime_asset)"
+  export STRATA_RUNTIME_HIP_SHA256="$(field "$hip_output" runtime_sha256)"
+  export STRATA_RUNTIME_HIP_SIZE="$(field "$hip_output" runtime_size)"
+  export STRATA_RUNTIME_HIP_URL="https://github.com/${repository}/releases/download/v${version}/$(basename "$hip_asset")"
+fi
 
 build_output="$("$root/scripts/build.sh" --platform linux-x86_64 --output "$output")"
 artifact="$(printf '%s\n' "$build_output" | sed -n 's/^artifact=//p')"
@@ -53,5 +80,5 @@ jq -n \
   '($contract[0]) + {release_id: $release_id, version: $version, os: "linux", arch: "x86_64",
      asset: $asset, sha256: $sha256, size: $size}' > "$public_manifest"
 
-printf 'artifact=%s\npublic_manifest=%s\nruntime_asset=%s\nruntime_url=%s\nsha256=%s\nsize=%s\nversion=%s\n' \
-  "$artifact" "$public_manifest" "$runtime_asset" "$STRATA_RUNTIME_URL" "$sha256" "$size" "$version"
+printf 'artifact=%s\npublic_manifest=%s\nruntime_asset=%s\nruntime_url=%s\nhip_runtime_asset=%s\nsha256=%s\nsize=%s\nversion=%s\n' \
+  "$artifact" "$public_manifest" "$runtime_asset" "$STRATA_RUNTIME_URL" "$hip_asset" "$sha256" "$size" "$version"

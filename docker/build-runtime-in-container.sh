@@ -55,6 +55,7 @@ root = sys.argv[1]
 meta = {
     "strata_commit": os.environ.get("STRATA_COMMIT", ""),
     "llama_cpp_commit": os.environ.get("LLAMA_CPP_COMMIT", ""),
+    "backend": "cuda",
     "cuda": subprocess.run(["nvcc", "--version"], capture_output=True, text=True).stdout.split("release ")[-1].split(",")[0],
     "cuda_architectures": os.environ["CUDA_ARCHITECTURES"].split(";"),
     "python": "%d.%d" % sys.version_info[:2],
