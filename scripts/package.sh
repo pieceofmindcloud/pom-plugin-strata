@@ -80,5 +80,18 @@ jq -n \
   '($contract[0]) + {release_id: $release_id, version: $version, os: "linux", arch: "x86_64",
      asset: $asset, sha256: $sha256, size: $size}' > "$public_manifest"
 
-printf 'artifact=%s\npublic_manifest=%s\nruntime_asset=%s\nruntime_url=%s\nhip_runtime_asset=%s\nsha256=%s\nsize=%s\nversion=%s\n' \
-  "$artifact" "$public_manifest" "$runtime_asset" "$STRATA_RUNTIME_URL" "$hip_asset" "$sha256" "$size" "$version"
+# Metadata for the license server upload (scripts/publish-to-license-server.sh),
+# the same shape the harness plugin writes.
+metadata="${output}/pom-plugin-strata-linux-x86_64.metadata.json"
+jq -n \
+  --arg plugin_code "$(jq -er '.plugin_code' "$root/release/manifest.json")" \
+  --arg version "$version" \
+  --arg artifact "$(basename "$artifact")" \
+  --arg sha256 "$sha256" \
+  --argjson size "$size" \
+  --argjson plugin_abi "$(jq -er '.plugin_abi' "$root/release/manifest.json")" \
+  '{plugin_code: $plugin_code, version: $version, platform: "linux-x86_64", target: "x86_64-unknown-linux-gnu",
+    plugin_abi: $plugin_abi, sha256: $sha256, size: $size, artifact: $artifact}' > "$metadata"
+
+printf 'artifact=%s\npublic_manifest=%s\nmetadata=%s\nruntime_asset=%s\nruntime_url=%s\nhip_runtime_asset=%s\nsha256=%s\nsize=%s\nversion=%s\n' \
+  "$artifact" "$public_manifest" "$metadata" "$runtime_asset" "$STRATA_RUNTIME_URL" "$hip_asset" "$sha256" "$size" "$version"

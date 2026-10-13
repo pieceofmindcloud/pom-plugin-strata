@@ -108,6 +108,7 @@ jobs:
           mkdir -p release
           cp "$(sed -n 's/^artifact=//p' package.txt)" \
              "$(sed -n 's/^public_manifest=//p' package.txt)" \
+             "$(sed -n 's/^metadata=//p' package.txt)" \
              runtimes/strata-runtime-linux-x86_64.tar.gz \
              runtimes/strata-runtime-hip-linux-x86_64.tar.gz release/
         env:
@@ -124,3 +125,31 @@ jobs:
           name: v${{ inputs.version }}
           prerelease: ${{ inputs.prerelease }}
           files: release/*
+
+  # Same flow as the other POM plugins: a final release goes to the license
+  # server, a prerelease does not.
+  license-server:
+    name: License server
+    needs: package
+    if: ${{ !inputs.prerelease }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download the plugin library from the GitHub release
+        shell: bash
+        run: |
+          mkdir -p dist-release
+          gh release download "v${{ inputs.version }}" --repo "$GITHUB_REPOSITORY" --dir dist-release --pattern 'pom-plugin-strata-linux-x86_64.*'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Publish package to the license server
+        shell: bash
+        run: ./scripts/publish-to-license-server.sh --version "$RELEASE_TAG" --platform linux-x86_64 --artifact dist-release/pom-plugin-strata-linux-x86_64.so --metadata dist-release/pom-plugin-strata-linux-x86_64.metadata.json --reason "release $RELEASE_TAG"
+        env:
+          RELEASE_TAG: v${{ inputs.version }}
+          POM_RELEASE_TOKEN: ${{ secrets.POM_RELEASE_TOKEN }}
+          POM_RELEASE_API: ${{ secrets.POM_RELEASE_API }}
