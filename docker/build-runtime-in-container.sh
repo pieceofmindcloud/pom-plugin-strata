@@ -43,6 +43,7 @@ cp -a /src/third_party/llama.cpp/gguf-py "$out.tmp/strata/third_party/llama.cpp/
 find "$out.tmp/strata" -name '__pycache__' -prune -exec rm -rf {} +
 find "$out.tmp/strata/serve" -name 'test_*.py' -delete
 install -m 0644 /plugin/runtime/pom_strata_server.py "$out.tmp/pom_strata_server.py"
+install -m 0644 /plugin/runtime/pom_sessions.py "$out.tmp/pom_sessions.py"
 
 echo "== python packages (for $(python3 --version))"
 grep -vE '^\s*(#|$)|^(cmake|ninja)==' /src/requirements.txt > /work/requirements.txt

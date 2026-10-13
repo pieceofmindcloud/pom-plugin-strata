@@ -40,7 +40,9 @@ import json
 import os
 import sys
 import threading
+import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 HERE = Path(__file__).resolve().parent
 for extra in (HERE / "strata", HERE / "pylib"):
@@ -48,6 +50,8 @@ for extra in (HERE / "strata", HERE / "pylib"):
         sys.path.insert(0, str(extra))
 
 from serve import server as S  # noqa: E402
+
+import pom_sessions as P  # noqa: E402
 
 # The system turn the POM's llama.cpp path puts in front of every prompt
 # (llama-engine `apply_chat_template`). The same here, so a model answers the
@@ -61,6 +65,103 @@ def session_dir() -> Path:
     path = Path(os.environ.get("POM_STRATA_SESSIONS", "/data/strata/sessions"))
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+# per batch slot: the conversation whose K/V the slot holds as its delta base, and the tokens of that base
+slot_bases: dict[int, tuple[str, list[int]]] = {}
+
+
+def session_path(key: str, kind: str) -> str:
+    return str(session_dir() / P.file_name(key, kind))
+
+
+def engine_session(svc, action: str, key: str, slot: int, ids: list[int] | None = None) -> dict:
+    """One keyed session step on a batch slot, under the service FIFO: the whole session, or its delta (`*_delta`)."""
+    kind = "delta" if action.endswith("_delta") else "full"
+    with svc.fifo:
+        return svc.engine.session_file(action, session_path(key, kind), slot=slot, ids=ids)
+
+
+def restore_for_prompt(svc, ids: list[int]) -> None:
+    """Before a turn: a saved session that starts the prompt further than any slot holds it is restored into a free
+    slot, so the engine reads only the rest.  A session that cannot be restored leaves the slots as they were."""
+    if not getattr(svc, "batch", 0) or not svc.loaded():
+        return
+    sessions = P.read_sessions(session_dir())
+    if not sessions:
+        return
+    with svc.slot_cv:
+        key = P.choose_restore(ids, sessions, svc.slot_held)
+        slot = svc.pick_slot(ids) if key is not None else None
+    if key is None or slot is None:
+        return
+    try:
+        engine_session(svc, "restore", key, slot, ids=sessions[key])
+    except (S.SessionRefused, S.EngineDied, ValueError) as e:
+        print(f"pom: session {key} not restored into slot {slot}: {e}", file=sys.stderr, flush=True)
+        return
+    slot_bases[slot] = (key, sessions[key])
+
+
+def save_turn(svc, key: str, prompt: list[int]) -> dict | None:
+    """After a turn that ran in a batch slot: the slot saves the conversation under `key`.  When the slot's base is
+    still this conversation's, the delta from that base is cut first (the peers apply it to their whole session), then
+    the whole session is saved, which becomes the next base.  None: no slot holds the turn."""
+    if not getattr(svc, "batch", 0):
+        return None
+    deadline = time.monotonic() + 5
+    with svc.slot_cv:
+        while any(svc.slot_busy) and time.monotonic() < deadline:
+            svc.slot_cv.wait(0.05)
+        slot = P.slot_for_turn(prompt, svc.slot_held)
+        held = list(svc.slot_held[slot]) if slot is not None else []
+    if slot is None:
+        return None
+    base = slot_bases.get(slot)
+    base_ids = base[1] if base and base[0] == key and P.base_holds(held, base[1]) else None
+    folder = session_dir()
+    delta = False
+    if base_ids is not None:
+        try:
+            engine_session(svc, "save_delta", key, slot)
+            delta = True
+        except S.SessionRefused as e:
+            print(f"pom: session {key}: no delta this turn: {e}", file=sys.stderr, flush=True)
+    whole = engine_session(svc, "save", key, slot)
+    P.write_json(folder / P.file_name(key, "full_ids"), whole["ids"])
+    if delta:
+        P.write_json(folder / P.file_name(key, "delta_meta"), {"base": base_ids, "ids": whole["ids"]})
+    else:
+        for kind in ("delta", "delta_meta"):
+            (folder / P.file_name(key, kind)).unlink(missing_ok=True)
+    slot_bases[slot] = (key, whole["ids"])
+    return {"ids": whole["ids"], "delta": delta}
+
+
+def apply_delta(svc, key: str) -> dict:
+    """The receiving side: the peer's delta applied to the whole session held here.  The whole session (the base) goes
+    into a free slot, the delta on top of it, and the result is saved again as the whole session.  Refused unless the
+    whole session's tokens are the delta's base, so a delta is never applied twice or to another base."""
+    folder = session_dir()
+    meta = P.read_delta_meta(folder / P.file_name(key, "delta_meta"))
+    base = P.read_ids(folder / P.file_name(key, "full_ids"))
+    if meta is None or base is None or meta[0] != base:
+        raise ValueError("the whole session here is not the base of the delta")
+    _, ids = meta
+    with svc.slot_cv:
+        slot = svc.pick_slot(ids)
+    if slot is None:
+        raise ValueError("no free batch slot to apply the delta in")
+    engine_session(svc, "restore", key, slot, ids=base)
+    try:
+        engine_session(svc, "restore_delta", key, slot, ids=ids)
+    except Exception:
+        slot_bases.pop(slot, None)
+        raise
+    whole = engine_session(svc, "save", key, slot)
+    P.write_json(folder / P.file_name(key, "full_ids"), whole["ids"])
+    slot_bases[slot] = (key, whole["ids"])
+    return {"ids": whole["ids"]}
 SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
                  "repeat_penalty", "seed")
 
@@ -162,7 +263,21 @@ def make_handler(original):
                         self._json(200, {"loaded": svc.loaded(), "model": svc.model,
                                          "max_context": svc.reported_ctx(), "busy": busy, "queued": queued})
                     return
+                if self.path.split("?")[0].rstrip("/") == "/pom/session/file":
+                    if self._authorized():
+                        self._pom_file_get()
+                    return
                 super().do_GET()
+
+            def do_PUT(self):
+                if self.path.split("?")[0].rstrip("/") == "/pom/session/file":
+                    if self._authorized():
+                        try:
+                            self._pom_file_put()
+                        except ValueError as e:
+                            self._json(400, {"error": str(e)})
+                    return
+                self._json(405, {"error": "PUT is for /pom/session/file"})
 
             def do_POST(self):
                 if self.path.split("?")[0].rstrip("/") == "/pom/session":
@@ -204,7 +319,76 @@ def make_handler(original):
                                                                                                "completed")
                         svc.request_trace.record = None
 
+            def _file_query(self) -> tuple[str, str]:
+                query = parse_qs(urlparse(self.path).query)
+                key, kind = (query.get("key") or [""])[0], (query.get("kind") or [""])[0]
+                why = P.key_problem(key)
+                if why:
+                    raise ValueError(f"key {why}")
+                if kind not in P.KINDS:
+                    raise ValueError(f"kind must be one of {', '.join(P.KINDS)}")
+                return key, kind
+
+            def _pom_file_get(self) -> None:
+                """One session file, streamed, under the service FIFO (no save or restore writes it meanwhile)."""
+                try:
+                    key, kind = self._file_query()
+                except ValueError as e:
+                    self._json(400, {"error": str(e)})
+                    return
+                path = session_dir() / P.file_name(key, kind)
+                with svc.fifo:
+                    if not path.is_file():
+                        self._json(404, {"error": f"no {kind} file for {key}"})
+                        return
+                    size = path.stat().st_size
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(size))
+                    self.end_headers()
+                    with open(path, "rb") as f:
+                        while chunk := f.read(16 << 20):
+                            self.wfile.write(chunk)
+
+            def _pom_file_put(self) -> None:
+                """One session file received from a peer: written whole, under the service FIFO.  The JSON kinds are
+                checked before they are written; the file kinds are written to a temporary name and renamed."""
+                key, kind = self._file_query()
+                size = int(self.headers.get("Content-Length") or 0)
+                if size <= 0:
+                    raise ValueError("send the file with a Content-Length")
+                path = session_dir() / P.file_name(key, kind)
+                if kind == "full_ids" or kind == "delta_meta":
+                    body = self.rfile.read(size)
+                    if len(body) != size:
+                        raise ValueError("the body ended early")
+                    try:
+                        value = json.loads(body)
+                    except ValueError:
+                        raise ValueError(f"{kind} must be JSON") from None
+                    if (kind == "full_ids" and not P.is_ids(value)) or (kind == "delta_meta" and not (
+                            isinstance(value, dict) and P.is_ids(value.get("base")) and P.is_ids(value.get("ids")))):
+                        raise ValueError(f"{kind} does not hold what it should")
+                    with svc.fifo:
+                        P.write_json(path, value)
+                else:
+                    tmp = path.with_name(path.name + ".part")
+                    with svc.fifo:
+                        left = size
+                        with open(tmp, "wb") as f:
+                            while left > 0:
+                                chunk = self.rfile.read(min(left, 16 << 20))
+                                if not chunk:
+                                    tmp.unlink(missing_ok=True)
+                                    raise ValueError("the body ended early")
+                                f.write(chunk)
+                                left -= len(chunk)
+                        os.replace(tmp, path)
+                self._json(200, {"bytes": size, "file": path.name})
+
             def _pom_session(self, req: dict) -> None:
+                if "key" in req:
+                    return self._pom_keyed(req)
                 action = req.get("action")
                 if action not in SESSION_ACTIONS:
                     raise ValueError("action must be save, restore, save_delta or restore_delta")
@@ -243,12 +427,32 @@ def make_handler(original):
                 self._json(200, {"tokens": result.get("tokens"), "bytes": result.get("bytes"),
                                  "ms": result.get("ms")})
 
+            def _pom_keyed(self, req: dict) -> None:
+                """A keyed session step: `apply`, the receiving side of a delta the peer sent (see apply_delta)."""
+                if req.get("action") != "apply":
+                    raise ValueError("a keyed session action is apply")
+                why = P.key_problem(req.get("key"))
+                if why:
+                    raise ValueError(f"key {why}")
+                if not svc.loaded():
+                    self._json(503, {"error": "the model is not loaded"})
+                    return
+                try:
+                    result = apply_delta(svc, req["key"])
+                except S.SessionRefused as e:
+                    self._json(e.status, {"error": str(e), "kind": e.kind, "published": bool(e.published)})
+                    return
+                self._json(200, result)
+
             def _line(self, obj) -> None:
                 self.wfile.write(json.dumps(obj, ensure_ascii=False).encode() + b"\n")
                 self.wfile.flush()
 
             def _pom_generate(self, req: dict) -> None:
                 prompt, chat, thinking, max_tokens, sampling = generation_request(req)
+                session = req.get("session")
+                if session is not None and P.key_problem(session):
+                    raise ValueError(f"session {P.key_problem(session)}")
                 self.record = svc.begin_request("/pom/generate", {"model": svc.model, "stream": True,
                                                                   "max_tokens": max_tokens})
                 svc.load()
@@ -260,6 +464,7 @@ def make_handler(original):
                 else:
                     ids, max_new = raw_ids(svc, prompt, max_tokens)
                     thinking = False
+                restore_for_prompt(svc, list(ids))
                 cancel = threading.Event()
                 self._watch_client(cancel)
                 self.send_response(200)
@@ -267,6 +472,7 @@ def make_handler(original):
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 think = ThinkWrapper()
+                completed = False
                 try:
                     for kind, x in svc.run(ids, thinking, None, max_new, sampling, cancel):
                         if kind == "ping":
@@ -277,6 +483,7 @@ def make_handler(original):
                             if text:
                                 self._line({"t": text})
                         elif kind == "done":
+                            completed = True
                             tail = think.close()
                             if tail:
                                 self._line({"t": tail})
@@ -297,6 +504,12 @@ def make_handler(original):
                         self._line({"error": str(e)})
                     except OSError:
                         pass
+                # the turn is over and the engine has released it: the conversation is saved for its next turn
+                if session is not None and completed:
+                    try:
+                        save_turn(svc, session, list(ids))
+                    except (S.SessionRefused, S.EngineDied, ValueError) as e:
+                        print(f"pom: session {session} not saved: {e}", file=sys.stderr, flush=True)
 
         return PomHandler
 
