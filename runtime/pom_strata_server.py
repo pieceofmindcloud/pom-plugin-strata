@@ -586,24 +586,37 @@ def make_handler(original):
                     raise ValueError(f"session {P.key_problem(session)}")
                 self.record = svc.begin_request("/pom/generate", {"model": svc.model, "stream": True,
                                                                   "max_tokens": max_tokens})
-                svc.load()
-                if chat:
-                    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
-                    # No limit asked: prepare answers the room the templated prompt leaves.
-                    ids, thinking, room = svc.prepare(messages, None, {"enable_thinking": thinking}, None)
-                    max_new = fit_budget(max_tokens, room)
-                else:
-                    ids, max_new = raw_ids(svc, prompt, max_tokens)
-                    thinking = False
-                # a short prompt is not kept: its turn is not saved in the slot nor synced to the peers
-                if session is not None and len(ids) < MIN_SESSION_TOKENS:
-                    session = None
                 # a decision probe (POM /v1/systemone): the label distribution of the first generated token
                 probe = req.get("probe")
                 labels = probe.get("labels") if isinstance(probe, dict) else None
                 if labels is not None and (not isinstance(labels, list) or not labels or
                                            not all(isinstance(x, str) and x for x in labels)):
                     raise ValueError("'probe.labels' must be a non-empty list of strings")
+                # the question's reusable prefix (bytes of the prompt): pinned so the next questions read only their part
+                prefix_bytes = probe.get("prefix_bytes") if isinstance(probe, dict) else None
+                if prefix_bytes is not None and (not isinstance(prefix_bytes, int) or isinstance(prefix_bytes, bool)
+                                                 or prefix_bytes < 1):
+                    raise ValueError("'probe.prefix_bytes' must be a positive whole number")
+                svc.load()
+                if chat:
+                    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+                    # No limit asked: prepare answers the room the templated prompt leaves.
+                    ids, thinking, room = svc.prepare(messages, None, {"enable_thinking": thinking}, None)
+                    max_new = fit_budget(max_tokens, room)
+                    if prefix_bytes and labels:
+                        # the engine pins the checkpoint at the end of the question's prefix (`strata_prefix`, resolved
+                        # against the rendered prompt the same way a client's own would be)
+                        head = prompt.encode()[:prefix_bytes].decode("utf-8", "ignore")
+                        resolved = svc.resolve_prefix({"message": 1, "chars": len(head)}, messages, None,
+                                                      {"enable_thinking": thinking}, ids)
+                        if resolved:
+                            sampling = {**sampling, "strata_prefix": resolved}
+                else:
+                    ids, max_new = raw_ids(svc, prompt, max_tokens)
+                    thinking = False
+                # a short prompt is not kept: its turn is not saved in the slot nor synced to the peers
+                if session is not None and len(ids) < MIN_SESSION_TOKENS:
+                    session = None
                 svc.engine.last_probe = None
                 svc.engine.probe_request = probe_groups(svc, labels) if labels else None
                 restore_for_prompt(svc, list(ids))
