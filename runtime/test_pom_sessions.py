@@ -95,5 +95,36 @@ class Folder(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["x.json"])
 
 
+class Chunks(unittest.TestCase):
+    def test_pieces_assemble_into_the_file_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.strsess"
+            data = bytes(range(256)) * 40
+            total = len(data)
+            P.write_chunk(path, 0, total, data[:1000])
+            self.assertFalse(path.exists())            # not published until the last piece
+            P.write_chunk(path, 1000, total, data[1000:5000])
+            P.write_chunk(path, 5000, total, data[5000:])
+            self.assertEqual(path.read_bytes(), data)
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["c.strsess"])
+
+    def test_a_piece_out_of_order_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.strsess"
+            P.write_chunk(path, 0, 10, b"abc")
+            with self.assertRaises(ValueError):
+                P.write_chunk(path, 5, 10, b"xyz")      # a gap
+            with self.assertRaises(ValueError):
+                P.write_chunk(path, 0, 10, b"0123456789ab")   # longer than the file
+
+    def test_a_file_is_published_only_when_its_last_piece_is_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.strsess"
+            P.write_chunk(path, 0, 4, b"ab")
+            self.assertFalse(path.exists())
+            P.write_chunk(path, 2, 4, b"cd")
+            self.assertEqual(path.read_bytes(), b"abcd")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -124,3 +124,29 @@ def read_sessions(folder: Path) -> dict[str, list[int]]:
         if ids:
             sessions[key] = ids
     return sessions
+
+
+MAX_FILE = 1 << 30
+CHUNK = 8 << 20   # a piece of a session file: under the control channel's 16 MiB body limit
+
+
+def write_chunk(path: Path, offset: int, total: int, data: bytes) -> None:
+    """Writes one piece of a file of `total` bytes at `offset` into `path` (a .part beside the final name). The first
+    piece starts the file; each later piece must follow the bytes already there. When the last piece is in, the file
+    holds exactly `total` bytes and is published under its name (a JSON kind is checked before it is published).
+    Raises ValueError for a piece that does not fit the file, or a file that ends short."""
+    if not (0 <= offset <= total <= MAX_FILE) or offset + len(data) > total:
+        raise ValueError("the piece does not fit the file")
+    part = path.with_name(path.name + ".part")
+    if offset == 0:
+        part.write_bytes(b"")
+    elif not part.is_file() or part.stat().st_size != offset:
+        raise ValueError("the piece does not follow the bytes received so far")
+    with open(part, "r+b") as f:
+        f.seek(offset)
+        f.write(data)
+    if offset + len(data) == total:
+        if part.stat().st_size != total:
+            part.unlink(missing_ok=True)
+            raise ValueError("the file ended short")
+        os.replace(part, path)
