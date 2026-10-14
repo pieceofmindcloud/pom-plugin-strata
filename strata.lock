@@ -1,6 +1,7 @@
-# The Strata source this plugin builds: repository and the exact commit.
+# The Strata source this plugin builds: repository and branch. Every build takes the branch's head commit
+# (scripts/build-runtime.sh resolves it and records it in RUNTIME.json as strata_commit).
 # The llama.cpp commit is the one Strata's setup.py pins (LLAMA_CPP_COMMIT);
 # only its ggml (engine build) and gguf-py (pack tools) are used.
 STRATA_REPOSITORY=https://github.com/pieceofmindcloud/Strata.git
-STRATA_COMMIT=5579f33a5fb7f03a10276fccf93e144eee149b75
+STRATA_BRANCH=pom-stages
 LLAMA_CPP_COMMIT=3cf03257f219afbe7334045ff7c6a06ac68c627d

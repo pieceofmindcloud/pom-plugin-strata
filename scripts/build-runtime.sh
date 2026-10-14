@@ -36,7 +36,7 @@ usage() {
     'Environment: CUDA_ARCHITECTURES (default "86;120", the POM default),' \
     '  HIP_ARCHITECTURES (default "gfx1101"), ROCM_VERSION (default 7.2.4),' \
     '  CUDA_VERSION (default 13.4.1, the POM default),' \
-    '  STRATA_SOURCE_DIR (a local Strata git checkout to take the locked commit from).'
+    '  STRATA_SOURCE_DIR (a local Strata git checkout to take the branch head from).'
 }
 
 while (($# > 0)); do
@@ -60,6 +60,10 @@ if ((worktree)); then
   work="$strata_source"
   STRATA_COMMIT="$(git -C "$strata_source" rev-parse HEAD)-dirty"
 else
+# The head of the Strata branch now, every build: the commit is recorded in RUNTIME.json.
+STRATA_COMMIT="$(git ls-remote "$STRATA_REPOSITORY" "refs/heads/$STRATA_BRANCH" | cut -f1)"
+[[ -n "$STRATA_COMMIT" ]] || { echo "build-runtime: branch $STRATA_BRANCH not found in $STRATA_REPOSITORY" >&2; exit 2; }
+echo "build-runtime: Strata $STRATA_BRANCH at $STRATA_COMMIT"
 rm -rf "$work"
 mkdir -p "$work"
 
