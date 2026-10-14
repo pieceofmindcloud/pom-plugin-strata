@@ -358,6 +358,8 @@ impl Snapshot {
             "architectures": [gguf::STRATA_ARCHITECTURE],
             // A POM slice of a model runs as one stage of a split across machines.
             "stages": true,
+            // The POM settings that apply to those stages: the nodes carry the hidden state between them.
+            "pom_settings": ["prefill_max_inflight_chunks", "hidden_state_dtype"],
             "settings": crate::settings::schema(),
         })
     }
@@ -1423,6 +1425,7 @@ mod tests {
         assert_eq!(snapshot.service()["kind"], "inference");
         assert_eq!(snapshot.service()["status"], "waiting");
         assert_eq!(snapshot.service()["stages"], true);
+        assert_eq!(snapshot.service()["pom_settings"][1], "hidden_state_dtype");
         snapshot.port = None;
         snapshot.link_port = Some(4321);
         assert_eq!(snapshot.upstream_json()["status"], "error");
