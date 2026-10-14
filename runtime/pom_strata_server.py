@@ -36,6 +36,7 @@ out of the output; they go back into the text in the template's own form.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -69,6 +70,47 @@ def session_dir() -> Path:
 
 # per batch slot: the conversation whose K/V the slot holds as its delta base, and the tokens of that base
 slot_bases: dict[int, tuple[str, list[int]]] = {}
+
+# The requests this bridge serves now (a generation or a session step, queued or running).  Counted here rather than
+# read from Strata's status, which a request that ends early can leave saying busy.
+_in_flight_lock = threading.Lock()
+_in_flight = 0
+
+
+@contextlib.contextmanager
+def in_flight():
+    global _in_flight
+    with _in_flight_lock:
+        _in_flight += 1
+    try:
+        yield
+    finally:
+        with _in_flight_lock:
+            _in_flight -= 1
+
+
+def in_flight_count() -> int:
+    with _in_flight_lock:
+        return _in_flight
+
+
+DEFAULT_CACHE_MB = 2048      # the session folder's size limit on this machine (POM_STRATA_SESSION_CACHE_MB)
+DEFAULT_MAX_AGE_H = 24       # a conversation not used for this long leaves the folder (POM_STRATA_SESSION_MAX_AGE_H)
+
+
+def prune_cache() -> None:
+    """Keeps this machine's session folder within its size limit and drops the conversations not used for a day.  A
+    conversation a slot holds as its delta base is kept.  Runs after each session file is written here."""
+    limit = int(float(os.environ.get("POM_STRATA_SESSION_CACHE_MB", DEFAULT_CACHE_MB)) * (1 << 20))
+    max_age = float(os.environ.get("POM_STRATA_SESSION_MAX_AGE_H", DEFAULT_MAX_AGE_H)) * 3600
+    keep = {key for key, _ in slot_bases.values()}
+    try:
+        removed = P.prune(session_dir(), limit, max_age, keep, time.time())
+    except OSError as e:
+        print(f"pom: session cache not pruned: {e}", file=sys.stderr, flush=True)
+        return
+    if removed:
+        print(f"pom: session cache: removed {', '.join(removed)}", flush=True)
 
 
 def session_path(key: str, kind: str) -> str:
@@ -157,6 +199,7 @@ def save_turn(svc, key: str, prompt: list[int], locked: bool = True, held: list[
         for kind in ("delta", "delta_meta"):
             (folder / P.file_name(key, kind)).unlink(missing_ok=True)
     slot_bases[slot] = (key, whole["ids"])
+    prune_cache()
     return {"ids": whole["ids"], "delta": delta}
 
 
@@ -186,6 +229,7 @@ def apply_delta(svc, key: str) -> dict:
     whole = engine_session(svc, "save", key, slot)
     P.write_json(folder / P.file_name(key, "full_ids"), whole["ids"])
     slot_bases[slot] = (key, whole["ids"])
+    prune_cache()
     return {"ids": whole["ids"]}
 SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
                  "repeat_penalty", "seed")
@@ -283,10 +327,11 @@ def make_handler(original):
                 if self.path.split("?")[0].rstrip("/") == "/pom/status":
                     if self._authorized():
                         with svc.status_lock:
-                            busy = bool(svc.status.get("busy"))
                             queued = int(svc.status.get("queued") or 0)
+                        active = in_flight_count()
                         self._json(200, {"loaded": svc.loaded(), "model": svc.model,
-                                         "max_context": svc.reported_ctx(), "busy": busy, "queued": queued})
+                                         "max_context": svc.reported_ctx(), "busy": active > 0,
+                                         "in_flight": active, "queued": queued})
                     return
                 if self.path.split("?")[0].rstrip("/") == "/pom/session/file":
                     if self._authorized():
@@ -318,7 +363,8 @@ def make_handler(original):
                             req = json.loads(self._body() or b"{}")
                             if not isinstance(req, dict):
                                 raise ValueError("send a JSON object")
-                            self._pom_session(req)
+                            with in_flight():
+                                self._pom_session(req)
                         except ValueError as e:
                             self._json(400, {"error": str(e)})
                     return
@@ -330,7 +376,8 @@ def make_handler(original):
                     req = json.loads(self._body() or b"{}")
                     if not isinstance(req, dict):
                         raise ValueError("send a JSON object")
-                    self._pom_generate(req)
+                    with in_flight():
+                        self._pom_generate(req)
                 except S.BadBody as e:
                     self._json(e.status, {"error": str(e)})
                 except ValueError as e:
@@ -412,6 +459,8 @@ def make_handler(original):
                         except ValueError:
                             path.unlink(missing_ok=True)
                             raise ValueError(f"{kind} is not JSON") from None
+                    if offset + size == total:
+                        prune_cache()
                 self._json(200, {"received": offset + size})
 
             def _pom_file_put(self) -> None:

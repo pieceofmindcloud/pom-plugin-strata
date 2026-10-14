@@ -126,6 +126,61 @@ def read_sessions(folder: Path) -> dict[str, list[int]]:
     return sessions
 
 
+PART = ".part"   # a piece being received (write_chunk); a stale one is cache too
+TEMP = ".tmp"    # write_json's temporary file
+CACHE_SUFFIXES = (FULL, DELTA, IDS, DELTA_META, PART, TEMP)
+
+
+def cache_groups(folder: Path) -> dict[str, dict]:
+    """The files of every conversation in `folder`, grouped by key: key -> {"paths", "bytes", "used"}.  `used` is the
+    newest modification time of the group, so a conversation that is saved again is recent.  Files that are not a
+    session's are left out."""
+    groups: dict[str, dict] = {}
+    if not folder.is_dir():
+        return groups
+    for path in folder.iterdir():
+        if not path.is_file():
+            continue
+        suffix = next((s for s in CACHE_SUFFIXES if path.name.endswith(s)), None)
+        if suffix is None:
+            continue
+        key = path.name[:-len(suffix)]
+        if key_problem(key):
+            continue
+        stat = path.stat()
+        group = groups.setdefault(key, {"paths": [], "bytes": 0, "used": 0.0})
+        group["paths"].append(path)
+        group["bytes"] += stat.st_size
+        group["used"] = max(group["used"], stat.st_mtime)
+    return groups
+
+
+def prune(folder: Path, max_bytes: int, max_age_s: float, keep: set[str], now: float) -> list[str]:
+    """Removes the conversations of `folder` that a machine should not keep: first those not used for `max_age_s`,
+    then, while the folder holds more than `max_bytes`, the least recently used.  A conversation in `keep` (its
+    slot holds it) is never removed, even over the limit.  Returns the keys removed, oldest first."""
+    groups = cache_groups(folder)
+    removed: list[str] = []
+
+    def drop(key: str) -> None:
+        for path in groups[key]["paths"]:
+            path.unlink(missing_ok=True)
+        removed.append(key)
+
+    candidates = sorted((k for k in groups if k not in keep), key=lambda k: groups[k]["used"])
+    for key in list(candidates):
+        if now - groups[key]["used"] > max_age_s:
+            drop(key)
+            candidates.remove(key)
+    total = sum(group["bytes"] for key, group in groups.items() if key not in removed)
+    for key in candidates:
+        if total <= max_bytes:
+            break
+        drop(key)
+        total -= groups[key]["bytes"]
+    return removed
+
+
 MAX_FILE = 1 << 30
 CHUNK = 64 << 20   # a piece of a session file (the signed control channel reads bodies up to 128 MiB)
 

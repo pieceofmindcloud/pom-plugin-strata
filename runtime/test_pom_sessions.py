@@ -1,5 +1,6 @@
 """CPU tests of pom_sessions.py: run with `cd runtime && python3 -m unittest test_pom_sessions`."""
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -124,6 +125,66 @@ class Chunks(unittest.TestCase):
             self.assertFalse(path.exists())
             P.write_chunk(path, 2, 4, b"cd")
             self.assertEqual(path.read_bytes(), b"abcd")
+
+
+class Cache(unittest.TestCase):
+    DAY = 24 * 3600
+
+    def make(self, folder, key, size, used):
+        """A conversation's whole session file and token list, last used at `used` (seconds)."""
+        for kind, data in (("full", b"x" * size), ("full_ids", b"[1]")):
+            path = folder / P.file_name(key, kind)
+            path.write_bytes(data)
+            os.utime(path, (used, used))
+
+    def test_groups_count_every_file_of_a_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            self.make(folder, "a", 10, 100.0)
+            (folder / "a.strsdlt").write_bytes(b"dd")
+            (folder / "stray.txt").write_bytes(b"not a session")
+            groups = P.cache_groups(folder)
+            self.assertEqual(set(groups), {"a"})
+            self.assertEqual(groups["a"]["bytes"], 10 + 3 + 2)
+            self.assertEqual(groups["a"]["used"], max(p.stat().st_mtime for p in groups["a"]["paths"]))
+
+    def test_conversations_older_than_the_age_go(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            now = 10 * self.DAY
+            self.make(folder, "old", 5, now - self.DAY - 1)
+            self.make(folder, "new", 5, now - 60)
+            removed = P.prune(folder, max_bytes=1 << 30, max_age_s=self.DAY, keep=set(), now=now)
+            self.assertEqual(removed, ["old"])
+            self.assertEqual(set(P.cache_groups(folder)), {"new"})
+
+    def test_over_the_limit_the_least_recently_used_go_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            now = 1000.0
+            self.make(folder, "a", 100, now - 30)
+            self.make(folder, "b", 100, now - 20)
+            self.make(folder, "c", 100, now - 10)
+            removed = P.prune(folder, max_bytes=250, max_age_s=self.DAY, keep=set(), now=now)
+            self.assertEqual(removed, ["a"])
+            self.assertEqual(set(P.cache_groups(folder)), {"b", "c"})
+
+    def test_a_kept_conversation_is_never_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            now = 10 * self.DAY
+            self.make(folder, "busy", 100, now - 2 * self.DAY)
+            self.make(folder, "other", 100, now - 10)
+            removed = P.prune(folder, max_bytes=50, max_age_s=self.DAY, keep={"busy"}, now=now)
+            self.assertEqual(removed, ["other"])
+            self.assertEqual(set(P.cache_groups(folder)), {"busy"})
+
+    def test_under_the_limit_nothing_recent_goes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            now = 1000.0
+            self.make(folder, "a", 100, now - 10)
+            self.assertEqual(P.prune(folder, max_bytes=1000, max_age_s=self.DAY, keep=set(), now=now), [])
 
 
 if __name__ == "__main__":
