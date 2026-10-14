@@ -11,6 +11,7 @@ export type StrataStatus = {
   gpus: number[] | null;
   context: number | null;
   busy: boolean;
+  inFlight: number;
   /** This machine runs an earlier stage of a split model: the engine alone, no Strata app. */
   earlierStage: boolean;
   runtime: { ready: boolean; version: string | null; error: string | null };
@@ -43,6 +44,7 @@ export function normalizeStatus(value: unknown): StrataStatus | null {
     gpus: Array.isArray(raw.gpus) ? raw.gpus.filter((gpu): gpu is number => typeof gpu === "number") : null,
     context: typeof raw.n_ctx === "number" ? raw.n_ctx : null,
     busy: raw.busy === true,
+    inFlight: typeof raw.in_flight === "number" ? raw.in_flight : 0,
     earlierStage: raw.earlier_stage === true,
     runtime: { ready: runtime.ready === true, version: text(runtime.version), error: text(runtime.error) },
     log: Array.isArray(raw.log) ? raw.log.filter((line): line is string => typeof line === "string") : null,
@@ -114,6 +116,9 @@ export function StatusView({ status, failed }: { status: StrataStatus | null; fa
                 </KeyValue>
                 <KeyValue label={t("activity")}>
                   <span className="pb-mono">{status.state === "ready" ? t(status.busy ? "busy" : "free") : t("none")}</span>
+                </KeyValue>
+                <KeyValue label={t("inFlight")}>
+                  <span className="pb-mono">{status.state === "ready" ? status.inFlight : t("none")}</span>
                 </KeyValue>
                 <KeyValue label={t("runtime")}>
                   <span className="pb-mono">{status.runtime.version ?? t("none")}</span>

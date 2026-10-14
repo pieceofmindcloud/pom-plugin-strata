@@ -17,6 +17,7 @@
   "activity": "Atividade",
   "busy": "gerando",
   "free": "livre",
+  "inFlight": "Em voo",
   "runtime": "Runtime do Strata",
   "log": "Log do Strata",
   "none": "-",

@@ -261,6 +261,8 @@ pub struct Snapshot {
     pub link_token: Option<String>,
     pub api_key: String,
     pub busy: bool,
+    /// Requests the bridge is serving now (generations and session steps, queued or running).
+    pub in_flight: u32,
     pub since: Instant,
     pub log: PathBuf,
 }
@@ -276,6 +278,7 @@ impl Snapshot {
             "gpus": self.request.as_ref().map(|request| request.gpus.clone()),
             "n_ctx": self.context.or(self.request.as_ref().map(|request| request.context)),
             "busy": self.busy,
+            "in_flight": self.in_flight,
             // An earlier stage of a split model runs the engine alone: no
             // server, so no Strata app to open; the last stage has it.
             "earlier_stage": self.port.is_none() && self.link_port.is_some(),
@@ -412,6 +415,7 @@ impl Engine {
             link_token: None,
             api_key: random_key(),
             busy: false,
+            in_flight: 0,
             since: Instant::now(),
             log: base.join("run/strata-server.log"),
         }));
@@ -752,6 +756,7 @@ impl Manager {
             snapshot.link_port = None;
             snapshot.link_token = None;
             snapshot.busy = false;
+            snapshot.in_flight = 0;
         });
         if self.installer.is_none() {
             self.set_phase(Phase::Idle, None);
@@ -1300,8 +1305,10 @@ impl Manager {
                 let loaded = status["loaded"].as_bool().unwrap_or(false);
                 let context = status["max_context"].as_u64().map(|context| context as u32);
                 let busy = status["busy"].as_bool().unwrap_or(false);
+                let in_flight = status["in_flight"].as_u64().unwrap_or(0) as u32;
                 self.update(|snapshot| {
                     snapshot.busy = busy;
+                    snapshot.in_flight = in_flight;
                     if context.is_some_and(|context| context > 0) {
                         snapshot.context = context;
                     }
@@ -1414,6 +1421,7 @@ mod tests {
             link_token: None,
             api_key: "k".into(),
             busy: false,
+            in_flight: 0,
             since: Instant::now(),
             log: PathBuf::from("/dev/null"),
         };
