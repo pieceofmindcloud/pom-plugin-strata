@@ -55,6 +55,8 @@ pub struct LoadRequest {
     /// Where the bridge keeps the conversation sessions (`POM_STRATA_SESSIONS`):
     /// the node's KV snapshot folder, so the KV cache clear empties them.
     pub session_dir: Option<PathBuf>,
+    /// The vision projector (mmproj) the deployment chose: the engine reads images with it. `None` = text only.
+    pub mmproj_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +208,19 @@ impl LoadRequest {
                         return Err("session_dir must be absolute".into());
                     }
                     Some(dir)
+                }
+                None => None,
+            },
+            mmproj_path: match value["mmproj_path"].as_str().filter(|path| !path.is_empty()) {
+                Some(path) => {
+                    let path = PathBuf::from(path);
+                    if !path.is_absolute() {
+                        return Err("mmproj_path must be absolute".into());
+                    }
+                    if !path.is_file() {
+                        return Err(format!("the vision projector {} is not on this machine", path.display()));
+                    }
+                    Some(path)
                 }
                 None => None,
             },
@@ -363,6 +378,8 @@ impl Snapshot {
             "stages": true,
             // The POM settings that apply to those stages: the nodes carry the hidden state between them.
             "pom_settings": ["prefill_max_inflight_chunks", "hidden_state_dtype"],
+            // Images are read through the deployment's vision projector (`mmproj_path`), when one is chosen.
+            "vision": true,
             "settings": crate::settings::schema(),
         })
     }
@@ -1065,6 +1082,11 @@ impl Manager {
             many => config["gpu"] = json!(many),
         }
         config["gpus_asked"] = json!(!request.backend_gpus().is_empty());
+        // Vision: the projector is read on the CPU, so the image encoder does not take VRAM from the model.
+        if let Some(mmproj) = &request.mmproj_path {
+            config["mmproj"] = json!(mmproj.display().to_string());
+            config["vision"] = json!({"gpu": false});
+        }
         if request.backend() == runtime::Backend::Hip {
             config["backend"] = json!("hip");
             // the ROCm libraries the HIP runtime carries (a POM node has none)
@@ -1402,6 +1424,8 @@ mod tests {
         assert_eq!(plain.context, DEFAULT_CONTEXT);
         assert_eq!(plain.kv, "int8");
         assert!(LoadRequest::from_json(&json!({"model_path": "relative.gguf"})).is_err());
+        assert!(LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "mmproj_path": "rel.gguf"})).is_err());
+        assert!(LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "mmproj_path": "/no/such/mmproj.gguf"})).is_err());
         assert!(LoadRequest::from_json(&json!({})).is_err());
     }
 
@@ -1433,6 +1457,7 @@ mod tests {
         assert_eq!(snapshot.service()["kind"], "inference");
         assert_eq!(snapshot.service()["status"], "waiting");
         assert_eq!(snapshot.service()["stages"], true);
+        assert_eq!(snapshot.service()["vision"], true);
         assert_eq!(snapshot.service()["pom_settings"][1], "hidden_state_dtype");
         snapshot.port = None;
         snapshot.link_port = Some(4321);
