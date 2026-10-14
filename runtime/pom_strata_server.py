@@ -94,6 +94,10 @@ def in_flight_count() -> int:
         return _in_flight
 
 
+# A conversation's session is kept (saved, and synced to the peers) only from this many prompt tokens: a shorter one
+# re-reads its prompt faster than the save and the sync cost.
+MIN_SESSION_TOKENS = 8000
+
 DEFAULT_CACHE_MB = 2048      # the session folder's size limit on this machine (POM_STRATA_SESSION_CACHE_MB)
 DEFAULT_MAX_AGE_H = 24       # a conversation not used for this long leaves the folder (POM_STRATA_SESSION_MAX_AGE_H)
 
@@ -577,6 +581,9 @@ def make_handler(original):
                 else:
                     ids, max_new = raw_ids(svc, prompt, max_tokens)
                     thinking = False
+                # a short prompt is not kept: its turn is not saved in the slot nor synced to the peers
+                if session is not None and len(ids) < MIN_SESSION_TOKENS:
+                    session = None
                 restore_for_prompt(svc, list(ids))
                 cancel = threading.Event()
                 self._watch_client(cancel)
