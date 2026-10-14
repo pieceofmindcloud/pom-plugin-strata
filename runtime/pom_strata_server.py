@@ -310,6 +310,20 @@ def fit_budget(max_tokens: int, room: int) -> int:
     return room if max_tokens <= 0 else min(max_tokens, room)
 
 
+def probe_groups(svc, labels: list[str]) -> list[list[int]]:
+    """The token ids that stand for each label, as the POM's decision probe takes them: the first token of the label and
+    of " " + label (without special tokens), each id once."""
+    groups = []
+    for label in labels:
+        ids: list[int] = []
+        for text in (label, f" {label}"):
+            tokens = svc.tok.encode(text)
+            if tokens and tokens[0] not in ids:
+                ids.append(tokens[0])
+        groups.append(ids)
+    return groups
+
+
 def raw_ids(svc, prompt: str, max_tokens: int) -> tuple[list[int], int]:
     """A completion prompt as it is (no template), with Strata's context check."""
     ids = svc.tok.encode(prompt, parse_special=True)
@@ -584,6 +598,14 @@ def make_handler(original):
                 # a short prompt is not kept: its turn is not saved in the slot nor synced to the peers
                 if session is not None and len(ids) < MIN_SESSION_TOKENS:
                     session = None
+                # a decision probe (POM /v1/systemone): the label distribution of the first generated token
+                probe = req.get("probe")
+                labels = probe.get("labels") if isinstance(probe, dict) else None
+                if labels is not None and (not isinstance(labels, list) or not labels or
+                                           not all(isinstance(x, str) and x for x in labels)):
+                    raise ValueError("'probe.labels' must be a non-empty list of strings")
+                svc.engine.last_probe = None
+                svc.engine.probe_request = probe_groups(svc, labels) if labels else None
                 restore_for_prompt(svc, list(ids))
                 cancel = threading.Event()
                 self._watch_client(cancel)
@@ -623,6 +645,7 @@ def make_handler(original):
                                       file=sys.stderr, flush=True)
                             self._line({"done": {
                                 **({"session": {"key": session, "saved": saved}} if saved else {}),
+                                **({"probe": svc.engine.last_probe} if svc.engine.probe_request else {}),
                                 "finish": x.get("finish"),
                                 "prompt_tokens": x.get("prompt_tokens", len(ids)),
                                 "completion_tokens": x.get("completion_tokens", 0),
@@ -639,6 +662,8 @@ def make_handler(original):
                         self._line({"error": str(e)})
                     except OSError:
                         pass
+                finally:
+                    svc.engine.probe_request = None
 
         return PomHandler
 
