@@ -295,6 +295,13 @@ def make_handler(original):
                 super().do_GET()
 
             def do_PUT(self):
+                if self.path.split("?")[0].rstrip("/") == "/pom/session/chunk":
+                    if self._authorized():
+                        try:
+                            self._pom_chunk_put()
+                        except ValueError as e:
+                            self._json(400, {"error": str(e)})
+                    return
                 if self.path.split("?")[0].rstrip("/") == "/pom/session/file":
                     if self._authorized():
                         try:
@@ -374,6 +381,38 @@ def make_handler(original):
                     with open(path, "rb") as f:
                         while chunk := f.read(16 << 20):
                             self.wfile.write(chunk)
+
+            def _pom_chunk_put(self) -> None:
+                """One piece of a session file from a peer (pom_sessions.write_chunk). The file is published when its last
+                piece is in; a JSON kind is checked first, so a bad file is never published."""
+                query = parse_qs(urlparse(self.path).query)
+                key, kind = (query.get("key") or [""])[0], (query.get("kind") or [""])[0]
+                why = P.key_problem(key)
+                if why:
+                    raise ValueError(f"key {why}")
+                if kind not in P.KINDS:
+                    raise ValueError(f"kind must be one of {', '.join(P.KINDS)}")
+                try:
+                    offset = int((query.get("offset") or [""])[0])
+                    total = int((query.get("total") or [""])[0])
+                except ValueError:
+                    raise ValueError("offset and total are numbers") from None
+                size = int(self.headers.get("Content-Length") or 0)
+                if not 0 <= size <= P.CHUNK:
+                    raise ValueError(f"a piece is at most {P.CHUNK} bytes")
+                data = self.rfile.read(size) if size else b""
+                if len(data) != size:
+                    raise ValueError("the body ended early")
+                path = session_dir() / P.file_name(key, kind)
+                with svc.fifo:
+                    P.write_chunk(path, offset, total, data)
+                    if offset + size == total and kind in ("full_ids", "delta_meta"):
+                        try:
+                            json.loads(path.read_text())
+                        except ValueError:
+                            path.unlink(missing_ok=True)
+                            raise ValueError(f"{kind} is not JSON") from None
+                self._json(200, {"received": offset + size})
 
             def _pom_file_put(self) -> None:
                 """One session file received from a peer: written whole, under the service FIFO.  The JSON kinds are

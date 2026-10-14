@@ -127,7 +127,7 @@ def read_sessions(folder: Path) -> dict[str, list[int]]:
 
 
 MAX_FILE = 1 << 30
-CHUNK = 8 << 20   # a piece of a session file: under the control channel's 16 MiB body limit
+CHUNK = 64 << 20   # a piece of a session file (the signed control channel reads bodies up to 128 MiB)
 
 
 def write_chunk(path: Path, offset: int, total: int, data: bytes) -> None:
