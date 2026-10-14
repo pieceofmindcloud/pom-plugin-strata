@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { usePluginI18n } from "../host/runtime";
+import { useScreenReady } from "../host/ready";
 import { StatusView, useStatus } from "./Status";
 
 declare const __POM_PLUGIN_CODE__: string;
@@ -35,6 +36,10 @@ export function StrataApp() {
       // Remembering the tab is a convenience only.
     }
   };
+
+  // The engine's status is what this screen is for: the host opens it when the
+  // first poll answered (or failed), not over the empty page before it.
+  useScreenReady(status !== null || failed);
 
   // Strata's app runs on the machine that serves the requests; an earlier
   // stage of a split model has only the engine, so it shows the status alone.
