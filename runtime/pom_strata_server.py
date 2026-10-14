@@ -599,7 +599,16 @@ def make_handler(original):
                     raise ValueError("'probe.prefix_bytes' must be a positive whole number")
                 svc.load()
                 if chat:
-                    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+                    # the images of the turn (data: URLs) come before its text; the engine reads them through the
+                    # deployment's projector (prepare() encodes them and run() takes the embeddings)
+                    images = req.get("images") or []
+                    if not isinstance(images, list) or not all(isinstance(x, str) and x.startswith("data:image/")
+                                                              for x in images):
+                        raise ValueError("'images' must be a list of data:image/... URLs")
+                    content = ([{"type": "image", "source": src} for src in images]
+                               + [{"type": "text", "text": prompt}]) if images else prompt
+                    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "user", "content": content}]
                     # No limit asked: prepare answers the room the templated prompt leaves.
                     ids, thinking, room = svc.prepare(messages, None, {"enable_thinking": thinking}, None)
                     max_new = fit_budget(max_tokens, room)
@@ -612,6 +621,8 @@ def make_handler(original):
                         if resolved:
                             sampling = {**sampling, "strata_prefix": resolved}
                 else:
+                    if req.get("images"):
+                        raise ValueError("images need the chat template (chat_template true)")
                     ids, max_new = raw_ids(svc, prompt, max_tokens)
                     thinking = False
                 # a short prompt is not kept: its turn is not saved in the slot nor synced to the peers
