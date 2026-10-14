@@ -124,3 +124,22 @@ jobs:
           name: v${{ inputs.version }}
           prerelease: ${{ inputs.prerelease }}
           files: release/*
+
+  license-server:
+    name: License server v${{ inputs.version }}
+    needs: package
+    # Prereleases never reach the license server.
+    if: ${{ !inputs.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Downloads the release back, checks the library against the manifest published with it and only then uploads it.
+      - name: Publish linux-x86_64 to the license server
+        shell: bash
+        run: ./scripts/publish-to-license-server.sh --version "v${{ inputs.version }}" --reason "release v${{ inputs.version }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          POM_RELEASE_TOKEN: ${{ secrets.POM_RELEASE_TOKEN }}
+          POM_RELEASE_API: ${{ secrets.POM_RELEASE_API }}
