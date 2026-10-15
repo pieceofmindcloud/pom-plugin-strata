@@ -18,6 +18,8 @@ struct Setting {
     min: Option<f64>,
     max: Option<f64>,
     options: &'static [&'static str],
+    /// `pom`: the deployment's POM settings card draws it (whatever the slices), not the engine's card.
+    pom: bool,
 }
 
 const fn setting(
@@ -34,6 +36,7 @@ const fn setting(
         min: None,
         max: None,
         options: &[],
+        pom: false,
     }
 }
 
@@ -111,7 +114,9 @@ fn all() -> Vec<Setting> {
                 ("Posição do esforço", "Onde entra um esforço de raciocínio fora do padrão: start, ou end (mantém o cache quando muda)."),
             )
         },
-        setting(
+        Setting {
+            pom: true,
+            ..setting(
             "session_save",
             "boolean",
             (
@@ -122,7 +127,8 @@ fn all() -> Vec<Setting> {
                 "Salvar o cache KV",
                 "Salva o cache KV de cada conversa na pasta de sessões (POM_STRATA_SESSIONS: o disco compartilhado), para outra máquina restaurá-lo. Desligado: nenhuma sessão é salva nem restaurada.",
             ),
-        ),
+            )
+        },
         setting(
             "aliases",
             "list",
@@ -192,6 +198,9 @@ pub fn schema() -> Value {
                 if !s.options.is_empty() {
                     entry["options"] = json!(s.options);
                 }
+                if s.pom {
+                    entry["placement"] = json!("pom");
+                }
                 entry
             })
             .collect(),
@@ -230,6 +239,13 @@ mod tests {
             assert!(entry["label"]["en"].is_string() && entry["label"]["pt-BR"].is_string());
         }
         assert!(!keys.contains(&"open_browser"));
+        // the session switch sits in the POM settings card, the others in the engine's
+        let placed: Vec<&str> = entries
+            .iter()
+            .filter(|e| e["placement"] == "pom")
+            .map(|e| e["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(placed, ["session_save"]);
     }
 
     #[test]
