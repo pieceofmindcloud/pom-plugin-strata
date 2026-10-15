@@ -1,4 +1,4 @@
-"""The /pom/generate bridge returns a tool call as text the POM parses.
+"""The /pom/generate bridge keeps reasoning separate and returns tool calls as parseable text.
 
 Run with the built runtime next to it: python3 tests/test_bridge.py (needs build/runtime/strata, from
 scripts/build-runtime.sh)."""
@@ -16,24 +16,25 @@ OUTPUT = ("Let me run a quick check.\n</think>\n\n<tool_call>\n<function=Bash>\n
           "</parameter>\n<parameter=timeout>\n5000\n</parameter>\n</function>\n</tool_call>")
 
 
-def bridge(chunks: list[str]) -> str:
+def bridge(chunks: list[str]) -> list[tuple[str, str]]:
     parser = OutputParser(thinking=True, tools=None, stream_tools=True, recover=False)
-    think, out = B.ThinkWrapper(), []
+    out = []
     for chunk in chunks:
-        out += [think.event(ev) for ev in parser.feed(chunk)]
-    out += [think.event(ev) for ev in parser.finish("stop")]
-    out.append(think.close())
-    return "".join(out)
+        out += [mapped for ev in parser.feed(chunk) if (mapped := B.pom_event(ev)) is not None]
+    out += [mapped for ev in parser.finish("stop") if (mapped := B.pom_event(ev)) is not None]
+    return out
 
 
-def test_tool_call_survives_whole_and_streamed():
+def test_reasoning_and_tool_call_survive_whole_and_streamed():
     for chunks in ([OUTPUT], [OUTPUT[i:i + 7] for i in range(0, len(OUTPUT), 7)]):
-        text = bridge(chunks)
-        assert text.startswith("<think>Let me run a quick check."), text
-        assert "</think>" in text and text.index("</think>") < text.index("<tool_call>"), text
-        assert "<function=Bash>\n<parameter=command>\nls -la\n</parameter>" in text, text
-        assert text.rstrip().endswith("</function>\n</tool_call>"), text
-        assert text.count("<tool_call>") == 1, text
+        events = bridge(chunks)
+        reasoning = "".join(text for field, text in events if field == "r")
+        answer = "".join(text for field, text in events if field == "t")
+        assert reasoning.rstrip("\n") == "Let me run a quick check.", events
+        assert "<think>" not in answer and "</think>" not in answer, answer
+        assert "<function=Bash>\n<parameter=command>\nls -la\n</parameter>" in answer, answer
+        assert answer.rstrip().endswith("</function>\n</tool_call>"), answer
+        assert answer.count("<tool_call>") == 1, answer
 
 
 def test_non_string_arguments_are_json():

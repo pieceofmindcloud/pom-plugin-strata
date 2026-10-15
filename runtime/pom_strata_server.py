@@ -15,17 +15,19 @@ This route does the same with Strata's template and tokenizer, runs the request
 through Strata's own request path (the FIFO, the monitor, the reasoning and
 stop handling) and streams the generated text back, one JSON object per line:
 
-    {"t": "<text>"}               generated text, in order
+    {"t": "<text>"}               generated answer text, in order
+    {"r": "<text>"}               generated reasoning, in order
     {"p": [read, total]}          prompt progress while the prompt is read
-    {"done": {...}}               the end: finish, token counts, timings (with the
-                                  MTP drafts, draft_n / draft_n_accepted), stop_sequence
+    {"done": {...}}               the end: finish, token counts (including reasoning_tokens),
+                                  timings (with MTP draft_n / draft_n_accepted), stop_sequence
     {"error": "..."}              the request failed
 
-Reasoning comes back inside <think> ... </think>, the way the POM chat and the
-POM tool-call parser read a llama.cpp pipeline's raw output. Tools are not
-given to Strata's parser: the POM renders its own tool block into the prompt
-and parses the calls out of the text. Strata's parser still takes the calls
-out of the output; they go back into the text in the template's own form.
+Reasoning stays distinct from answer text all the way to the POM adapter, so
+OpenAI-compatible clients receive `reasoning_content` instead of literal
+`<think>` markup in `content`. Tools are not given to Strata's parser: the POM
+renders its own tool block into the prompt and parses the calls out of answer
+text. Strata's parser still takes the calls out of the output; they go back
+into the text in the template's own form.
 
     GET /pom/status               loaded, model, context, busy (no prompts)
 
@@ -388,39 +390,24 @@ def tool_call_text(name: str, arguments: dict) -> str:
     return "".join(out)
 
 
-class ThinkWrapper:
-    """Turns Strata's parsed events back into the raw text a llama.cpp pipeline returns."""
+def pom_event(ev) -> tuple[str, str] | None:
+    """Maps one parsed Strata event to the POM NDJSON field and text.
 
-    def __init__(self):
-        self.open = False
-
-    def event(self, ev) -> str:
-        """One of Strata's events as raw text. A tool call is whole only in its final `tool_call` event; the
-        streamed `tool_start` / `tool_args` pieces come again inside it."""
-        if ev.kind == "tool_call" and ev.call is not None:
-            return self.text("content", "\n\n" + tool_call_text(ev.call.name, ev.call.arguments))
-        return self.text(ev.kind, ev.text or "")
-
-    def text(self, kind: str, text: str) -> str:
-        if not text:
-            return ""
-        if kind == "reasoning":
-            if not self.open:
-                self.open = True
-                return "<think>" + text
-            return text
-        if kind == "content":
-            if self.open:
-                self.open = False
-                return "</think>" + text
-            return text
-        return ""
-
-    def close(self) -> str:
-        if self.open:
-            self.open = False
-            return "</think>"
-        return ""
+    A tool call is whole only in its final `tool_call` event; the streamed
+    `tool_start` / `tool_args` pieces come again inside it and are ignored.
+    Reasoning deliberately uses a distinct field instead of being flattened
+    into literal `<think>` markup.
+    """
+    if ev.kind == "tool_call" and ev.call is not None:
+        return "t", "\n\n" + tool_call_text(ev.call.name, ev.call.arguments)
+    text = ev.text or ""
+    if not text:
+        return None
+    if ev.kind == "reasoning":
+        return "r", text
+    if ev.kind == "content":
+        return "t", text
+    return None
 
 
 def fit_budget(max_tokens: int, room: int) -> int:
@@ -775,7 +762,6 @@ def make_handler(original):
                 self.send_header("Content-Type", "application/x-ndjson")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                think = ThinkWrapper()
                 turn: dict = {}
 
                 def turn_hook(slot, held):
@@ -792,13 +778,11 @@ def make_handler(original):
                             progress = getattr(svc.engine, "progress", None)
                             self._line({"p": list(progress)} if progress else {"p": None})
                         elif kind == "event":
-                            text = think.event(x)
-                            if text:
-                                self._line({"t": text})
+                            event = pom_event(x)
+                            if event is not None:
+                                field, text = event
+                                self._line({field: text})
                         elif kind == "done":
-                            tail = think.close()
-                            if tail:
-                                self._line({"t": tail})
                             # the turn's save is deferred in its slot window (the hook above); the done line says so
                             if session is not None and "ran" not in turn:
                                 print(f"pom: session {session}: the turn did not run in a batch slot, not saved",
@@ -810,6 +794,7 @@ def make_handler(original):
                                 "finish": x.get("finish"),
                                 "prompt_tokens": x.get("prompt_tokens", len(ids)),
                                 "completion_tokens": x.get("completion_tokens", 0),
+                                "reasoning_tokens": x.get("reasoning_tokens", 0),
                                 "cached_tokens": x.get("reused") or 0,
                                 "timings": x.get("timings"),
                                 "stop_sequence": x.get("stop_sequence"),
