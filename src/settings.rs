@@ -112,6 +112,18 @@ fn all() -> Vec<Setting> {
             )
         },
         setting(
+            "session_save",
+            "boolean",
+            (
+                "Save the KV cache",
+                "Saves each conversation's KV cache to the session folder (POM_STRATA_SESSIONS: the shared disk), so another machine can restore it. Off: no session is saved or restored.",
+            ),
+            (
+                "Salvar o cache KV",
+                "Salva o cache KV de cada conversa na pasta de sessões (POM_STRATA_SESSIONS: o disco compartilhado), para outra máquina restaurá-lo. Desligado: nenhuma sessão é salva nem restaurada.",
+            ),
+        ),
+        setting(
             "aliases",
             "list",
             ("Model aliases", "Other model names the engine answers to (comma-separated)."),
@@ -209,11 +221,11 @@ mod tests {
     fn the_schema_names_every_key_once_with_both_languages() {
         let schema = schema();
         let entries = schema.as_array().unwrap();
-        assert_eq!(entries.len(), 14);
+        assert_eq!(entries.len(), 15);
         let mut keys: Vec<&str> = entries.iter().map(|e| e["key"].as_str().unwrap()).collect();
         keys.sort();
         keys.dedup();
-        assert_eq!(keys.len(), 14);
+        assert_eq!(keys.len(), 15);
         for entry in entries {
             assert!(entry["label"]["en"].is_string() && entry["label"]["pt-BR"].is_string());
         }

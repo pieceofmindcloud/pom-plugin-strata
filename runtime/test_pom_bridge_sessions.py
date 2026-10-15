@@ -7,7 +7,10 @@ import json
 import os
 import tempfile
 import threading
+import time
+import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import pom_sessions as P
@@ -191,6 +194,155 @@ class BridgeSessions(unittest.TestCase):
             B.apply_delta(svc, "conv")
         self.assertEqual(P.read_ids(folder / "conv.ids.json"), [7, 7])
         self.assertEqual(svc.engine.calls, [])
+
+
+@unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+class DeferredSaves(unittest.TestCase):
+    """A turn's save written later, by save_deferred, while the engine is idle; the slot keeps the turn meanwhile."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("POM_STRATA_SESSIONS")
+        os.environ["POM_STRATA_SESSIONS"] = self.tmp.name
+        B.slot_bases.clear()
+        B.deferred_saves.clear()
+        # no background saver here: the tests run save_deferred themselves, so each step is seen as it happens
+        self.saver_started = B._saver_started
+        B._saver_started = True
+        self.folder = Path(self.tmp.name)
+
+    def tearDown(self):
+        B.deferred_saves.clear()
+        B._saver_started = self.saver_started
+        if self.old is None:
+            os.environ.pop("POM_STRATA_SESSIONS", None)
+        else:
+            os.environ["POM_STRATA_SESSIONS"] = self.old
+        self.tmp.cleanup()
+
+    def test_the_turn_writes_nothing_and_its_save_waits_for_an_idle_engine(self):
+        svc = FakeService()
+        svc.slot_held[0] = [1, 2, 3, 4]
+        svc.slot_busy[0] = True                   # the turn's own slot, its window still open
+        B.defer_save(svc, "conv", [1, 2, 3], 0, [1, 2, 3, 4])
+        svc.slot_busy[0] = False                  # the engine frees the slot after the hook
+        self.assertEqual(svc.engine.calls, [])
+        self.assertFalse((self.folder / "conv.ids.json").exists())
+        self.assertTrue(B.save_deferred(svc))
+        self.assertEqual(P.read_ids(self.folder / "conv.ids.json"), [1, 2, 3, 4])
+        self.assertEqual(B.deferred_saves, {})
+        self.assertFalse(svc.slot_busy[0])        # the save gave the slot back
+
+    def test_a_save_waits_while_another_slot_is_busy(self):
+        svc = FakeService()
+        svc.slot_held[0] = [1, 2, 3, 4]
+        B.defer_save(svc, "conv", [1, 2, 3], 0, [1, 2, 3, 4])
+        svc.slot_busy[1] = True                   # another conversation is generating
+        self.assertFalse(B.save_deferred(svc))
+        self.assertIn(0, B.deferred_saves)
+        svc.slot_busy[1] = False
+        self.assertTrue(B.save_deferred(svc))
+        self.assertEqual(P.read_ids(self.folder / "conv.ids.json"), [1, 2, 3, 4])
+
+    def test_a_deferred_slot_is_not_taken_by_another_conversation(self):
+        svc = FakeService(slots=2)
+        svc.slot_held[0] = [1, 2, 3, 4]
+        B.defer_save(svc, "conv", [1, 2, 3], 0, [1, 2, 3, 4])
+        engine = B.batch_engine(svc)
+        with engine.slot_cv:
+            self.assertEqual(engine.pick_slot([9, 9, 9]), 1)
+        self.assertIn(0, B.deferred_saves)
+        self.assertFalse(svc.slot_busy[0])        # the guard gave the slot back after the pick
+
+    def test_with_one_slot_the_other_conversation_waits_for_the_save(self):
+        svc = FakeService(slots=1)
+        svc.slot_held[0] = [1, 2, 3, 4]
+        B.defer_save(svc, "conv", [1, 2, 3], 0, [1, 2, 3, 4])
+        engine = B.batch_engine(svc)
+        with engine.slot_cv:
+            self.assertIsNone(engine.pick_slot([9, 9, 9]))
+
+    def test_the_conversations_own_next_turn_takes_its_slot_and_supersedes_the_save(self):
+        svc = FakeService(slots=1)
+        svc.slot_held[0] = [1, 2, 3, 4]
+        B.defer_save(svc, "conv", [1, 2, 3], 0, [1, 2, 3, 4])
+        engine = B.batch_engine(svc)
+        with engine.slot_cv:
+            self.assertEqual(engine.pick_slot([1, 2, 3, 4, 5]), 0)
+        self.assertEqual(B.deferred_saves, {})
+        self.assertEqual(svc.engine.calls, [])
+
+    def test_a_conversation_is_pending_until_its_save_is_written(self):
+        svc = FakeService()
+        svc.slot_held[0] = [1, 2, 3, 4]
+        self.assertFalse(B.session_pending(svc, "conv"))
+        self.assertTrue(B.defer_save(svc, "conv", [1, 2, 3], 0, [1, 2, 3, 4]))
+        self.assertTrue(B.session_pending(svc, "conv"))
+        self.assertFalse(B.session_pending(svc, "other"))
+        seen = []
+        original = B.save_turn
+
+        def recording(*args, **kwargs):
+            seen.append(B.session_pending(svc, "conv"))   # still pending while the save is written
+            return original(*args, **kwargs)
+
+        with mock.patch.object(B, "save_turn", recording):
+            self.assertTrue(B.save_deferred(svc))
+        self.assertEqual(seen, [True])
+        self.assertFalse(B.session_pending(svc, "conv"))
+
+    def test_without_a_batch_engine_nothing_is_deferred(self):
+        svc = types.SimpleNamespace(engine=None)
+        self.assertFalse(B.defer_save(svc, "conv", [1], 0, [1]))
+        self.assertFalse(B.session_pending(svc, "conv"))
+
+    def test_a_save_not_written_in_time_is_dropped(self):
+        svc = FakeService()
+        svc.slot_held[0] = [1, 2, 3, 4]
+        B.deferred_saves[0] = ("conv", [1, 2, 3], [1, 2, 3, 4], time.monotonic() - 3600)
+        B.guard_pick(svc.engine)
+        self.assertFalse(B.save_deferred(svc))
+        self.assertEqual(B.deferred_saves, {})
+        self.assertEqual(svc.engine.calls, [])
+
+
+class SessionSaveSetting(unittest.TestCase):
+    """The deployment's session_save setting: taken out of the engine's settings, and off when absent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "config.json"
+        self.before = B.SESSIONS_ON if B is not None else False
+
+    def tearDown(self):
+        if B is not None:
+            B.SESSIONS_ON = self.before
+        self.tmp.cleanup()
+
+    def run_with(self, cfg):
+        self.path.write_text(json.dumps(cfg))
+        B.apply_pom_settings(["pom_strata_server.py", "--config", str(self.path)])
+        return json.loads(self.path.read_text())
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_session_save_true_turns_sessions_on_and_is_not_an_engine_setting(self):
+        B.SESSIONS_ON = False
+        written = self.run_with({"model": "m", "pom_settings": {"session_save": True}})
+        self.assertTrue(B.SESSIONS_ON)
+        self.assertNotIn("pom_settings", written)
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_session_save_false_keeps_sessions_off(self):
+        B.SESSIONS_ON = True
+        self.run_with({"model": "m", "pom_settings": {"session_save": False}})
+        self.assertFalse(B.SESSIONS_ON)
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_without_pom_settings_the_config_is_left_alone_and_sessions_stay_off(self):
+        B.SESSIONS_ON = False
+        cfg = {"model": "m"}
+        self.assertEqual(self.run_with(cfg), cfg)
+        self.assertFalse(B.SESSIONS_ON)
 
 
 if __name__ == "__main__":

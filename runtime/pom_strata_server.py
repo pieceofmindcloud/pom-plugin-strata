@@ -29,9 +29,13 @@ out of the output; they go back into the text in the template's own form.
 
     GET /pom/status               loaded, model, context, busy (no prompts)
 
-    POST /pom/session             a session file in the session folder (no paths: one file name)
+    POST /pom/session             a session file in the session folder (no paths: one file name); 501 unless the
+                                  deployment's session_save setting is on (and then the session routes below too)
     {"action": "save" | "restore" | "save_delta" | "restore_delta", "filename": "conv-1.strsdlt"}
     -> {"tokens", "bytes", "ms"}; a delta is cut from, and applied to, the base the engine holds.
+
+    GET /pom/session/pending?key=conv-1   -> {"pending": bool}: the conversation's save is still to be written here
+                                  (a turn's `done` line says `session.deferred`); the node syncs it after that
 """
 
 from __future__ import annotations
@@ -70,6 +74,20 @@ def session_dir() -> Path:
 
 # per batch slot: the conversation whose K/V the slot holds as its delta base, and the tokens of that base
 slot_bases: dict[int, tuple[str, list[int]]] = {}
+
+# The deployment's `session_save` setting (apply_pom_settings). Off, no session is saved or restored: the engine's
+# session calls are not made, the session routes answer 501 and a generation runs as it did without sessions.
+SESSIONS_ON = False
+
+# A turn's save, deferred (SESSIONS_ON): per batch slot, the conversation, its prompt, the tokens the slot held when the
+# turn ended, and when it was deferred. The slot keeps the turn until save_deferred writes it (guard_pick). A save
+# not written within DEFER_MAX_S is dropped: a session is a cache, and the next turn re-reads its prompt.
+deferred_saves: dict[int, tuple[str, list[int], list[int], float]] = {}
+DEFER_MAX_S = 10.0
+_saver_started = False
+# the conversations whose deferred save is being written now (save_deferred); with deferred_saves, what
+# session_pending reports
+_writing: set[str] = set()
 
 # The requests this bridge serves now (a generation or a session step, queued or running).  Counted here rather than
 # read from Strata's status, which a request that ends early can leave saying busy.
@@ -207,6 +225,108 @@ def save_turn(svc, key: str, prompt: list[int], locked: bool = True, held: list[
     return {"ids": whole["ids"], "delta": delta}
 
 
+def guard_pick(engine) -> None:
+    """Keeps a deferred save's slot for its conversation: while the save is pending, the engine's pick_slot does not
+    see the slot as free, unless the conversation's next prompt starts with the tokens the slot holds (then the slot
+    is taken, and that save is superseded by the turn's own). Installed once on the engine; the caller holds slot_cv,
+    as the caller of pick_slot does."""
+    if getattr(engine, "_pom_guarded", False):
+        return
+    original = engine.pick_slot
+
+    def pick_slot(prompt: list[int]) -> int | None:
+        marked = []
+        for slot, (_, _, held, _) in deferred_saves.items():
+            if engine.slot_busy[slot]:
+                continue
+            if len(held) < len(prompt) and list(prompt[:len(held)]) == held:
+                continue
+            engine.slot_busy[slot] = True
+            marked.append(slot)
+        try:
+            slot = original(prompt)
+        finally:
+            for kept in marked:
+                engine.slot_busy[kept] = False
+        if slot is not None and slot in deferred_saves:
+            key = deferred_saves.pop(slot)[0]
+            print(f"pom: session {key}: its slot takes the next turn, its save is superseded", file=sys.stderr,
+                  flush=True)
+        return slot
+
+    engine.pick_slot = pick_slot
+    engine._pom_guarded = True
+
+
+def defer_save(svc, key: str, prompt: list[int], slot: int, held: list[int]) -> bool:
+    """A turn that ended in a batch slot, saved later: the slot keeps the turn (guard_pick) and save_deferred writes it
+    while the engine is idle. Nothing is read or written here, so the turn returns at once. True: deferred."""
+    global _saver_started
+    engine = batch_engine(svc)
+    if engine is None:
+        return False
+    with engine.slot_cv:
+        deferred_saves[slot] = (key, list(prompt), list(held), time.monotonic())
+        guard_pick(engine)
+        engine.slot_cv.notify_all()
+    if not _saver_started:
+        _saver_started = True
+        threading.Thread(target=_saver_loop, args=(svc,), name="pom-session-saver", daemon=True).start()
+    return True
+
+
+def session_pending(svc, key: str) -> bool:
+    """Whether the save of `key` is still to be written here: deferred, or being written now. The node's sync waits for
+    it to end (GET /pom/session/pending) before it sends the conversation to the other machines."""
+    engine = batch_engine(svc)
+    if engine is None:
+        return False
+    with engine.slot_cv:
+        return key in _writing or any(item[0] == key for item in deferred_saves.values())
+
+
+def save_deferred(svc) -> bool:
+    """Writes one deferred save while every slot is idle (the engine's session_file needs that), or drops the ones
+    past DEFER_MAX_S. Returns whether a save was written or dropped (False: nothing was ready)."""
+    engine = batch_engine(svc)
+    if engine is None:
+        return False
+    with engine.slot_cv:
+        now = time.monotonic()
+        for slot in [s for s, item in deferred_saves.items() if now - item[3] > DEFER_MAX_S]:
+            key = deferred_saves.pop(slot)[0]
+            print(f"pom: session {key} not saved: no idle engine within {DEFER_MAX_S:.0f} s", file=sys.stderr,
+                  flush=True)
+        if not deferred_saves or any(engine.slot_busy):
+            return False
+        slot = min(deferred_saves, key=lambda s: deferred_saves[s][3])
+        key, prompt, held, _ = deferred_saves.pop(slot)
+        engine.slot_busy[slot] = True            # the save's own reservation: the slot is not picked meanwhile
+        _writing.add(key)
+    try:
+        save_turn(svc, key, prompt, locked=True, held=held, slot=slot, in_turn=True)
+    except Exception as e:                       # a save that fails is a session not kept, never a broken turn
+        print(f"pom: session {key} not saved: {e}", file=sys.stderr, flush=True)
+    finally:
+        with engine.slot_cv:
+            engine.slot_busy[slot] = False
+            _writing.discard(key)
+            engine.slot_cv.notify_all()
+    return True
+
+
+def _saver_loop(svc) -> None:
+    engine = batch_engine(svc)
+    while True:
+        with engine.slot_cv:
+            if not deferred_saves:
+                engine.slot_cv.wait(1.0)
+                continue
+        if not save_deferred(svc):
+            with engine.slot_cv:
+                engine.slot_cv.wait(0.2)
+
+
 def apply_delta(svc, key: str) -> dict:
     """The receiving side: the peer's delta applied to the whole session held here.  The whole session (the base) goes
     into a free slot, the delta on top of it, and the result is saved again as the whole session.  Refused unless the
@@ -341,6 +461,13 @@ def make_handler(original):
         base = original(svc)
 
         class PomHandler(base):
+            def _sessions_off(self) -> bool:
+                """The session routes with `session_save` off: 501, and nothing is read or written."""
+                if SESSIONS_ON:
+                    return False
+                self._json(501, {"error": "sessions are off on this deployment (the session_save setting)"})
+                return True
+
             def do_GET(self):
                 if self.path.split("?")[0].rstrip("/") == "/pom/status":
                     if self._authorized():
@@ -352,21 +479,30 @@ def make_handler(original):
                                          "in_flight": active, "queued": queued})
                     return
                 if self.path.split("?")[0].rstrip("/") == "/pom/session/file":
-                    if self._authorized():
+                    if self._authorized() and not self._sessions_off():
                         self._pom_file_get()
+                    return
+                if self.path.split("?")[0].rstrip("/") == "/pom/session/pending":
+                    if self._authorized() and not self._sessions_off():
+                        key = (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
+                        why = P.key_problem(key)
+                        if why:
+                            self._json(400, {"error": f"key {why}"})
+                        else:
+                            self._json(200, {"pending": session_pending(svc, key)})
                     return
                 super().do_GET()
 
             def do_PUT(self):
                 if self.path.split("?")[0].rstrip("/") == "/pom/session/chunk":
-                    if self._authorized():
+                    if self._authorized() and not self._sessions_off():
                         try:
                             self._pom_chunk_put()
                         except ValueError as e:
                             self._json(400, {"error": str(e)})
                     return
                 if self.path.split("?")[0].rstrip("/") == "/pom/session/file":
-                    if self._authorized():
+                    if self._authorized() and not self._sessions_off():
                         try:
                             self._pom_file_put()
                         except ValueError as e:
@@ -376,7 +512,7 @@ def make_handler(original):
 
             def do_POST(self):
                 if self.path.split("?")[0].rstrip("/") == "/pom/session":
-                    if self._authorized():
+                    if self._authorized() and not self._sessions_off():
                         try:
                             req = json.loads(self._body() or b"{}")
                             if not isinstance(req, dict):
@@ -581,7 +717,8 @@ def make_handler(original):
 
             def _pom_generate(self, req: dict) -> None:
                 prompt, chat, thinking, max_tokens, sampling = generation_request(req)
-                session = req.get("session")
+                # sessions off: the request's session is not read, and the turn runs as it did before sessions
+                session = req.get("session") if SESSIONS_ON else None
                 if session is not None and P.key_problem(session):
                     raise ValueError(f"session {P.key_problem(session)}")
                 self.record = svc.begin_request("/pom/generate", {"model": svc.model, "stream": True,
@@ -630,7 +767,8 @@ def make_handler(original):
                     session = None
                 svc.engine.last_probe = None
                 svc.engine.probe_request = probe_groups(svc, labels) if labels else None
-                restore_for_prompt(svc, list(ids))
+                if SESSIONS_ON:
+                    restore_for_prompt(svc, list(ids))
                 cancel = threading.Event()
                 self._watch_client(cancel)
                 self.send_response(200)
@@ -641,12 +779,11 @@ def make_handler(original):
                 turn: dict = {}
 
                 def turn_hook(slot, held):
-                    # the engine's turn is ending in `slot`, which still holds it: save it there
+                    # the engine's turn is ending in `slot`, which still holds it: its save is deferred to an idle
+                    # engine (defer_save), so the turn's answer does not wait for the disk. The done line says so
+                    # (`session.deferred`), and the node syncs the conversation once session_pending is false
                     turn["ran"] = True
-                    try:
-                        turn["saved"] = save_turn(svc, session, list(ids), held=held, slot=slot, in_turn=True)
-                    except (S.SessionRefused, S.EngineDied, ValueError) as e:
-                        print(f"pom: session {session} not saved: {e}", file=sys.stderr, flush=True)
+                    turn["deferred"] = defer_save(svc, session, list(ids), slot, held)
                 try:
                     for kind, x in svc.run(ids, thinking, None, max_new, sampling, cancel,
                                            keep_slot=session is not None,
@@ -662,13 +799,13 @@ def make_handler(original):
                             tail = think.close()
                             if tail:
                                 self._line({"t": tail})
-                            # the turn was saved in its slot window (the hook below); the done line reports it
-                            saved = turn.get("saved")
+                            # the turn's save is deferred in its slot window (the hook above); the done line says so
                             if session is not None and "ran" not in turn:
                                 print(f"pom: session {session}: the turn did not run in a batch slot, not saved",
                                       file=sys.stderr, flush=True)
                             self._line({"done": {
-                                **({"session": {"key": session, "saved": saved}} if saved else {}),
+                                **({"session": {"key": session, "saved": None, "deferred": True}}
+                                   if turn.get("deferred") else {}),
                                 **({"probe": svc.engine.last_probe} if svc.engine.probe_request else {}),
                                 "finish": x.get("finish"),
                                 "prompt_tokens": x.get("prompt_tokens", len(ids)),
@@ -697,6 +834,7 @@ def make_handler(original):
 def apply_pom_settings(argv: list[str]) -> None:
     """The deployment's engine settings (`pom_settings` in the run config, written by the plugin) applied with
     Strata's own rules (serve/runconfig.py); a value Strata refuses stops the start with Strata's message."""
+    global SESSIONS_ON
     if "--config" not in argv[:-1]:
         return
     path = Path(argv[argv.index("--config") + 1])
@@ -704,13 +842,17 @@ def apply_pom_settings(argv: list[str]) -> None:
     settings = cfg.pop("pom_settings", None)
     if not settings:
         return
-    from serve import runconfig
-    try:
-        cfg, changed = runconfig.apply(cfg, settings)
-    except ValueError as e:
-        print(f"[pom] engine setting refused: {e}", flush=True)
-        raise SystemExit(2)
-    print(f"[pom] engine settings: {', '.join(changed) or 'no change'}", flush=True)
+    # session_save is the bridge's own setting, not an engine one: it is taken out before Strata's rules see the rest
+    SESSIONS_ON = bool(settings.pop("session_save", False))
+    print(f"[pom] session save (KV cache on the shared disk): {'on' if SESSIONS_ON else 'off'}", flush=True)
+    if settings:
+        from serve import runconfig
+        try:
+            cfg, changed = runconfig.apply(cfg, settings)
+        except ValueError as e:
+            print(f"[pom] engine setting refused: {e}", flush=True)
+            raise SystemExit(2)
+        print(f"[pom] engine settings: {', '.join(changed) or 'no change'}", flush=True)
     path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
 
 
