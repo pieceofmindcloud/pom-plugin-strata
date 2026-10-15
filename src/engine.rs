@@ -1106,6 +1106,10 @@ impl Manager {
         if !env.is_empty() {
             config["env"] = Value::Object(env);
         }
+        // A tool call the model writes in a near form (`<parameter=NAME>` as the opener, no `<function=NAME>`) is
+        // still the call. Strata reads it only when this is on (its default is off), and the POM's chat needs it:
+        // without it the call stays as text and the request ends with no tool execution.
+        config["tool_call_recovery"] = json!(true);
         // Applied by the bridge with Strata's own rules (serve/runconfig.py).
         if !request.settings.is_empty() {
             config["pom_settings"] = Value::Object(request.settings.clone());
