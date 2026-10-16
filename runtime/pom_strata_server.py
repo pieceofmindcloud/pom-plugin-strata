@@ -36,6 +36,10 @@ into the text in the template's own form.
     {"action": "save" | "restore" | "save_delta" | "restore_delta", "filename": "conv-1.strsdlt"}
     -> {"tokens", "bytes", "ms"}; a delta is cut from, and applied to, the base the engine holds.
 
+    GET /pom/session/offer?key=conv-1    -> {"tokens", "bytes", "ram_tokens", "layers", "pending"}: what this machine can
+                                  give a peer (its file on disk, its layer split); a peer fetches the file in pieces with
+                                  GET /pom/session/file?key=&kind=&offset=&len= (kind full, full_ids), and only when the
+                                  layers match its own
     GET /pom/session/pending?key=conv-1   -> {"pending": bool}: the conversation's save is still to be written here
                                   (a turn's `done` line says `session.deferred`); the node syncs it after that
 """
@@ -80,6 +84,8 @@ slot_bases: dict[int, tuple[str, list[int]]] = {}
 # The deployment's `session_save` setting (apply_pom_settings). Off, no session is saved or restored: the engine's
 # session calls are not made, the session routes answer 501 and a generation runs as it did without sessions.
 SESSIONS_ON = False
+# the largest piece of a session file a peer reads in one request (the node relays pieces of this size)
+SESSION_PIECE = 64 << 20
 
 # A turn's save, deferred (SESSIONS_ON): per batch slot, the conversation, its prompt, the tokens the slot held when the
 # turn ended, and when it was deferred. The slot keeps the turn until save_deferred writes it (guard_pick). A save
@@ -175,6 +181,9 @@ def restore_for_prompt(svc, ids: list[int]) -> None:
         key = P.choose_restore(ids, sessions, engine.slot_held)
         slot = engine.pick_slot(ids) if key is not None else None
     if key is None or slot is None:
+        # the test's marker: the prompt is read again from its first token (no saved start of it on disk, or no slot)
+        print(f"pom: session restore: none of {len(sessions)} saved sessions starts this prompt "
+              f"({len(ids)} tokens): the prompt is read again", file=sys.stderr, flush=True)
         return
     try:
         engine_session(svc, "restore", key, slot, ids=sessions[key])
@@ -182,14 +191,19 @@ def restore_for_prompt(svc, ids: list[int]) -> None:
         print(f"pom: session {key} not restored into slot {slot}: {e}", file=sys.stderr, flush=True)
         return
     slot_bases[slot] = (key, sessions[key])
+    # the test's marker: the saved start came from this machine's disk into a batch slot; the engine reads the rest
+    print(f"pom: session {key} restored from disk into slot {slot}: {len(sessions[key])} of {len(ids)} prompt "
+          f"tokens", file=sys.stderr, flush=True)
 
 
 def save_turn(svc, key: str, prompt: list[int], locked: bool = True, held: list[int] | None = None,
-              slot: int | None = None, in_turn: bool = False) -> dict | None:
+              slot: int | None = None, in_turn: bool = False, wait: bool = True) -> dict | None:
     """A turn that ran in a batch slot: the slot saves the conversation under `key`.  When the slot's base is still this
     conversation's, the delta from that base is cut first (the peers apply it to their whole session), then the whole
     session is saved, which becomes the next base.  `slot`/`held` come from the engine's turn hook (`in_turn`: the
     slot is still the turn's own, its window is open).  Without them the slot is found by its held tokens.
+    `wait=False`: a save the engine answers SAVING returns at once, with `pending` (its ticket) and `finish` (the
+    bookkeeping, to call once the file is written); the slot is free by then.
     None: no slot holds the turn."""
     engine = batch_engine(svc)
     if engine is None:
@@ -216,15 +230,27 @@ def save_turn(svc, key: str, prompt: list[int], locked: bool = True, held: list[
         except S.SessionRefused as e:
             print(f"pom: session {key}: no delta this turn: {e}", file=sys.stderr, flush=True)
     whole = engine_session(svc, "save", key, slot, locked=locked, in_turn=in_turn)
-    P.write_json(folder / P.file_name(key, "full_ids"), whole["ids"])
+    ticket = whole.get("pending")                   # SAVING: the engine copied the state, its file is still written
+    finish = lambda: _finish_turn_save(svc, key, slot, delta, base_ids, folder, whole["ids"], ticket)
+    if ticket is not None and not wait:
+        return {"ids": whole["ids"], "delta": delta, "pending": ticket, "finish": finish}
+    return finish()
+
+
+def _finish_turn_save(svc, key: str, slot: int, delta: bool, base_ids, folder, ids: list[int], ticket) -> dict:
+    """What a turn's save leaves behind, once its file is written: the ids and the base the peers hold. A file the
+    engine did not write raises (SessionRefused / EngineDied), and then the base stays as it was."""
+    if ticket is not None:
+        batch_engine(svc).await_session_file(ticket)
+    P.write_json(folder / P.file_name(key, "full_ids"), ids)
     if delta:
-        P.write_json(folder / P.file_name(key, "delta_meta"), {"base": base_ids, "ids": whole["ids"]})
+        P.write_json(folder / P.file_name(key, "delta_meta"), {"base": base_ids, "ids": ids})
     else:
         for kind in ("delta", "delta_meta"):
             (folder / P.file_name(key, kind)).unlink(missing_ok=True)
-    slot_bases[slot] = (key, whole["ids"])
+    slot_bases[slot] = (key, ids)
     prune_cache()
-    return {"ids": whole["ids"], "delta": delta}
+    return {"ids": ids, "delta": delta}
 
 
 def guard_pick(engine) -> None:
@@ -277,6 +303,28 @@ def defer_save(svc, key: str, prompt: list[int], slot: int, held: list[int]) -> 
     return True
 
 
+def session_offer(svc, key: str) -> dict:
+    """What this machine can give a peer for a conversation: `tokens` of its saved session on disk (the only copy a
+    peer can fetch), `bytes` of that file, `ram_tokens` the batch slot holds in RAM, `layers` the layer split the engine
+    runs ("whole" on a whole model: a session is only usable on the same split), and `pending` while its save is still
+    being written. Nothing is read beyond the token count and the file's size."""
+    engine = batch_engine(svc)
+    ram = 0
+    if engine is not None:
+        with engine.slot_cv:
+            for k, ids in slot_bases.values():
+                if k == key:
+                    ram = max(ram, len(ids))
+    folder = session_dir()
+    ids_path, full = folder / P.file_name(key, "full_ids"), folder / P.file_name(key, "full")
+    ids = P.read_ids(ids_path) if ids_path.is_file() else None
+    on_disk = bool(ids) and full.is_file()
+    info = getattr(engine, "info", None) or {}
+    return {"tokens": len(ids) if on_disk else 0, "bytes": full.stat().st_size if on_disk else 0,
+            "ram_tokens": ram, "layers": str(info.get("layers") or "whole"),
+            "pending": session_pending(svc, key)}
+
+
 def session_pending(svc, key: str) -> bool:
     """Whether the save of `key` is still to be written here: deferred, or being written now. The node's sync waits for
     it to end (GET /pom/session/pending) before it sends the conversation to the other machines."""
@@ -299,22 +347,44 @@ def save_deferred(svc) -> bool:
             key = deferred_saves.pop(slot)[0]
             print(f"pom: session {key} not saved: no idle engine within {DEFER_MAX_S:.0f} s", file=sys.stderr,
                   flush=True)
-        if not deferred_saves or any(engine.slot_busy):
+        # a request in flight (queued or generating) may already own a slot the engine has not marked busy yet, and
+        # the engine answers a SAVE in the same stream as its generations: the save waits for the bridge to be idle
+        if not deferred_saves or any(engine.slot_busy) or in_flight_count():
             return False
         slot = min(deferred_saves, key=lambda s: deferred_saves[s][3])
         key, prompt, held, _ = deferred_saves.pop(slot)
         engine.slot_busy[slot] = True            # the save's own reservation: the slot is not picked meanwhile
         _writing.add(key)
+    out = None
     try:
-        save_turn(svc, key, prompt, locked=True, held=held, slot=slot, in_turn=True)
+        out = save_turn(svc, key, prompt, locked=True, held=held, slot=slot, in_turn=True, wait=False)
     except Exception as e:                       # a save that fails is a session not kept, never a broken turn
         print(f"pom: session {key} not saved: {e}", file=sys.stderr, flush=True)
     finally:
+        # SAVING: the state is in RAM, the slot is free; the file is still being written by the engine. Its end is
+        # finished by a thread of its own, so the slot takes the next turn meanwhile.
         with engine.slot_cv:
             engine.slot_busy[slot] = False
+            if not (out and out.get("pending")):
+                _writing.discard(key)
+            engine.slot_cv.notify_all()
+    if out and out.get("pending"):
+        threading.Thread(target=_finish_writing, args=(key, out, engine), name="pom-session-finish",
+                         daemon=True).start()
+    return True
+
+
+def _finish_writing(key: str, out: dict, engine) -> None:
+    """The end of a deferred save whose file the engine is still writing: the bookkeeping once it is written, or the
+    session dropped with its reason. `key` is pending (session_pending) until then."""
+    try:
+        out["finish"]()
+    except Exception as e:                       # the file was not written: the session is not kept
+        print(f"pom: session {key} not saved: {e}", file=sys.stderr, flush=True)
+    finally:
+        with engine.slot_cv:
             _writing.discard(key)
             engine.slot_cv.notify_all()
-    return True
 
 
 def _saver_loop(svc) -> None:
@@ -353,6 +423,8 @@ def apply_delta(svc, key: str) -> dict:
         slot_bases.pop(slot, None)
         raise
     whole = engine_session(svc, "save", key, slot)
+    if whole.get("pending") is not None:             # SAVING: the file must be written before it is this peer's base
+        batch_engine(svc).await_session_file(whole["pending"])
     P.write_json(folder / P.file_name(key, "full_ids"), whole["ids"])
     slot_bases[slot] = (key, whole["ids"])
     prune_cache()
@@ -469,6 +541,10 @@ def make_handler(original):
                     if self._authorized() and not self._sessions_off():
                         self._pom_file_get()
                     return
+                if self.path.split("?")[0].rstrip("/") == "/pom/session/offer":
+                    if self._authorized() and not self._sessions_off():
+                        self._pom_file_offer()
+                    return
                 if self.path.split("?")[0].rstrip("/") == "/pom/session/pending":
                     if self._authorized() and not self._sessions_off():
                         key = (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
@@ -549,14 +625,46 @@ def make_handler(original):
                     raise ValueError(f"kind must be one of {', '.join(P.KINDS)}")
                 return key, kind
 
+            def _pom_file_offer(self) -> None:
+                """GET /pom/session/offer?key=: what this machine can give a peer for the conversation (session_offer)."""
+                key = (parse_qs(urlparse(self.path).query).get("key") or [""])[0]
+                why = P.key_problem(key)
+                if why:
+                    self._json(400, {"error": f"key {why}"})
+                    return
+                self._json(200, session_offer(svc, key))
+
             def _pom_file_get(self) -> None:
-                """One session file, streamed, under the service FIFO (no save or restore writes it meanwhile)."""
+                """One session file, streamed, under the service FIFO (no save or restore writes it meanwhile). With
+                `offset` and `len` a piece of it, read without the FIFO: a published file never changes (its name is
+                renamed into place only when it is whole), so a fetch does not hold the generations."""
                 try:
                     key, kind = self._file_query()
+                    query = parse_qs(urlparse(self.path).query)
+                    ranged = "offset" in query or "len" in query
+                    offset = int((query.get("offset") or ["0"])[0])
+                    length = int((query.get("len") or [str(SESSION_PIECE)])[0])
+                    if offset < 0 or not 0 < length <= SESSION_PIECE:
+                        raise ValueError("a piece is at most 64 MiB from a nonnegative offset")
                 except ValueError as e:
                     self._json(400, {"error": str(e)})
                     return
                 path = session_dir() / P.file_name(key, kind)
+                if ranged:
+                    if not path.is_file():
+                        self._json(404, {"error": f"no {kind} file for {key}"})
+                        return
+                    size = path.stat().st_size
+                    with open(path, "rb") as f:
+                        f.seek(offset)
+                        piece = f.read(length)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(piece)))
+                    self.send_header("X-File-Size", str(size))          # the whole file, for the fetch's end
+                    self.end_headers()
+                    self.wfile.write(piece)
+                    return
                 with svc.fifo:
                     if not path.is_file():
                         self._json(404, {"error": f"no {kind} file for {key}"})
@@ -838,6 +946,10 @@ def apply_pom_settings(argv: list[str]) -> None:
             print(f"[pom] engine setting refused: {e}", flush=True)
             raise SystemExit(2)
         print(f"[pom] engine settings: {', '.join(changed) or 'no change'}", flush=True)
+    # the same setting turns on the engine's asynchronous session write (SAVING, then the file on a thread)
+    args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
+    if SESSIONS_ON and "--session-async-save" not in args:
+        cfg["args"] = [*args, "--session-async-save"]
     path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
 
 

@@ -80,6 +80,31 @@ class FakeEngine:
         raise AssertionError(action)
 
 
+class AsyncFakeEngine(FakeEngine):
+    """A save answers SAVING at once (the slot is free) and writes its file on a thread, as the engine does for a
+    layer split; await_session_file waits for that file (StrataEngine's contract)."""
+
+    def session_file(self, action, path, slot=None, ids=None, in_turn=False):
+        if action != "save":
+            return super().session_file(action, path, slot=slot, ids=ids, in_turn=in_turn)
+        self.calls.append((action, Path(path).name, slot))
+        tokens = list(self.svc.slot_held[slot])
+        ticket = {"path": path, "slot": slot, "result": None, "error": None, "done": False}
+
+        def write():
+            time.sleep(0.3)
+            Path(path).write_text(json.dumps(tokens))
+            ticket["result"] = {"tokens": len(tokens), "bytes": 1, "ms": 0.0}
+
+        ticket["thread"] = threading.Thread(target=write, daemon=True)
+        ticket["thread"].start()
+        return {"tokens": len(tokens), "bytes": None, "ms": 0.0, "ids": tokens, "pending": ticket}
+
+    def await_session_file(self, ticket, raise_error=True):
+        ticket["thread"].join()
+        return ticket["result"]
+
+
 class FakeService:
     """The service has no batch attribute of its own: as in the real server, the batch lives on `engine`."""
 
@@ -244,6 +269,33 @@ class DeferredSaves(unittest.TestCase):
         self.assertTrue(B.save_deferred(svc))
         self.assertEqual(P.read_ids(self.folder / "conv.ids.json"), [1, 2, 3, 4])
 
+    def test_a_save_waits_while_a_request_is_in_flight(self):
+        svc = FakeService()
+        svc.slot_held[0] = [1, 2, 3, 4]
+        B.defer_save(svc, "conv", [1, 2, 3], 0, [1, 2, 3, 4])
+        with B.in_flight():                       # a request already admitted, its slot not marked busy yet
+            self.assertFalse(B.save_deferred(svc))
+            self.assertEqual(svc.engine.calls, [])
+            self.assertIn(0, B.deferred_saves)
+        self.assertTrue(B.save_deferred(svc))
+        self.assertEqual(P.read_ids(self.folder / "conv.ids.json"), [1, 2, 3, 4])
+
+    def test_a_save_answered_saving_frees_the_slot_and_is_finished_when_written(self):
+        svc = FakeService()
+        svc.engine = AsyncFakeEngine(svc)
+        svc.slot_held[0] = [1, 2, 3, 4]
+        B.defer_save(svc, "conv", [1, 2, 3], 0, [1, 2, 3, 4])
+        self.assertTrue(B.save_deferred(svc))
+        self.assertFalse(svc.slot_busy[0])                    # SAVING: the next turn may take the slot now
+        self.assertTrue(B.session_pending(svc, "conv"))       # but the session is not kept until it is written
+        self.assertFalse((self.folder / "conv.ids.json").exists())
+        deadline = time.monotonic() + 5
+        while B.session_pending(svc, "conv") and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(B.session_pending(svc, "conv"))
+        self.assertEqual(P.read_ids(self.folder / "conv.ids.json"), [1, 2, 3, 4])
+        self.assertEqual(B.slot_bases[0], ("conv", [1, 2, 3, 4]))
+
     def test_a_deferred_slot_is_not_taken_by_another_conversation(self):
         svc = FakeService(slots=2)
         svc.slot_held[0] = [1, 2, 3, 4]
@@ -330,12 +382,14 @@ class SessionSaveSetting(unittest.TestCase):
         written = self.run_with({"model": "m", "pom_settings": {"session_save": True}})
         self.assertTrue(B.SESSIONS_ON)
         self.assertNotIn("pom_settings", written)
+        self.assertIn("--session-async-save", written["args"])     # the same setting turns the async write on
 
     @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
     def test_session_save_false_keeps_sessions_off(self):
         B.SESSIONS_ON = True
-        self.run_with({"model": "m", "pom_settings": {"session_save": False}})
+        written = self.run_with({"model": "m", "pom_settings": {"session_save": False}})
         self.assertFalse(B.SESSIONS_ON)
+        self.assertNotIn("--session-async-save", written.get("args", []))
 
     @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
     def test_without_pom_settings_the_config_is_left_alone_and_sessions_stay_off(self):
@@ -347,3 +401,50 @@ class SessionSaveSetting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+class SessionOffer(unittest.TestCase):
+    """What a machine offers a peer for a conversation (session_offer): its file on disk, its slot in RAM, its split."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = os.environ.get("POM_STRATA_SESSIONS")
+        os.environ["POM_STRATA_SESSIONS"] = self.tmp.name
+        B.slot_bases.clear()
+        self.folder = Path(self.tmp.name)
+        self.svc = FakeService()
+        self.svc.engine.info = {"layers": "0-35|36-47"}
+
+    def tearDown(self):
+        if self.old is None:
+            os.environ.pop("POM_STRATA_SESSIONS", None)
+        else:
+            os.environ["POM_STRATA_SESSIONS"] = self.old
+        B.slot_bases.clear()
+        self.tmp.cleanup()
+
+    def save_on_disk(self, key, ids, body=b"x" * 100):
+        P.write_json(self.folder / P.file_name(key, "full_ids"), ids)
+        (self.folder / P.file_name(key, "full")).write_bytes(body)
+
+    def test_a_session_on_disk_is_offered_with_its_tokens_bytes_and_split(self):
+        self.save_on_disk("conv", [1, 2, 3, 4], b"y" * 4096)
+        offer = B.session_offer(self.svc, "conv")
+        self.assertEqual((offer["tokens"], offer["bytes"], offer["layers"]), (4, 4096, "0-35|36-47"))
+        self.assertFalse(offer["pending"])
+
+    def test_a_session_only_in_ram_is_not_offered_to_fetch(self):
+        self.svc.slot_held[0] = [1, 2, 3, 4, 5]
+        B.slot_bases[0] = ("conv", [1, 2, 3, 4, 5])
+        offer = B.session_offer(self.svc, "conv")
+        self.assertEqual((offer["tokens"], offer["ram_tokens"]), (0, 5))
+
+    def test_a_whole_model_says_whole(self):
+        self.svc.engine.info = {}
+        self.save_on_disk("conv", [1, 2])
+        self.assertEqual(B.session_offer(self.svc, "conv")["layers"], "whole")
+
+    def test_an_unknown_conversation_offers_nothing(self):
+        offer = B.session_offer(self.svc, "nobody")
+        self.assertEqual((offer["tokens"], offer["bytes"], offer["ram_tokens"]), (0, 0, 0))
