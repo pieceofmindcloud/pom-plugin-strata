@@ -121,11 +121,11 @@ fn all() -> Vec<Setting> {
             "boolean",
             (
                 "Save the KV cache",
-                "Saves each conversation's KV cache to the session folder (POM_STRATA_SESSIONS: the shared disk), so another machine can restore it. Off: no session is saved or restored.",
+                "Saves each conversation's KV cache to disk, in the shared session folder (POM_STRATA_SESSIONS), so that another machine can restore it instead of re-reading the prompt. Only conversations of at least 8,000 prompt tokens are saved, at the end of the turn, without delaying the answer. A machine restores a session it does not hold in memory when it runs the same model layout and the transfer is faster than re-reading the prompt. The folder is limited to 5 GB per machine (POM_STRATA_SESSION_CACHE_MB); conversations unused for 24 hours are removed (POM_STRATA_SESSION_MAX_AGE_H), and the KV cache clear button empties it. Off: no session is saved or restored.",
             ),
             (
                 "Salvar o cache KV",
-                "Salva o cache KV de cada conversa na pasta de sessões (POM_STRATA_SESSIONS: o disco compartilhado), para outra máquina restaurá-lo. Desligado: nenhuma sessão é salva nem restaurada.",
+                "Salva o cache KV de cada conversa em disco, na pasta compartilhada de sessões (POM_STRATA_SESSIONS), para que outra máquina a restaure em vez de reler o prompt. Somente conversas com pelo menos 8.000 tokens de prompt são salvas, ao fim do turno, sem atrasar a resposta. Uma máquina restaura uma sessão que não tem em memória quando roda o mesmo layout do modelo e a transferência é mais rápida que reler o prompt. A pasta é limitada a 5 GB por máquina (POM_STRATA_SESSION_CACHE_MB); conversas sem uso há 24 horas são removidas (POM_STRATA_SESSION_MAX_AGE_H), e o botão de limpar o cache KV também a esvazia. Desligado: nenhuma sessão é salva nem restaurada.",
             ),
             )
         },
