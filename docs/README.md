@@ -90,10 +90,13 @@ that session, restores it and reads only the rest, then writes the answer.
 
 - A role keeps the sessions on (as **Save the KV cache** does) and the batch
   slots on (at least 2 concurrent requests), whatever those settings say.
-- Every turn goes through the prefill machine. `POM_STRATA_PREFILL_MIN_TOKENS`
-  in the prefill node's environment leaves to the decode machine the turns
-  whose new part is shorter than that many tokens (sending the session costs
-  about 118 MB whatever the prompt).
+- A turn goes through the prefill machine only when the part of its prompt the
+  decode machine does not already hold has at least 4096 tokens (the POM
+  setting **Prefill machine from (tokens)** of the deployment, or
+  `POM_STRATA_PREFILL_MIN_TOKENS` in the prefill node's environment; 0 sends
+  every turn with anything new). A shorter one, such as the next turn of a long
+  conversation the decode machine just answered, is read by the decode
+  machine itself: sending the session costs about 118 MB whatever the prompt.
 - What crosses is one session file per turn: about 118 MB of recurrent state
   plus the K/V of the attention layers (about 7.5 KB per token in q4_0). Both
   machines need the same model and KV type; anything that fails leaves the

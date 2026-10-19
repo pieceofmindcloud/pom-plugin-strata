@@ -258,6 +258,30 @@ class DeferredSaves(unittest.TestCase):
         self.assertEqual(B.deferred_saves, {})
         self.assertFalse(svc.slot_busy[0])        # the save gave the slot back
 
+    def test_a_prefill_turn_is_kept_from_the_slot_the_engine_frees_holding_its_prompt(self):
+        # max_tokens 1: the consumer stops before BDONE, the hook does not run, and the slot is freed holding the prompt
+        svc = FakeService()
+        svc.slot_held[1] = [1, 2, 3]
+        self.assertTrue(B.keep_prefill(svc, "conv", [1, 2, 3], wait_s=0.5))
+        self.assertIn(1, B.deferred_saves)
+        self.assertTrue(B.save_deferred(svc))
+        self.assertEqual(P.read_ids(self.folder / "conv.ids.json"), [1, 2, 3])
+
+    def test_a_prefill_turn_no_slot_holds_is_not_kept(self):
+        svc = FakeService()
+        svc.slot_held[0] = [9, 9]
+        self.assertFalse(B.keep_prefill(svc, "conv", [1, 2, 3], wait_s=0.2))
+        self.assertEqual(B.deferred_saves, {})
+
+    def test_a_prefill_is_skipped_when_the_decode_machine_lacks_too_little(self):
+        with mock.patch.object(B, "PREFILL_MIN_TOKENS", 4096):
+            self.assertIsNone(B.prefill_skip(list(range(10000)), 0))
+            self.assertIsNotNone(B.prefill_skip(list(range(10000)), 8000))   # 2000 new: the decode machine reads them
+            self.assertIsNotNone(B.prefill_skip(list(range(100)), None))
+        with mock.patch.object(B, "PREFILL_MIN_TOKENS", 0):
+            self.assertIsNone(B.prefill_skip(list(range(100)), 0))
+            self.assertIsNotNone(B.prefill_skip(list(range(100)), 100))     # nothing new
+
     def test_a_save_waits_while_another_slot_is_busy(self):
         svc = FakeService()
         svc.slot_held[0] = [1, 2, 3, 4]

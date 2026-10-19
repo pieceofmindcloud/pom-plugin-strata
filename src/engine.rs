@@ -60,6 +60,9 @@ pub struct LoadRequest {
     /// The machine's part in the POM's prefill/decode split (`prefill` or `decode`; `None` = both). The bridge keeps
     /// the sessions on for it: the split hands a prompt's state from one machine to the other as a session.
     pub role: Option<String>,
+    /// The split's threshold (the deployment's `prefill_min_tokens`): the bridge of a prefill machine reads a turn
+    /// only when the part the decode machine lacks has this many tokens. `None` = the bridge's default.
+    pub prefill_min_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -199,8 +202,12 @@ impl LoadRequest {
             Some(role @ ("prefill" | "decode")) => Some(role.to_owned()),
             Some(other) => return Err(format!("unknown inference role {other}")),
         };
+        let prefill_min_tokens = value["prefill_min_tokens"]
+            .as_u64()
+            .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32);
         Ok(Self {
             role,
+            prefill_min_tokens,
             model_path,
             model_label,
             context,
@@ -387,7 +394,12 @@ impl Snapshot {
             "stages": true,
             // The POM settings that apply to those stages (the nodes carry the hidden state between them), and the
             // prefill/decode role of a machine that runs the whole model.
-            "pom_settings": ["prefill_max_inflight_chunks", "hidden_state_dtype", "inference_role"],
+            "pom_settings": [
+                "prefill_max_inflight_chunks",
+                "hidden_state_dtype",
+                "inference_role",
+                "prefill_min_tokens"
+            ],
             // Images are read through the deployment's vision projector (`mmproj_path`), when one is chosen.
             "vision": true,
             "settings": crate::settings::schema(),
@@ -1131,6 +1143,9 @@ impl Manager {
         let mut pom_settings = request.settings.clone();
         if let Some(role) = &request.role {
             pom_settings.insert("inference_role".into(), json!(role));
+            if let Some(tokens) = request.prefill_min_tokens {
+                pom_settings.insert("prefill_min_tokens".into(), json!(tokens));
+            }
         }
         if !pom_settings.is_empty() {
             config["pom_settings"] = Value::Object(pom_settings);
@@ -1454,6 +1469,11 @@ mod tests {
             |role: &str| LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "role": role}));
         assert_eq!(role("prefill").unwrap().role.as_deref(), Some("prefill"));
         assert_eq!(role("both").unwrap().role, None);
+        let threshold = LoadRequest::from_json(
+            &json!({"model_path": "/m/x.gguf", "role": "prefill", "prefill_min_tokens": 2048}),
+        )
+        .unwrap();
+        assert_eq!(threshold.prefill_min_tokens, Some(2048));
         assert!(role("other").is_err());
         assert!(LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "mmproj_path": "rel.gguf"})).is_err());
         assert!(LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "mmproj_path": "/no/such/mmproj.gguf"})).is_err());

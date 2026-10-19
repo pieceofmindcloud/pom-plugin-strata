@@ -133,11 +133,11 @@ MIN_SESSION_TOKENS = 8000
 
 # The deployment's prefill/decode role (`inference_role`: "prefill", "decode", or None for both; apply_pom_settings).
 ROLE = None
-# A prefill machine reads a prompt for the decode machine only when the part that machine lacks has this many tokens
-# (at least one). 0, the default, sends every turn through the prefill machine; a larger value leaves the short ones
-# to the decode machine, where sending the session (~118 MB of recurrent state, whatever the prompt) costs more than
-# reading them.
-PREFILL_MIN_TOKENS = int(os.environ.get("POM_STRATA_PREFILL_MIN_TOKENS", "0"))
+# A prefill machine reads a prompt for the decode machine only when the part that machine lacks (the prompt less what
+# it already holds of the conversation, `decode_holds`) has this many tokens: below it, the decode machine reads it
+# itself, since sending the session (~118 MB of recurrent state, whatever the prompt) costs more than reading them.
+# POM_STRATA_PREFILL_MIN_TOKENS in the prefill node's environment changes it (0: every turn with anything new).
+PREFILL_MIN_TOKENS = int(os.environ.get("POM_STRATA_PREFILL_MIN_TOKENS", "4096"))
 # A prefill machine's deferred save waits this long for an idle engine (DEFER_MAX_S otherwise): the decode machine
 # waits for that save, and a queue of prompts keeps the engine busy.
 PREFILL_DEFER_MAX_S = 300.0
@@ -302,6 +302,27 @@ def guard_pick(engine) -> None:
 
     engine.pick_slot = pick_slot
     engine._pom_guarded = True
+
+
+def keep_prefill(svc, key: str, prompt: list[int], wait_s: float = 10.0) -> bool:
+    """A prefill turn's session when the engine's turn hook did not run: its one token is all the turn asks for, so the
+    consumer stops before the slot's BDONE and the engine frees the slot in the background, holding the prompt. That
+    slot is found once it is free and its save is deferred as a turn's would be. False: no slot holds the prompt."""
+    engine = batch_engine(svc)
+    if engine is None:
+        return False
+    deadline = time.monotonic() + wait_s
+    with engine.slot_cv:
+        while True:
+            slot = P.slot_for_turn(list(prompt), engine.slot_held)
+            if slot is not None and not engine.slot_busy[slot]:
+                held = list(engine.slot_held[slot])
+                break
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            engine.slot_cv.wait(min(0.1, left))
+    return defer_save(svc, key, list(prompt), slot, held)
 
 
 def defer_save(svc, key: str, prompt: list[int], slot: int, held: list[int]) -> bool:
@@ -942,6 +963,9 @@ def make_handler(original):
                                 self._line({field: text})
                         elif kind == "done":
                             # the turn's save is deferred in its slot window (the hook above); the done line says so
+                            if prefill_only and "ran" not in turn:
+                                turn["ran"] = True
+                                turn["deferred"] = keep_prefill(svc, session, list(ids))
                             if session is not None and "ran" not in turn:
                                 print(f"pom: session {session}: the turn did not run in a batch slot, not saved",
                                       file=sys.stderr, flush=True)
@@ -982,7 +1006,7 @@ def make_handler(original):
 def apply_pom_settings(argv: list[str]) -> None:
     """The deployment's engine settings (`pom_settings` in the run config, written by the plugin) applied with
     Strata's own rules (serve/runconfig.py); a value Strata refuses stops the start with Strata's message."""
-    global SESSIONS_ON, ROLE
+    global SESSIONS_ON, ROLE, PREFILL_MIN_TOKENS
     if "--config" not in argv[:-1]:
         return
     path = Path(argv[argv.index("--config") + 1])
@@ -995,6 +1019,12 @@ def apply_pom_settings(argv: list[str]) -> None:
     # the prefill/decode role is the bridge's own too; the split hands the prompt's state over as a session
     role = settings.pop("inference_role", None)
     ROLE = role if role in ("prefill", "decode") else None
+    # the deployment's threshold of the split (POM settings, prefill_min_tokens), over the environment's
+    threshold = settings.pop("prefill_min_tokens", None)
+    if isinstance(threshold, int) and not isinstance(threshold, bool) and threshold >= 0:
+        PREFILL_MIN_TOKENS = threshold
+    if ROLE == "prefill":
+        print(f"[pom] prefill machine: a turn is read here from {PREFILL_MIN_TOKENS} new tokens", flush=True)
     if ROLE:
         SESSIONS_ON = True
         print(f"[pom] inference role: {ROLE} (the prefill/decode split keeps the sessions on)", flush=True)
