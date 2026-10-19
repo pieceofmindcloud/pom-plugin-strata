@@ -57,6 +57,9 @@ pub struct LoadRequest {
     pub session_dir: Option<PathBuf>,
     /// The vision projector (mmproj) the deployment chose: the engine reads images with it. `None` = text only.
     pub mmproj_path: Option<PathBuf>,
+    /// The machine's part in the POM's prefill/decode split (`prefill` or `decode`; `None` = both). The bridge keeps
+    /// the sessions on for it: the split hands a prompt's state from one machine to the other as a session.
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -191,7 +194,13 @@ impl LoadRequest {
             _ => "int8",
         }
         .to_owned();
+        let role = match value["role"].as_str() {
+            None | Some("both") => None,
+            Some(role @ ("prefill" | "decode")) => Some(role.to_owned()),
+            Some(other) => return Err(format!("unknown inference role {other}")),
+        };
         Ok(Self {
+            role,
             model_path,
             model_label,
             context,
@@ -376,8 +385,9 @@ impl Snapshot {
             "architectures": [gguf::STRATA_ARCHITECTURE],
             // A POM slice of a model runs as one stage of a split across machines.
             "stages": true,
-            // The POM settings that apply to those stages: the nodes carry the hidden state between them.
-            "pom_settings": ["prefill_max_inflight_chunks", "hidden_state_dtype"],
+            // The POM settings that apply to those stages (the nodes carry the hidden state between them), and the
+            // prefill/decode role of a machine that runs the whole model.
+            "pom_settings": ["prefill_max_inflight_chunks", "hidden_state_dtype", "inference_role"],
             // Images are read through the deployment's vision projector (`mmproj_path`), when one is chosen.
             "vision": true,
             "settings": crate::settings::schema(),
@@ -1092,8 +1102,14 @@ impl Manager {
             // the ROCm libraries the HIP runtime carries (a POM node has none)
             config["lib_dirs"] = json!([runtime.join("lib").display().to_string()]);
         }
-        if request.sessions > 1 {
-            config["parallel"] = json!(request.sessions);
+        // a prefill/decode role hands the prompt's state over as a session, which lives in a batch slot
+        let parallel = if request.role.is_some() {
+            request.sessions.max(2)
+        } else {
+            request.sessions
+        };
+        if parallel > 1 {
+            config["parallel"] = json!(parallel);
         }
         let mut env = serde_json::Map::new();
         if let Some(token) = request.link.as_ref().and_then(|link| link.token.as_ref()) {
@@ -1110,9 +1126,14 @@ impl Manager {
         // still the call. Strata reads it only when this is on (its default is off), and the POM's chat needs it:
         // without it the call stays as text and the request ends with no tool execution.
         config["tool_call_recovery"] = json!(true);
-        // Applied by the bridge with Strata's own rules (serve/runconfig.py).
-        if !request.settings.is_empty() {
-            config["pom_settings"] = Value::Object(request.settings.clone());
+        // Applied by the bridge with Strata's own rules (serve/runconfig.py). The prefill/decode role is the bridge's
+        // own, as session_save is: it takes it out before Strata's rules see the rest.
+        let mut pom_settings = request.settings.clone();
+        if let Some(role) = &request.role {
+            pom_settings.insert("inference_role".into(), json!(role));
+        }
+        if !pom_settings.is_empty() {
+            config["pom_settings"] = Value::Object(pom_settings);
         }
         let config_path = self.base.join("run/strata.json");
         if let Err(error) = write_private(
@@ -1428,6 +1449,12 @@ mod tests {
         assert_eq!(plain.context, DEFAULT_CONTEXT);
         assert_eq!(plain.kv, "int8");
         assert!(LoadRequest::from_json(&json!({"model_path": "relative.gguf"})).is_err());
+        // the prefill/decode role: both is no role, an unknown one is refused
+        let role =
+            |role: &str| LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "role": role}));
+        assert_eq!(role("prefill").unwrap().role.as_deref(), Some("prefill"));
+        assert_eq!(role("both").unwrap().role, None);
+        assert!(role("other").is_err());
         assert!(LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "mmproj_path": "rel.gguf"})).is_err());
         assert!(LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "mmproj_path": "/no/such/mmproj.gguf"})).is_err());
         assert!(LoadRequest::from_json(&json!({})).is_err());

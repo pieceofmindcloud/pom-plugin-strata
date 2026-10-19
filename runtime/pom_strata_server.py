@@ -42,6 +42,13 @@ into the text in the template's own form.
                                   layers match its own
     GET /pom/session/pending?key=conv-1   -> {"pending": bool}: the conversation's save is still to be written here
                                   (a turn's `done` line says `session.deferred`); the node syncs it after that
+
+The POM's prefill/decode split (the deployment's `inference_role`, which keeps the sessions on): a prefill machine
+gets the turn with `"prefill_only": true` and `"decode_holds"` (the tokens the decode machine already holds of the
+conversation). It reads the prompt into a batch slot and keeps the session like any turn, sends no text, and its
+`done` carries `"prefill": {"tokens"}`; or, when the part the decode machine lacks is shorter than
+PREFILL_MIN_TOKENS, it reads nothing and answers `"prefill": {"skipped"}`. The decode machine then fetches the
+session and restores it before its own turn (restore_for_prompt).
 """
 
 from __future__ import annotations
@@ -123,6 +130,15 @@ def in_flight_count() -> int:
 # A conversation's session is kept (saved, and synced to the peers) only from this many prompt tokens: a shorter one
 # re-reads its prompt faster than the save and the sync cost.
 MIN_SESSION_TOKENS = 8000
+
+# The deployment's prefill/decode role (`inference_role`: "prefill", "decode", or None for both; apply_pom_settings).
+ROLE = None
+# A prefill machine reads a prompt for the decode machine only when the part that machine lacks has this many tokens:
+# below it, sending the session (~118 MB of recurrent state, whatever the prompt) costs more than reading it there.
+PREFILL_MIN_TOKENS = int(os.environ.get("POM_STRATA_PREFILL_MIN_TOKENS", "4096"))
+# A prefill machine's deferred save waits this long for an idle engine (DEFER_MAX_S otherwise): the decode machine
+# waits for that save, and a queue of prompts keeps the engine busy.
+PREFILL_DEFER_MAX_S = 300.0
 
 DEFAULT_CACHE_MB = 5120      # the session folder's size limit on this machine (POM_STRATA_SESSION_CACHE_MB)
 DEFAULT_MAX_AGE_H = 24       # a conversation not used for this long leaves the folder (POM_STRATA_SESSION_MAX_AGE_H)
@@ -343,9 +359,10 @@ def save_deferred(svc) -> bool:
         return False
     with engine.slot_cv:
         now = time.monotonic()
-        for slot in [s for s, item in deferred_saves.items() if now - item[3] > DEFER_MAX_S]:
+        limit = PREFILL_DEFER_MAX_S if ROLE == "prefill" else DEFER_MAX_S
+        for slot in [s for s, item in deferred_saves.items() if now - item[3] > limit]:
             key = deferred_saves.pop(slot)[0]
-            print(f"pom: session {key} not saved: no idle engine within {DEFER_MAX_S:.0f} s", file=sys.stderr,
+            print(f"pom: session {key} not saved: no idle engine within {limit:.0f} s", file=sys.stderr,
                   flush=True)
         # a request in flight (queued or generating) may already own a slot the engine has not marked busy yet, and
         # the engine answers a SAVE in the same stream as its generations: the save waits for the bridge to be idle
@@ -449,6 +466,17 @@ def generation_request(req: dict) -> tuple[str, bool, bool, int, dict]:
         sampling["stop"] = stop
     return prompt, req.get("chat_template", True) is not False, req.get("thinking", True) is not False, \
         max_tokens, sampling
+
+
+def prefill_skip(ids: list[int], decode_holds) -> str | None:
+    """Why a prefill_only turn is not read here (None: it is): the part of the prompt the decode machine lacks is
+    shorter than PREFILL_MIN_TOKENS. `decode_holds` is what that machine holds of the conversation (0 when unknown)."""
+    holds = decode_holds if isinstance(decode_holds, int) and not isinstance(decode_holds, bool) and decode_holds > 0 \
+        else 0
+    new = len(ids) - min(holds, len(ids))
+    if new < PREFILL_MIN_TOKENS:
+        return f"{new} new tokens of {len(ids)}, under {PREFILL_MIN_TOKENS}"
+    return None
 
 
 def tool_call_text(name: str, arguments: dict) -> str:
@@ -816,6 +844,11 @@ def make_handler(original):
                 session = req.get("session") if SESSIONS_ON else None
                 if session is not None and P.key_problem(session):
                     raise ValueError(f"session {P.key_problem(session)}")
+                # the prefill/decode split: this machine reads the prompt for another one, which decodes
+                prefill_only = req.get("prefill_only") is True
+                if prefill_only and session is None:
+                    raise ValueError("'prefill_only' needs a session, and the sessions on (inference_role or "
+                                     "session_save)")
                 self.record = svc.begin_request("/pom/generate", {"model": svc.model, "stream": True,
                                                                   "max_tokens": max_tokens})
                 # a decision probe (POM /v1/systemone): the label distribution of the first generated token
@@ -857,11 +890,25 @@ def make_handler(original):
                         raise ValueError("images need the chat template (chat_template true)")
                     ids, max_new = raw_ids(svc, prompt, max_tokens)
                     thinking = False
-                # a short prompt is not kept: its turn is not saved in the slot nor synced to the peers
-                if session is not None and len(ids) < MIN_SESSION_TOKENS:
+                skipped = prefill_skip(ids, req.get("decode_holds")) if prefill_only else None
+                if prefill_only and skipped is None:
+                    max_new = 1             # its token is dropped: the decode machine samples the answer itself
+                # a short prompt is not kept: its turn is not saved in the slot nor synced to the peers (a prefill
+                # turn is kept whatever its length: keeping it is what it is for)
+                if session is not None and len(ids) < MIN_SESSION_TOKENS and not prefill_only:
                     session = None
+                if skipped is not None:
+                    print(f"pom: prefill of session {session} skipped: {skipped}", file=sys.stderr, flush=True)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-ndjson")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    self._line({"done": {"prefill": {"tokens": 0, "skipped": skipped}, "finish": "stop",
+                                         "prompt_tokens": len(ids), "completion_tokens": 0,
+                                         "reasoning_tokens": 0, "cached_tokens": 0}})
+                    return
                 svc.engine.last_probe = None
-                svc.engine.probe_request = probe_groups(svc, labels) if labels else None
+                svc.engine.probe_request = probe_groups(svc, labels) if labels and not prefill_only else None
                 if SESSIONS_ON:
                     restore_for_prompt(svc, list(ids))
                 cancel = threading.Event()
@@ -886,7 +933,7 @@ def make_handler(original):
                             progress = getattr(svc.engine, "progress", None)
                             self._line({"p": list(progress)} if progress else {"p": None})
                         elif kind == "event":
-                            event = pom_event(x)
+                            event = None if prefill_only else pom_event(x)
                             if event is not None:
                                 field, text = event
                                 self._line({field: text})
@@ -895,9 +942,14 @@ def make_handler(original):
                             if session is not None and "ran" not in turn:
                                 print(f"pom: session {session}: the turn did not run in a batch slot, not saved",
                                       file=sys.stderr, flush=True)
+                            if prefill_only:
+                                print(f"pom: prefill of session {session}: {len(ids)} prompt tokens read "
+                                      f"({x.get('reused') or 0} already in a slot), kept: {bool(turn.get('deferred'))}",
+                                      file=sys.stderr, flush=True)
                             self._line({"done": {
                                 **({"session": {"key": session, "saved": None, "deferred": True}}
                                    if turn.get("deferred") else {}),
+                                **({"prefill": {"tokens": len(ids) - (x.get("reused") or 0)}} if prefill_only else {}),
                                 **({"probe": svc.engine.last_probe} if svc.engine.probe_request else {}),
                                 "finish": x.get("finish"),
                                 "prompt_tokens": x.get("prompt_tokens", len(ids)),
@@ -927,7 +979,7 @@ def make_handler(original):
 def apply_pom_settings(argv: list[str]) -> None:
     """The deployment's engine settings (`pom_settings` in the run config, written by the plugin) applied with
     Strata's own rules (serve/runconfig.py); a value Strata refuses stops the start with Strata's message."""
-    global SESSIONS_ON
+    global SESSIONS_ON, ROLE
     if "--config" not in argv[:-1]:
         return
     path = Path(argv[argv.index("--config") + 1])
@@ -937,6 +989,12 @@ def apply_pom_settings(argv: list[str]) -> None:
         return
     # session_save is the bridge's own setting, not an engine one: it is taken out before Strata's rules see the rest
     SESSIONS_ON = bool(settings.pop("session_save", False))
+    # the prefill/decode role is the bridge's own too; the split hands the prompt's state over as a session
+    role = settings.pop("inference_role", None)
+    ROLE = role if role in ("prefill", "decode") else None
+    if ROLE:
+        SESSIONS_ON = True
+        print(f"[pom] inference role: {ROLE} (the prefill/decode split keeps the sessions on)", flush=True)
     print(f"[pom] session save (KV cache on the shared disk): {'on' if SESSIONS_ON else 'off'}", flush=True)
     if settings:
         from serve import runconfig

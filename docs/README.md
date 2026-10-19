@@ -78,6 +78,27 @@ Strata log says where it continued from ("continues after N tokens"). When
 the first machine holds no state for those tokens, the request reads the
 prompt from the start on both.
 
+## Prefill on one machine, decode on another
+
+Deploy the whole model on two machines and set **Inference role** in the POM
+settings card of each: **Prefill only** on the machine that reads prompts,
+**Decode only** (or both) on the one that answers. The POM never sends a
+request to the prefill machine to answer. Before a conversation's turn runs on
+the decode machine, the POM has the prefill machine read the prompt into a
+batch slot and keep the conversation's session; the decode machine fetches
+that session, restores it and reads only the rest, then writes the answer.
+
+- A role keeps the sessions on (as **Save the KV cache** does) and the batch
+  slots on (at least 2 concurrent requests), whatever those settings say.
+- The prefill machine reads a prompt only when the part the decode machine
+  lacks has at least 4096 tokens (`POM_STRATA_PREFILL_MIN_TOKENS` in the
+  node's environment); a shorter turn goes straight to the decode machine.
+- What crosses is one session file per turn: about 118 MB of recurrent state
+  plus the K/V of the attention layers (about 7.5 KB per token in q4_0). Both
+  machines need the same model and KV type; anything that fails leaves the
+  decode machine to read the prompt itself.
+- Turns with images or a typed decision skip the split.
+
 ## Where things live on a node
 
 - `<POM database dir>/strata/packs/<model>` - the model prepared for Strata.
