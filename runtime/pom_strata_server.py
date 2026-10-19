@@ -998,6 +998,15 @@ def apply_pom_settings(argv: list[str]) -> None:
     if ROLE:
         SESSIONS_ON = True
         print(f"[pom] inference role: {ROLE} (the prefill/decode split keeps the sessions on)", flush=True)
+        # A machine of the split holds the whole model's experts (~47 GB on qwen4exp IQ3_XXS): asking transparent huge
+        # pages for that arena (MADV_HUGEPAGE, with the distro default defrag=madvise) made every page fault compact
+        # memory on a machine whose RAM it nearly fills, and the load never ended (100% system time). Strata's own
+        # check (#2126) looks only at the start, when the memory is still free. The engine inherits this; an
+        # operator's STRATA_ARENA_THP=1 still asks for them.
+        if "STRATA_ARENA_THP" not in os.environ:
+            os.environ.setdefault("STRATA_NO_ARENA_THP", "1")
+            print("[pom] expert arena without transparent huge pages (a whole model; STRATA_ARENA_THP=1 asks for them)",
+                  flush=True)
     print(f"[pom] session save (KV cache on the shared disk): {'on' if SESSIONS_ON else 'off'}", flush=True)
     if settings:
         from serve import runconfig
