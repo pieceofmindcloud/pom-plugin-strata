@@ -133,9 +133,11 @@ MIN_SESSION_TOKENS = 8000
 
 # The deployment's prefill/decode role (`inference_role`: "prefill", "decode", or None for both; apply_pom_settings).
 ROLE = None
-# A prefill machine reads a prompt for the decode machine only when the part that machine lacks has this many tokens:
-# below it, sending the session (~118 MB of recurrent state, whatever the prompt) costs more than reading it there.
-PREFILL_MIN_TOKENS = int(os.environ.get("POM_STRATA_PREFILL_MIN_TOKENS", "4096"))
+# A prefill machine reads a prompt for the decode machine only when the part that machine lacks has this many tokens
+# (at least one). 0, the default, sends every turn through the prefill machine; a larger value leaves the short ones
+# to the decode machine, where sending the session (~118 MB of recurrent state, whatever the prompt) costs more than
+# reading them.
+PREFILL_MIN_TOKENS = int(os.environ.get("POM_STRATA_PREFILL_MIN_TOKENS", "0"))
 # A prefill machine's deferred save waits this long for an idle engine (DEFER_MAX_S otherwise): the decode machine
 # waits for that save, and a queue of prompts keeps the engine busy.
 PREFILL_DEFER_MAX_S = 300.0
@@ -474,7 +476,7 @@ def prefill_skip(ids: list[int], decode_holds) -> str | None:
     holds = decode_holds if isinstance(decode_holds, int) and not isinstance(decode_holds, bool) and decode_holds > 0 \
         else 0
     new = len(ids) - min(holds, len(ids))
-    if new < PREFILL_MIN_TOKENS:
+    if new < max(PREFILL_MIN_TOKENS, 1):
         return f"{new} new tokens of {len(ids)}, under {PREFILL_MIN_TOKENS}"
     return None
 
@@ -893,9 +895,10 @@ def make_handler(original):
                 skipped = prefill_skip(ids, req.get("decode_holds")) if prefill_only else None
                 if prefill_only and skipped is None:
                     max_new = 1             # its token is dropped: the decode machine samples the answer itself
-                # a short prompt is not kept: its turn is not saved in the slot nor synced to the peers (a prefill
-                # turn is kept whatever its length: keeping it is what it is for)
-                if session is not None and len(ids) < MIN_SESSION_TOKENS and not prefill_only:
+                # a short prompt is not kept: its turn is not saved in the slot nor synced to the peers. A machine of a
+                # prefill/decode split keeps every turn: the prefill machine hands it over, and the decode machine
+                # runs it in the slot its session was restored into (and offers what it holds to the next turn)
+                if session is not None and len(ids) < MIN_SESSION_TOKENS and ROLE is None:
                     session = None
                 if skipped is not None:
                     print(f"pom: prefill of session {session} skipped: {skipped}", file=sys.stderr, flush=True)
