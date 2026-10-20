@@ -320,6 +320,19 @@ def keep_prefill(svc, key: str, prompt: list[int], wait_s: float = 10.0) -> bool
                 break
             left = deadline - time.monotonic()
             if left <= 0:
+                # what each slot held when no slot held the prompt: busy (still being released), and how many of its
+                # tokens agree with the prompt from the start
+                def agree(tokens: list[int]) -> int:
+                    n = 0
+                    for a, b in zip(tokens, prompt):
+                        if a != b:
+                            break
+                        n += 1
+                    return n
+                state = "; ".join(f"slot {s}: busy={bool(engine.slot_busy[s])} held={len(h)} agree={agree(list(h))}"
+                                  for s, h in enumerate(engine.slot_held))
+                print(f"pom: prefill of session {key}: no free slot holds its {len(prompt)} prompt tokens after "
+                      f"{wait_s:.0f} s ({state})", file=sys.stderr, flush=True)
                 return False
             engine.slot_cv.wait(min(0.1, left))
     return defer_save(svc, key, list(prompt), slot, held)
@@ -949,6 +962,31 @@ def make_handler(original):
                     # (`session.deferred`), and the node syncs the conversation once session_pending is false
                     turn["ran"] = True
                     turn["deferred"] = defer_save(svc, session, list(ids), slot, held)
+                pending_done = None
+
+                def write_done(x) -> None:
+                    # the turn's save is deferred in its slot window (the hook above); the done line says so
+                    if session is not None and "ran" not in turn:
+                        print(f"pom: session {session}: the turn did not run in a batch slot, not saved",
+                              file=sys.stderr, flush=True)
+                    if prefill_only:
+                        print(f"pom: prefill of session {session}: {len(ids)} prompt tokens read "
+                              f"({x.get('reused') or 0} already in a slot), kept: {bool(turn.get('deferred'))}",
+                              file=sys.stderr, flush=True)
+                    self._line({"done": {
+                        **({"session": {"key": session, "saved": None, "deferred": True}}
+                           if turn.get("deferred") else {}),
+                        **({"prefill": {"tokens": len(ids) - (x.get("reused") or 0)}} if prefill_only else {}),
+                        **({"probe": svc.engine.last_probe} if svc.engine.probe_request else {}),
+                        "finish": x.get("finish"),
+                        "prompt_tokens": x.get("prompt_tokens", len(ids)),
+                        "completion_tokens": x.get("completion_tokens", 0),
+                        "reasoning_tokens": x.get("reasoning_tokens", 0),
+                        "cached_tokens": x.get("reused") or 0,
+                        "timings": x.get("timings"),
+                        "stop_sequence": x.get("stop_sequence"),
+                    }})
+
                 try:
                     for kind, x in svc.run(ids, thinking, None, max_new, sampling, cancel,
                                            keep_slot=session is not None,
@@ -962,30 +1000,17 @@ def make_handler(original):
                                 field, text = event
                                 self._line({field: text})
                         elif kind == "done":
-                            # the turn's save is deferred in its slot window (the hook above); the done line says so
-                            if prefill_only and "ran" not in turn:
-                                turn["ran"] = True
-                                turn["deferred"] = keep_prefill(svc, session, list(ids))
-                            if session is not None and "ran" not in turn:
-                                print(f"pom: session {session}: the turn did not run in a batch slot, not saved",
-                                      file=sys.stderr, flush=True)
                             if prefill_only:
-                                print(f"pom: prefill of session {session}: {len(ids)} prompt tokens read "
-                                      f"({x.get('reused') or 0} already in a slot), kept: {bool(turn.get('deferred'))}",
-                                      file=sys.stderr, flush=True)
-                            self._line({"done": {
-                                **({"session": {"key": session, "saved": None, "deferred": True}}
-                                   if turn.get("deferred") else {}),
-                                **({"prefill": {"tokens": len(ids) - (x.get("reused") or 0)}} if prefill_only else {}),
-                                **({"probe": svc.engine.last_probe} if svc.engine.probe_request else {}),
-                                "finish": x.get("finish"),
-                                "prompt_tokens": x.get("prompt_tokens", len(ids)),
-                                "completion_tokens": x.get("completion_tokens", 0),
-                                "reasoning_tokens": x.get("reasoning_tokens", 0),
-                                "cached_tokens": x.get("reused") or 0,
-                                "timings": x.get("timings"),
-                                "stop_sequence": x.get("stop_sequence"),
-                            }})
+                                # its slot is freed by the engine's generator after this yield: the session is kept,
+                                # and the done line written, once the generator has ended (below)
+                                pending_done = x
+                                continue
+                            write_done(x)
+                    if prefill_only and pending_done is not None:
+                        if "ran" not in turn:
+                            turn["ran"] = True
+                            turn["deferred"] = keep_prefill(svc, session, list(ids))
+                        write_done(pending_done)
                 except OSError:
                     self._note(outcome="disconnected")
                     cancel.set()
