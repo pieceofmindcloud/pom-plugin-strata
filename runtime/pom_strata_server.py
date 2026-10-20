@@ -355,10 +355,37 @@ def defer_save(svc, key: str, prompt: list[int], slot: int, held: list[int]) -> 
     return True
 
 
+ENGINE_ARGS: list[str] = []     # the engine's arguments as this bridge wrote them (session_config)
+
+
+def session_config(svc) -> str:
+    """The engine settings a saved session is bound to, as one string: Strata refuses to restore a file saved with
+    another configuration (its config fingerprint: engine version, backend, --kv, --max-context, --kv-resident, the
+    MTP window, STRATA_KV_ROT; conversation_file.cpp). A peer compares it before it fetches a session. The model's own
+    settings (rope) and the arithmetic switches are not in it: the same model and runtime give the same ones."""
+    def arg(name: str, default: str) -> str:
+        if name in ENGINE_ARGS:
+            at = ENGINE_ARGS.index(name)
+            if at + 1 < len(ENGINE_ARGS):
+                return ENGINE_ARGS[at + 1]
+        return default
+    info = getattr(batch_engine(svc), "info", None) or {}
+    try:
+        backend = json.loads((Path(__file__).parent / "RUNTIME.json").read_text()).get("backend") or "cuda"
+    except (OSError, ValueError):
+        backend = "cuda"
+    mtp = arg("--mtp-window", "32768") if "--mtp" in ENGINE_ARGS else "-1"
+    rot = "1" if os.environ.get("STRATA_KV_ROT", "").startswith("1") else "0"
+    return (f"engine={info.get('engine') or info.get('version') or '?'} backend={backend} kv={arg('--kv', info.get('kv') or '?')} "
+            f"max_context={arg('--max-context', str(info.get('context') or '?'))} "
+            f"kv_resident={arg('--kv-resident', str(info.get('kv_resident') or '?'))} mtp_window={mtp} kv_rot={rot}")
+
+
 def session_offer(svc, key: str) -> dict:
     """What this machine can give a peer for a conversation: `tokens` of its saved session on disk (the only copy a
     peer can fetch), `bytes` of that file, `ram_tokens` the batch slot holds in RAM, `layers` the layer split the engine
-    runs ("whole" on a whole model: a session is only usable on the same split), and `pending` while its save is still
+    runs ("whole" on a whole model: a session is only usable on the same split), `config` the engine settings its
+    sessions are bound to (session_config), and `pending` while its save is still
     being written. Nothing is read beyond the token count and the file's size."""
     engine = batch_engine(svc)
     ram = 0
@@ -374,7 +401,7 @@ def session_offer(svc, key: str) -> dict:
     info = getattr(engine, "info", None) or {}
     return {"tokens": len(ids) if on_disk else 0, "bytes": full.stat().st_size if on_disk else 0,
             "ram_tokens": ram, "layers": str(info.get("layers") or "whole"),
-            "pending": session_pending(svc, key)}
+            "config": session_config(svc), "pending": session_pending(svc, key)}
 
 
 def session_pending(svc, key: str) -> bool:
@@ -1085,6 +1112,7 @@ def apply_pom_settings(argv: list[str]) -> None:
     args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
     if SESSIONS_ON and "--session-async-save" not in args:
         cfg["args"] = [*args, "--session-async-save"]
+    ENGINE_ARGS[:] = [str(a) for a in cfg.get("args") or []]
     path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
 
 

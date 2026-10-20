@@ -469,6 +469,15 @@ class SessionOffer(unittest.TestCase):
         self.save_on_disk("conv", [1, 2])
         self.assertEqual(B.session_offer(self.svc, "conv")["layers"], "whole")
 
+    def test_the_offer_carries_the_settings_a_session_is_bound_to(self):
+        self.svc.engine.info = {"engine": "0.1.44.1", "kv": "int8", "context": 250000, "kv_resident": 32768}
+        with mock.patch.object(B, "ENGINE_ARGS", ["--max-context", "200000", "--kv-resident", "32768", "--mtp", "/m"]):
+            config = B.session_offer(self.svc, "nobody")["config"]
+            self.assertIn("engine=0.1.44.1", config)
+            self.assertIn("max_context=200000 kv_resident=32768 mtp_window=32768", config)
+        with mock.patch.object(B, "ENGINE_ARGS", ["--max-context", "200000", "--kv-resident", "32768"]):
+            self.assertIn("mtp_window=-1", B.session_offer(self.svc, "nobody")["config"])
+
     def test_an_unknown_conversation_offers_nothing(self):
         offer = B.session_offer(self.svc, "nobody")
         self.assertEqual((offer["tokens"], offer["bytes"], offer["ram_tokens"]), (0, 0, 0))
