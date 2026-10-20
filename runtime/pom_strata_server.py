@@ -928,7 +928,12 @@ def make_handler(original):
                     thinking = False
                 skipped = prefill_skip(ids, req.get("decode_holds")) if prefill_only else None
                 if prefill_only and skipped is None:
-                    max_new = 1             # its token is dropped: the decode machine samples the answer itself
+                    # its tokens are dropped: the decode machine samples the answer itself. Two, not one: a turn of one
+                    # token ends at its admission (Strata's generate_batched returns before the slot holds it, without
+                    # the turn hook), so its session could not be kept. No thinking budget: with two tokens it caps the
+                    # thinking at one, and that ends the turn at its first token as well
+                    max_new = 2
+                    sampling = {**sampling, "reasoning_budget_tokens": 0}
                 # a short prompt is not kept: its turn is not saved in the slot nor synced to the peers. A machine of a
                 # prefill/decode split keeps every turn: the prefill machine hands it over, and the decode machine
                 # runs it in the slot its session was restored into (and offers what it holds to the next turn)
