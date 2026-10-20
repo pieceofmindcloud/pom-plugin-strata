@@ -992,8 +992,13 @@ def make_handler(original):
                         "stop_sequence": x.get("stop_sequence"),
                     }})
 
+                # A prefill turn runs without the thinking budget: its one token would reach a budget capped at 1, and
+                # the budget's wrap-up leaves the pass before the engine ends the turn in its slot (the slot then holds
+                # nothing to keep). The prompt's tokens are the same: the template was applied above (prepare), with
+                # the request's own thinking flag, as on the decode machine.
+                run_thinking = thinking and not prefill_only
                 try:
-                    for kind, x in svc.run(ids, thinking, None, max_new, sampling, cancel,
+                    for kind, x in svc.run(ids, run_thinking, None, max_new, sampling, cancel,
                                            keep_slot=session is not None,
                                            turn_hook=turn_hook if session is not None else None):
                         if kind == "ping":
