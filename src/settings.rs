@@ -129,6 +129,22 @@ fn all() -> Vec<Setting> {
             ),
             )
         },
+        Setting {
+            options: &["int8", "q4_0", "k8v4"],
+            pom: true,
+            ..setting(
+                "kv_cache",
+                "enum",
+                (
+                    "KV cache format",
+                    "How the engine stores the KV cache (--kv): int8 (default), q4_0 (half the memory, a little less precise) or k8v4. Every machine of the deployment uses this one, so a session saved on one restores on another (a prefill/decode split needs it). The node's llama.cpp KV cache type does not apply to Strata.",
+                ),
+                (
+                    "Formato do cache KV",
+                    "Como o motor guarda o cache KV (--kv): int8 (padrão), q4_0 (metade da memória, um pouco menos preciso) ou k8v4. Todas as máquinas da implantação usam este, para que uma sessão salva numa restaure em outra (a divisão prefill/decode precisa disso). O tipo de cache KV do llama.cpp do nó não vale para o Strata.",
+                ),
+            )
+        },
         setting(
             "aliases",
             "list",
@@ -230,22 +246,22 @@ mod tests {
     fn the_schema_names_every_key_once_with_both_languages() {
         let schema = schema();
         let entries = schema.as_array().unwrap();
-        assert_eq!(entries.len(), 15);
+        assert_eq!(entries.len(), 16);
         let mut keys: Vec<&str> = entries.iter().map(|e| e["key"].as_str().unwrap()).collect();
         keys.sort();
         keys.dedup();
-        assert_eq!(keys.len(), 15);
+        assert_eq!(keys.len(), 16);
         for entry in entries {
             assert!(entry["label"]["en"].is_string() && entry["label"]["pt-BR"].is_string());
         }
         assert!(!keys.contains(&"open_browser"));
-        // the session switch sits in the POM settings card, the others in the engine's
+        // the session switch and the KV format sit in the POM settings card, the others in the engine's
         let placed: Vec<&str> = entries
             .iter()
             .filter(|e| e["placement"] == "pom")
             .map(|e| e["key"].as_str().unwrap())
             .collect();
-        assert_eq!(placed, ["session_save"]);
+        assert_eq!(placed, ["session_save", "kv_cache"]);
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub struct LoadRequest {
     pub amd_gpus: Vec<u32>,
     /// Concurrent requests (Strata's `parallel` batch slots).
     pub sessions: u32,
-    /// `int8`, `q4_0` or `k8v4`.
+    /// `int8`, `q4_0` or `k8v4`: the deployment's `kv_cache` setting.
     pub kv: String,
     /// Engine settings the deployment chose (`crate::settings`).
     pub settings: serde_json::Map<String, Value>,
@@ -191,9 +191,14 @@ impl LoadRequest {
             .as_u64()
             .map(|sessions| sessions.clamp(1, 8) as u32)
             .unwrap_or(1);
-        let kv = match value["kv"].as_str().unwrap_or("int8") {
-            "q4_0" => "q4_0",
-            "k8v4" => "k8v4",
+        // The deployment's `kv_cache` setting, the same on every machine of it: a session saved with one format does not
+        // restore with another (Strata's config fingerprint), so the node's own `kv` (its llama.cpp cache type, which
+        // the POM sends and which can differ between machines) is not used. It is the plugin's, not Strata's: taken
+        // out of the settings Strata's rules apply.
+        let mut settings = crate::settings::select(&value["settings"]);
+        let kv = match settings.remove("kv_cache").as_ref().and_then(Value::as_str) {
+            Some("q4_0") => "q4_0",
+            Some("k8v4") => "k8v4",
             _ => "int8",
         }
         .to_owned();
@@ -215,7 +220,7 @@ impl LoadRequest {
             amd_gpus,
             sessions,
             kv,
-            settings: crate::settings::select(&value["settings"]),
+            settings,
             link: Link::from_json(&value["link"])?,
             session_dir: match value["session_dir"].as_str().filter(|dir| !dir.is_empty()) {
                 Some(dir) => {
@@ -1451,15 +1456,19 @@ mod tests {
             "n_ctx": 65536,
             "gpus": [0, 1, 99],
             "max_sessions": 40,
-            "kv": "q4_0"
+            "kv": "q4_0",
+            "settings": {"kv_cache": "k8v4", "fit_max_tokens": true}
         }))
         .unwrap();
         assert_eq!(request.context, 65536);
         assert_eq!(request.gpus, vec![0, 1]);
         assert_eq!(request.sessions, 8);
-        assert_eq!(request.kv, "q4_0");
+        // the deployment's kv_cache, not the node's llama.cpp cache type; Strata's rules do not see it
+        assert_eq!(request.kv, "k8v4");
+        assert!(!request.settings.contains_key("kv_cache"));
+        assert!(request.settings.contains_key("fit_max_tokens"));
         let plain =
-            LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "kv": "f16"})).unwrap();
+            LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "kv": "q4_0"})).unwrap();
         assert_eq!(plain.model_label, "x");
         assert_eq!(plain.context, DEFAULT_CONTEXT);
         assert_eq!(plain.kv, "int8");
