@@ -145,6 +145,37 @@ fn all() -> Vec<Setting> {
                 ),
             )
         },
+        Setting {
+            min: Some(0.0),
+            ..setting(
+                "conversation_cache_mib",
+                "integer",
+                (
+                    "Conversation parking RAM (MiB)",
+                    "Host RAM in MiB where the engine parks conversations that leave their batch slot, so an agent's alternating conversations come back without re-reading the prompt (--conversation-cache-mib). Empty or 0: off. The engine keeps 2.5 GiB of RAM free regardless. Whole-model machines only.",
+                ),
+                (
+                    "RAM para conversas estacionadas (MiB)",
+                    "RAM do host em MiB onde o motor estaciona as conversas que saem do seu slot, para que as conversas alternadas de um agente voltem sem reler o prompt (--conversation-cache-mib). Vazio ou 0: desligado. O motor mantém 2,5 GiB de RAM livres de todo modo. Só em máquinas com o modelo inteiro.",
+                ),
+            )
+        },
+        Setting {
+            min: Some(1.0),
+            max: Some(64.0),
+            ..setting(
+                "conversation_cache_slots",
+                "integer",
+                (
+                    "Parked conversations",
+                    "At most this many conversations parked in RAM (--conversation-cache-slots; empty: 4). Applies with a parking RAM budget.",
+                ),
+                (
+                    "Conversas estacionadas",
+                    "No máximo este número de conversas estacionadas na RAM (--conversation-cache-slots; vazio: 4). Vale com um orçamento de RAM para estacionar.",
+                ),
+            )
+        },
         setting(
             "aliases",
             "list",
@@ -246,11 +277,11 @@ mod tests {
     fn the_schema_names_every_key_once_with_both_languages() {
         let schema = schema();
         let entries = schema.as_array().unwrap();
-        assert_eq!(entries.len(), 16);
+        assert_eq!(entries.len(), 18);
         let mut keys: Vec<&str> = entries.iter().map(|e| e["key"].as_str().unwrap()).collect();
         keys.sort();
         keys.dedup();
-        assert_eq!(keys.len(), 16);
+        assert_eq!(keys.len(), 18);
         for entry in entries {
             assert!(entry["label"]["en"].is_string() && entry["label"]["pt-BR"].is_string());
         }
