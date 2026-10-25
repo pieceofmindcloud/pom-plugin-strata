@@ -47,6 +47,10 @@ pub struct LoadRequest {
     pub sessions: u32,
     /// `int8`, `q4_0` or `k8v4`: the deployment's `kv_cache` setting.
     pub kv: String,
+    /// Host RAM in MiB for parked conversations (`--conversation-cache-mib`; 0 = off), and how many it parks
+    /// (`--conversation-cache-slots`; `None` = the engine's 4): the deployment's `conversation_cache_*` settings.
+    pub conversation_cache_mib: u64,
+    pub conversation_cache_slots: Option<u32>,
     /// Engine settings the deployment chose (`crate::settings`).
     pub settings: serde_json::Map<String, Value>,
     /// A POM slice runs as one stage of a split across machines: the link
@@ -202,6 +206,18 @@ impl LoadRequest {
             _ => "int8",
         }
         .to_owned();
+        // Conversation parking is an engine option, not one of Strata's editable keys: also the plugin's.
+        let conversation_cache_mib = settings
+            .remove("conversation_cache_mib")
+            .as_ref()
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let conversation_cache_slots = settings
+            .remove("conversation_cache_slots")
+            .as_ref()
+            .and_then(Value::as_u64)
+            .filter(|slots| *slots > 0)
+            .map(|slots| slots.min(64) as u32);
         let role = match value["role"].as_str() {
             None | Some("both") => None,
             Some(role @ ("prefill" | "decode")) => Some(role.to_owned()),
@@ -220,6 +236,8 @@ impl LoadRequest {
             amd_gpus,
             sessions,
             kv,
+            conversation_cache_mib,
+            conversation_cache_slots,
             settings,
             link: Link::from_json(&value["link"])?,
             session_dir: match value["session_dir"].as_str().filter(|dir| !dir.is_empty()) {
@@ -1076,6 +1094,7 @@ impl Manager {
             args.push("--kv".into());
             args.push(request.kv.clone());
         }
+        args.extend(conversation_cache_args(&request));
         if request.context >= KV_STREAM_FROM {
             args.push("--kv-resident".into());
             args.push(KV_RESIDENT.into());
@@ -1444,9 +1463,60 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     options.open(path)?.write_all(bytes)
 }
 
+/// The engine options that park conversations in host RAM, when the deployment gave them a budget. Only a machine
+/// that serves the whole model parks: a stage of a split across machines holds a part of each conversation, and the
+/// stages would park and evict theirs apart.
+fn conversation_cache_args(request: &LoadRequest) -> Vec<String> {
+    if request.conversation_cache_mib == 0 || request.link.is_some() {
+        return Vec::new();
+    }
+    let mut args = vec![
+        "--conversation-cache-mib".to_owned(),
+        request.conversation_cache_mib.to_string(),
+    ];
+    if let Some(slots) = request.conversation_cache_slots {
+        args.push("--conversation-cache-slots".into());
+        args.push(slots.to_string());
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_parking_follows_the_deployment_on_a_whole_model_only() {
+        let load = |settings: Value| {
+            LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "settings": settings}))
+                .unwrap()
+        };
+        let parked = load(
+            json!({"conversation_cache_mib": 8192, "conversation_cache_slots": 6, "lazy_load": true}),
+        );
+        assert_eq!(
+            conversation_cache_args(&parked),
+            [
+                "--conversation-cache-mib",
+                "8192",
+                "--conversation-cache-slots",
+                "6"
+            ]
+        );
+        // Strata's rules never see them
+        assert!(!parked.settings.contains_key("conversation_cache_mib"));
+        assert!(!parked.settings.contains_key("conversation_cache_slots"));
+        assert!(parked.settings.contains_key("lazy_load"));
+        assert_eq!(
+            conversation_cache_args(&load(json!({"conversation_cache_mib": 4096}))),
+            ["--conversation-cache-mib", "4096"]
+        );
+        assert!(conversation_cache_args(&load(json!({"conversation_cache_slots": 6}))).is_empty());
+        let mut stage = parked.clone();
+        stage.link = Link::from_json(&json!({})).unwrap();
+        assert!(stage.link.is_some());
+        assert!(conversation_cache_args(&stage).is_empty());
+    }
 
     #[test]
     fn a_load_request_is_read_with_safe_defaults() {
