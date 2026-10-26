@@ -1079,6 +1079,12 @@ impl Manager {
         } else if let Some(mtp) = self.mtp_dir(&request.model_path) {
             args.extend(["--spec", "4", "--spec-min-p", "0.5", "--mtp"].map(str::to_owned));
             args.push(mtp.display().to_string());
+            // The decode machine of a prefill/decode split runs every turn in a batch slot (its session is restored
+            // there and the turn is saved from there), where the solo path's drafts never run: each slot proposes
+            // its own MTP token instead.
+            if request.role.as_deref() == Some("decode") {
+                args.push("--batch-mtp".into());
+            }
         } else {
             // No drafter for this model (a slice without one): the native IQ engine still needs a verify window
             // (--spec T >= 2); the windows come from suffix matches in the context.
