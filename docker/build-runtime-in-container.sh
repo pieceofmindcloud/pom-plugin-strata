@@ -36,6 +36,21 @@ if ldd "$out.tmp/engine/strata" | grep 'not found' | grep -v 'libcuda.so.1' ; th
   exit 1
 fi
 
+# The vision encoder (llama.cpp's mtmd at the engine's pinned commit) runs on the CPU: the plugin reads images there,
+# so the model keeps the whole card (engine.rs, the config's vision section). Portable: AVX2 baseline, no OpenMP.
+echo "== vision encoder"
+cmake -G Ninja -S /src/tools/vision -B /work/build-vision \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_DIR=/src/third_party/llama.cpp \
+  -DSTRATA_PORTABLE=ON \
+  -DSTRATA_VISION_CUDA=OFF
+cmake --build /work/build-vision --target strata-vision -j "$jobs"
+install -m 0755 /work/build-vision/bin/strata-vision "$out.tmp/engine/strata-vision"
+if ldd "$out.tmp/engine/strata-vision" | grep 'not found' ; then
+  echo "the vision encoder has unresolved libraries" >&2
+  exit 1
+fi
+
 echo "== server and tools"
 cp -a /src/serve /src/tools /src/data /src/LICENSE "$out.tmp/strata/"
 mkdir -p "$out.tmp/strata/third_party/llama.cpp"

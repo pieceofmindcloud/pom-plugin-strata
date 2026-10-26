@@ -1135,9 +1135,22 @@ impl Manager {
         }
         config["gpus_asked"] = json!(!request.backend_gpus().is_empty());
         // Vision: the projector is read on the CPU, so the image encoder does not take VRAM from the model.
+        // Strata's vision section names its encoder, the projector and the model the projector belongs to.
         if let Some(mmproj) = &request.mmproj_path {
-            config["mmproj"] = json!(mmproj.display().to_string());
-            config["vision"] = json!({"gpu": false});
+            let encoder = runtime.join("engine/strata-vision");
+            if !encoder.is_file() {
+                return self.fail(format!(
+                    "this Strata runtime has no vision encoder ({}): build the runtime again \
+                     (scripts/build-runtime.sh), or deploy without vision",
+                    encoder.display()
+                ));
+            }
+            config["vision"] = json!({
+                "exe": encoder.display().to_string(),
+                "mmproj": mmproj.display().to_string(),
+                "model": request.model_path.display().to_string(),
+                "gpu": false,
+            });
         }
         if request.backend() == runtime::Backend::Hip {
             config["backend"] = json!("hip");
