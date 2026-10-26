@@ -210,8 +210,8 @@ def restore_for_prompt(svc, ids: list[int]) -> None:
         return
     slot_bases[slot] = (key, sessions[key])
     # the test's marker: the saved start came from this machine's disk into a batch slot; the engine reads the rest
-    print(f"pom: session {key} restored from disk into slot {slot}: {len(sessions[key])} of {len(ids)} prompt "
-          f"tokens", file=sys.stderr, flush=True)
+    print(f"pom: session {key} restored from disk into slot {slot}: {P.reuse_len(ids, sessions[key])} of {len(ids)} "
+          f"prompt tokens", file=sys.stderr, flush=True)
 
 
 def save_turn(svc, key: str, prompt: list[int], locked: bool = True, held: list[int] | None = None,

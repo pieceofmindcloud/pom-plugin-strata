@@ -47,7 +47,18 @@ class Prefixes(unittest.TestCase):
 
     def test_restore_none_without_a_session_that_starts_the_prompt(self):
         self.assertIsNone(P.choose_restore([5, 6], {"a": [1, 2]}, []))
-        self.assertIsNone(P.choose_restore([1, 2], {"a": [1, 2]}, []))
+        self.assertIsNone(P.choose_restore([1], {"a": [1, 2]}, []))
+
+    def test_a_session_past_the_prompt_is_restored(self):
+        # the prefill machine's turn: the prompt and the token it generated; the engine resumes at its turn checkpoint
+        prompt = [1, 2, 3, 4]
+        self.assertEqual(P.reuse_len(prompt, [1, 2, 3, 4, 5]), 3)
+        self.assertEqual(P.reuse_len(prompt, [1, 2, 3, 4]), 3)
+        self.assertEqual(P.reuse_len(prompt, [1, 2, 9, 4, 5]), 0)
+        self.assertEqual(P.choose_restore(prompt, {"p": [1, 2, 3, 4, 5]}, [[]]), "p")
+        self.assertEqual(P.choose_restore(prompt, {"a": [1, 2], "p": [1, 2, 3, 4, 5]}, []), "p")
+        # a slot that already holds the whole prompt is not overwritten by the same start
+        self.assertIsNone(P.choose_restore(prompt, {"p": [1, 2, 3, 4, 5]}, [[1, 2, 3, 4, 6]]))
 
 
 class Turns(unittest.TestCase):

@@ -52,12 +52,23 @@ def prefix_len(prompt: list[int], ids: list[int]) -> int:
     return 0
 
 
+def reuse_len(prompt: list[int], ids: list[int]) -> int:
+    """How much of `prompt` a session holding `ids` can serve: `prefix_len`, or, for a session that holds the whole
+    prompt and goes past it (a prefill machine's turn: the prompt and the token it generated), `len(prompt) - 1`.
+    The engine reuses such a session from its checkpoint at the prompt's last turn boundary, which the session file
+    keeps, and reads only the rest; `len(prompt) - 1` is the most it can reuse. 0: nothing."""
+    n = len(prompt)
+    if n > 1 and len(ids) >= n and ids[:n] == prompt:
+        return n - 1
+    return prefix_len(prompt, ids)
+
+
 def choose_restore(prompt: list[int], sessions: dict[str, list[int]], held: list[list[int]]) -> str | None:
-    """The session key to restore for `prompt`: the one whose tokens start it most, when that is longer than what
+    """The session key to restore for `prompt`: the one that serves most of it (`reuse_len`), when that is more than
     any slot already holds of it (`held`, the slots' tokens). Ties go to the lower key. None: nothing to restore."""
-    best_key, best = None, max((prefix_len(prompt, h) for h in held), default=0)
+    best_key, best = None, max((reuse_len(prompt, h) for h in held), default=0)
     for key in sorted(sessions):
-        n = prefix_len(prompt, sessions[key])
+        n = reuse_len(prompt, sessions[key])
         if n > best:
             best_key, best = key, n
     return best_key
