@@ -61,6 +61,20 @@ class Prefixes(unittest.TestCase):
         self.assertIsNone(P.choose_restore(prompt, {"p": [1, 2, 3, 4, 5]}, [[1, 2, 3, 4, 6]]))
 
 
+class Pieces(unittest.TestCase):
+    def test_a_prompt_is_cut_every_size_and_last_one_token_short(self):
+        self.assertEqual(P.piece_ends(10, 4), [4, 8, 9])
+        self.assertEqual(P.piece_ends(9, 4), [4, 8])
+        self.assertEqual(P.piece_ends(5, 4), [4])
+        self.assertEqual(P.piece_ends(3, 4), [2])
+        self.assertEqual(P.piece_ends(1, 4), [])
+        self.assertEqual(P.piece_ends(10, 0), [])
+
+    def test_a_piece_key_stays_a_key(self):
+        self.assertEqual(P.piece_key("conv-1", 3), "conv-1.p3")
+        self.assertIsNone(P.piece_key("a" * P.MAX_KEY, 1))
+
+
 class Turns(unittest.TestCase):
     def test_a_turn_is_held_by_the_slot_whose_tokens_start_with_it(self):
         held = [[9, 9], [1, 2, 3, 4], [1, 2, 3, 4, 5, 6]]

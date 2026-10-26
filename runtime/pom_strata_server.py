@@ -49,6 +49,13 @@ conversation). It reads the prompt into a batch slot and keeps the session like 
 `done` carries `"prefill": {"tokens"}`; or, when the part the decode machine lacks is shorter than
 PREFILL_MIN_TOKENS, it reads nothing and answers `"prefill": {"skipped"}`. The decode machine then fetches the
 session and restores it before its own turn (restore_for_prompt).
+
+With `"pieces": true` the prefill machine reads the prompt POM_STRATA_PIECE_TOKENS tokens at a time and saves each
+piece as it is read - the first whole, the next ones as deltas - under the keys `<session>.p1`, `.p2`, ...; it writes
+`{"piece": {"key", "kind": "full" | "delta", "tokens", "bytes"}}` for each one once its files are written, and its
+`done` carries `"prefill": {"tokens", "pieces"}`. The last piece stops one token short of the prompt. The decode
+machine fetches each piece and applies it to one batch slot as it comes (POST /pom/session {"key", "action": "piece",
+"piece", "kind"}, apply_piece), so only the last piece's transfer waits for the prompt to end.
 """
 
 from __future__ import annotations
@@ -353,6 +360,109 @@ def defer_save(svc, key: str, prompt: list[int], slot: int, held: list[int]) -> 
         _saver_started = True
         threading.Thread(target=_saver_loop, args=(svc,), name="pom-session-saver", daemon=True).start()
     return True
+
+
+# The prefill/decode split's pieces: a prefill machine asked for `pieces` reads the prompt this many tokens at a time and
+# saves each piece as it is read, so the decode machine fetches and restores it while the next one is read.
+PIECE_TOKENS = int(os.environ.get("POM_STRATA_PIECE_TOKENS", "4096"))
+# the slot each conversation's pieces are restored into on the decode machine, and the tokens it holds
+piece_slots: dict[str, tuple[int, list[int]]] = {}
+
+
+def save_live(svc, action: str, key: str) -> dict:
+    """The engine's main session (the one a request just read, outside the batch slots) saved under `key`: whole, or as
+    the delta from what it saved last (`save_delta`). Returns once the file is written: a save answered SAVING is
+    awaited here, on this thread, so no other reader of the engine's session answers races for its SAVED."""
+    path = session_path(key, "delta" if action.endswith("_delta") else "full")
+    with svc.fifo:
+        result = svc.engine.session_file(action, path)
+        if result.get("pending"):
+            ticket = {"path": path, "slot": None, "result": None, "error": None, "done": False}
+            svc.engine.save_pending = ticket
+            result = svc.engine.await_session_file(ticket)
+    return result
+
+
+def prefill_pieces(svc, key: str, ids: list[int], sampling: dict, cancel, line) -> dict:
+    """A prefill machine's turn read in pieces (the prefill/decode split, `"pieces": true`): each piece is the prompt up
+    to one of P.piece_ends, read as a request of one token (the engine's main session then holds exactly that start),
+    and saved under the conversation's piece key - the first whole, every later one as the delta from the one before.
+    Each saved piece is announced at once (`line({"piece": ...})`), so the decode machine fetches it while the next one
+    is read. The last piece stops one token short of the prompt: the decode machine reads that token itself."""
+    folder = session_dir()
+    ends = P.piece_ends(len(ids), PIECE_TOKENS)
+    if not ends:
+        raise ValueError("the prompt is too short to be read in pieces")
+    base: list[int] | None = None
+    reused, prompt_ms = None, 0.0
+    for index, end in enumerate(ends, 1):
+        piece = P.piece_key(key, index)
+        if piece is None:
+            raise ValueError(f"session {key}: its piece keys would be too long")
+        prompt = list(ids[:end])
+        done = None
+        for kind, x in svc.run(prompt, False, None, 1, sampling, cancel):
+            if kind == "ping":
+                progress = getattr(svc.engine, "progress", None)
+                line({"p": list(progress)} if progress else {"p": None})
+            elif kind == "done":
+                done = x
+        if cancel.is_set() or done is None:
+            raise ValueError(f"session {key}: the prefill stopped at piece {index}")
+        if reused is None:
+            reused = done.get("reused") or 0
+        prompt_ms += float((done.get("timings") or {}).get("prompt_ms") or 0.0)
+        whole = base is None
+        result = save_live(svc, "save" if whole else "save_delta", piece)
+        if whole:
+            P.write_json(folder / P.file_name(piece, "full_ids"), prompt)
+        else:
+            P.write_json(folder / P.file_name(piece, "delta_meta"), {"base": base, "ids": prompt})
+        line({"piece": {"key": piece, "kind": "full" if whole else "delta", "tokens": end,
+                        "bytes": result.get("bytes")}})
+        base = prompt
+    print(f"pom: prefill of session {key}: {len(ids)} prompt tokens read in {len(ends)} pieces "
+          f"({reused} already held)", file=sys.stderr, flush=True)
+    prune_cache()
+    return {"pieces": len(ends), "reused": reused or 0, "prompt_ms": prompt_ms}
+
+
+def apply_piece(svc, key: str, piece: str, kind: str) -> dict:
+    """The decode machine's side of a piece (fetched into the session folder): the first one (`full`) is restored into a
+    free batch slot, every later one (`delta`) onto that slot, which must still hold the piece before it. The piece's
+    files are removed once the slot holds it. -> {"tokens", "slot"}."""
+    if P.key_problem(piece) or not piece.startswith(key + ".p"):
+        raise ValueError("the piece is not one of this session's")
+    engine = batch_engine(svc)
+    if engine is None:
+        raise ValueError("the engine runs no batch slots")
+    folder = session_dir()
+    if kind == "full":
+        ids = P.read_ids(folder / P.file_name(piece, "full_ids"))
+        if ids is None:
+            raise ValueError(f"no tokens for piece {piece}")
+        with engine.slot_cv:
+            slot = engine.pick_slot(ids)
+        if slot is None:
+            raise ValueError("no free batch slot for the piece")
+        engine_session(svc, "restore", piece, slot, ids=ids)
+    elif kind == "delta":
+        meta = P.read_delta_meta(folder / P.file_name(piece, "delta_meta"))
+        held = piece_slots.get(key)
+        if meta is None:
+            raise ValueError(f"no tokens for piece {piece}")
+        base, ids = meta
+        if held is None or held[1] != base or list(engine.slot_held[held[0]]) != base:
+            raise ValueError(f"no slot holds the piece before {piece}")
+        slot = held[0]
+        engine_session(svc, "restore_delta", piece, slot, ids=ids)
+    else:
+        raise ValueError("a piece is full or delta")
+    piece_slots[key] = (slot, list(ids))
+    slot_bases.pop(slot, None)          # the slot's next save is whole: no peer holds a base of it
+    for name in (P.file_name(piece, k) for k in ("full", "full_ids", "delta", "delta_meta")):
+        (folder / name).unlink(missing_ok=True)
+    return {"tokens": len(ids), "slot": slot}
 
 
 ENGINE_ARGS: list[str] = []     # the engine's arguments as this bridge wrote them (session_config)
@@ -881,9 +991,10 @@ def make_handler(original):
                                  "ms": result.get("ms")})
 
             def _pom_keyed(self, req: dict) -> None:
-                """A keyed session step: `apply`, the receiving side of a delta the peer sent (see apply_delta)."""
-                if req.get("action") != "apply":
-                    raise ValueError("a keyed session action is apply")
+                """A keyed session step: `apply`, the receiving side of a delta the peer sent (see apply_delta), or
+                `piece`, a piece of a prefill machine's turn fetched here (see apply_piece)."""
+                if req.get("action") not in ("apply", "piece"):
+                    raise ValueError("a keyed session action is apply or piece")
                 why = P.key_problem(req.get("key"))
                 if why:
                     raise ValueError(f"key {why}")
@@ -891,7 +1002,12 @@ def make_handler(original):
                     self._json(503, {"error": "the model is not loaded"})
                     return
                 try:
-                    result = apply_delta(svc, req["key"])
+                    if req["action"] == "piece":
+                        if not isinstance(req.get("piece"), str):
+                            raise ValueError("a piece needs its key")
+                        result = apply_piece(svc, req["key"], req["piece"], req.get("kind"))
+                    else:
+                        result = apply_delta(svc, req["key"])
                 except S.SessionRefused as e:
                     self._json(e.status, {"error": str(e), "kind": e.kind, "published": bool(e.published)})
                     return
@@ -986,6 +1102,23 @@ def make_handler(original):
                 self.send_header("Content-Type", "application/x-ndjson")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
+                if prefill_only and req.get("pieces") is True:
+                    # the prefill/decode split's pieces: each piece is announced as it is saved (prefill_pieces)
+                    try:
+                        read = prefill_pieces(svc, session, list(ids), sampling, cancel, self._line)
+                    except (S.EngineDied, S.SessionRefused, ValueError) as e:
+                        self._note(error={"message": str(e)})
+                        self._line({"error": str(e)})
+                        return
+                    except OSError:
+                        self._note(outcome="disconnected")
+                        cancel.set()
+                        return
+                    self._line({"done": {"prefill": {"tokens": len(ids) - read["reused"], "pieces": read["pieces"]},
+                                         "finish": "stop", "prompt_tokens": len(ids), "completion_tokens": 0,
+                                         "reasoning_tokens": 0, "cached_tokens": read["reused"],
+                                         "timings": {"prompt_ms": read["prompt_ms"]}}})
+                    return
                 turn: dict = {}
 
                 def turn_hook(slot, held):

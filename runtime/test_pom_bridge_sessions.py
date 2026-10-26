@@ -140,6 +140,57 @@ class BridgeSessions(unittest.TestCase):
             os.environ["POM_STRATA_SESSIONS"] = self.old
         self.tmp.cleanup()
 
+    def test_a_prefill_reads_in_pieces_and_announces_each_as_it_is_saved(self):
+        svc = FakeService()
+        prompts, saves = [], []
+
+        def run(prompt, thinking, tools, max_new, sampling, cancel, **_):
+            prompts.append((list(prompt), max_new))
+            yield "done", {"reused": 2 if len(prompts) == 1 else len(prompts[-2][0]), "timings": {"prompt_ms": 5.0}}
+
+        def session_file(action, path, slot=None, ids=None, in_turn=False):
+            self.assertIsNone(slot)                 # the engine's main session, not a batch slot
+            saves.append((action, Path(path).name))
+            Path(path).write_text("x")
+            return {"tokens": 0, "bytes": 7, "ms": 0.0}
+
+        svc.run = run
+        svc.engine.session_file = session_file
+        lines = []
+        with mock.patch.object(B, "PIECE_TOKENS", 4):
+            read = B.prefill_pieces(svc, "conv", list(range(10)), {}, threading.Event(), lines.append)
+        self.assertEqual([p for p, _ in prompts], [list(range(4)), list(range(8)), list(range(9))])
+        self.assertTrue(all(n == 1 for _, n in prompts))
+        self.assertEqual(saves, [("save", "conv.p1.strsess"), ("save_delta", "conv.p2.strsdlt"),
+                                 ("save_delta", "conv.p3.strsdlt")])
+        self.assertEqual([x["piece"] for x in lines], [
+            {"key": "conv.p1", "kind": "full", "tokens": 4, "bytes": 7},
+            {"key": "conv.p2", "kind": "delta", "tokens": 8, "bytes": 7},
+            {"key": "conv.p3", "kind": "delta", "tokens": 9, "bytes": 7}])
+        self.assertEqual(P.read_ids(self.folder / "conv.p1.ids.json"), list(range(4)))
+        self.assertEqual(P.read_delta_meta(self.folder / "conv.p3.dlt.json"), (list(range(8)), list(range(9))))
+        self.assertEqual(read, {"pieces": 3, "reused": 2, "prompt_ms": 15.0})
+
+    def test_the_decode_machine_restores_the_pieces_into_one_slot(self):
+        svc = FakeService()
+        B.piece_slots.clear()
+        (self.folder / "conv.p1.strsess").write_text(json.dumps([1, 2, 3]))
+        P.write_json(self.folder / "conv.p1.ids.json", [1, 2, 3])
+        self.assertEqual(B.apply_piece(svc, "conv", "conv.p1", "full"), {"tokens": 3, "slot": 0})
+        (self.folder / "conv.p2.strsdlt").write_text(json.dumps({"base": [1, 2, 3], "ids": [1, 2, 3, 4, 5]}))
+        P.write_json(self.folder / "conv.p2.dlt.json", {"base": [1, 2, 3], "ids": [1, 2, 3, 4, 5]})
+        self.assertEqual(B.apply_piece(svc, "conv", "conv.p2", "delta"), {"tokens": 5, "slot": 0})
+        self.assertEqual(svc.slot_held[0], [1, 2, 3, 4, 5])
+        self.assertEqual([p.name for p in self.folder.iterdir()], [])     # the pieces' files are gone
+        # a delta whose base the slot no longer holds is refused
+        svc.slot_held[0] = [9]
+        (self.folder / "conv.p3.strsdlt").write_text(json.dumps({"base": [1, 2, 3, 4, 5], "ids": [1, 2, 3, 4, 5, 6]}))
+        P.write_json(self.folder / "conv.p3.dlt.json", {"base": [1, 2, 3, 4, 5], "ids": [1, 2, 3, 4, 5, 6]})
+        with self.assertRaises(ValueError):
+            B.apply_piece(svc, "conv", "conv.p3", "delta")
+        with self.assertRaises(ValueError):
+            B.apply_piece(svc, "conv", "other.p1", "full")
+
     def test_the_first_turn_is_saved_whole_and_the_next_one_as_a_delta(self):
         svc = FakeService()
         svc.slot_held[0] = [1, 2, 3, 4]          # the turn just ran in slot 0

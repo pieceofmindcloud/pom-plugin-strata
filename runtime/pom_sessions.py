@@ -63,6 +63,22 @@ def reuse_len(prompt: list[int], ids: list[int]) -> int:
     return prefix_len(prompt, ids)
 
 
+def piece_ends(n: int, size: int) -> list[int]:
+    """Where a prefill machine cuts a prompt of `n` tokens into pieces of `size` (the prefill/decode split's pieces):
+    every `size` tokens, and last at `n - 1`, so the machine that decodes holds a proper start of its prompt and reads
+    its last token itself. Empty: a prompt too short to cut (under two tokens)."""
+    if n < 2 or size < 1:
+        return []
+    ends = list(range(size, n - 1, size))
+    return ends + [n - 1]
+
+
+def piece_key(key: str, index: int) -> str | None:
+    """The session key of a conversation's `index`-th piece (from 1), or None when it would be no valid key."""
+    piece = f"{key}.p{index}"
+    return None if key_problem(piece) else piece
+
+
 def choose_restore(prompt: list[int], sessions: dict[str, list[int]], held: list[list[int]]) -> str | None:
     """The session key to restore for `prompt`: the one that serves most of it (`reuse_len`), when that is more than
     any slot already holds of it (`held`, the slots' tokens). Ties go to the lower key. None: nothing to restore."""
