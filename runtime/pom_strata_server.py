@@ -383,14 +383,26 @@ def save_live(svc, action: str, key: str) -> dict:
     return result
 
 
+def tail_role_token(svc) -> int | None:
+    """The engine's --tail-role-token ("system", with "effort_position": "end"), or None."""
+    if not getattr(svc, "effort_end", False):
+        return None
+    try:
+        role = svc.tok.encode("system", parse_special=True)
+    except Exception:
+        return None
+    return role[0] if len(role) == 1 else None
+
+
 def prefill_pieces(svc, key: str, ids: list[int], sampling: dict, cancel, line) -> dict:
     """A prefill machine's turn read in pieces (the prefill/decode split, `"pieces": true`): each piece is the prompt up
     to one of P.piece_ends, read as a request of one token (the engine's main session then holds exactly that start),
     and saved under the conversation's piece key - the first whole, every later one as the delta from the one before.
     Each saved piece is announced at once (`line({"piece": ...})`), so the decode machine fetches it while the next one
-    is read. The last piece stops one token short of the prompt: the decode machine reads that token itself."""
+    is read. The last piece stops one token before the turn checkpoint: the decode machine reads the rest itself and
+    takes that checkpoint, the one the chat's next turn continues from (its history drops this reply's thinking)."""
     folder = session_dir()
-    ends = P.piece_ends(len(ids), PIECE_TOKENS)
+    ends = P.piece_ends(len(ids), PIECE_TOKENS, P.prefill_last_end(ids, tail_role_token(svc)))
     if not ends:
         raise ValueError("the prompt is too short to be read in pieces")
     base: list[int] | None = None

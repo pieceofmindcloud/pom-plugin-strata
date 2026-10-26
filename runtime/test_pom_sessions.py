@@ -69,6 +69,22 @@ class Pieces(unittest.TestCase):
         self.assertEqual(P.piece_ends(3, 4), [2])
         self.assertEqual(P.piece_ends(1, 4), [])
         self.assertEqual(P.piece_ends(10, 0), [])
+        self.assertEqual(P.piece_ends(10, 4, 6), [4, 6])
+        self.assertEqual(P.piece_ends(10, 4, 8), [4, 8])
+        self.assertEqual(P.piece_ends(10, 4, 50), [4, 8, 9])
+
+    def test_the_last_piece_stops_before_the_turn_checkpoint(self):
+        S, E, NL = P.TURN_TOKEN, P.IM_END_TOKEN, P.NEWLINE_TOKEN
+        # <|im_start|>user ... <|im_end|>\n<|im_start|>assistant\n: the checkpoint is ahead of the user's <|im_end|>
+        ids = [S, 1, 5, 6, 7, E, NL, S, 2, NL]
+        self.assertEqual(P.turn_checkpoint_at(ids), 5)
+        self.assertEqual(P.prefill_last_end(ids), 4)
+        # a trailing turn of the tail role (the effort turn) stays out of it
+        ids = [S, 1, 5, 6, 7, E, NL, S, 3, 9, E, NL, S, 2, NL]
+        self.assertEqual(P.turn_checkpoint_at(ids), 10)
+        self.assertEqual(P.turn_checkpoint_at(ids, tail_role=3), 5)
+        # no turn header: the prompt's last token, as before
+        self.assertEqual(P.prefill_last_end([1, 2, 3, 4]), 3)
 
     def test_a_piece_key_stays_a_key(self):
         self.assertEqual(P.piece_key("conv-1", 3), "conv-1.p3")

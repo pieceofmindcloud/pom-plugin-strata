@@ -63,14 +63,43 @@ def reuse_len(prompt: list[int], ids: list[int]) -> int:
     return prefix_len(prompt, ids)
 
 
-def piece_ends(n: int, size: int) -> list[int]:
+TURN_TOKEN = 248045     # <|im_start|>: the engine's default --turn-token (Qwen3.x)
+IM_END_TOKEN = 248046   # <|im_end|>
+NEWLINE_TOKEN = 198     # "\n"
+
+
+def turn_checkpoint_at(ids: list[int], tail_role: int | None = None) -> int | None:
+    """Where the engine checkpoints a turn it reads (generate.cpp, the turn boundary): the end of the last message
+    before the new turn's header, ahead of its "<|im_end|>\\n", else that header's start. With `tail_role` (the engine's
+    --tail-role-token) a turn of that role right before the header is left out too. None: no turn header."""
+    turn_at = next((i for i in range(len(ids) - 1, 0, -1) if ids[i] == TURN_TOKEN), None)
+    if turn_at is None:
+        return None
+    if tail_role is not None:
+        before = next((i for i in range(turn_at - 1, 0, -1) if ids[i] == TURN_TOKEN), None)
+        if before is not None and before + 1 < len(ids) and ids[before + 1] == tail_role:
+            turn_at = before
+    if turn_at >= 3 and ids[turn_at - 2] == IM_END_TOKEN and ids[turn_at - 1] == NEWLINE_TOKEN:
+        return turn_at - 2
+    return turn_at
+
+
+def piece_ends(n: int, size: int, last: int | None = None) -> list[int]:
     """Where a prefill machine cuts a prompt of `n` tokens into pieces of `size` (the prefill/decode split's pieces):
-    every `size` tokens, and last at `n - 1`, so the machine that decodes holds a proper start of its prompt and reads
-    its last token itself. Empty: a prompt too short to cut (under two tokens)."""
+    every `size` tokens, and last at `last` (default and at most `n - 1`), so the machine that decodes holds a proper
+    start of its prompt and reads the rest itself. Empty: a prompt too short to cut (under two tokens)."""
     if n < 2 or size < 1:
         return []
-    ends = list(range(size, n - 1, size))
-    return ends + [n - 1]
+    end = n - 1 if last is None or last < 1 else min(last, n - 1)
+    ends = list(range(size, end, size))
+    return ends + [end]
+
+
+def prefill_last_end(ids: list[int], tail_role: int | None = None) -> int:
+    """The last piece's end: one token before the turn checkpoint, so the decoding engine reads past it and takes that
+    checkpoint itself (the one the chat's next turn continues from), else the prompt's last token."""
+    at = turn_checkpoint_at(ids, tail_role)
+    return at - 1 if at is not None and at >= 2 else len(ids) - 1
 
 
 def piece_key(key: str, index: int) -> str | None:
