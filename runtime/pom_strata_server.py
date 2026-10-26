@@ -8,6 +8,10 @@ added, without editing Strata's sources:
     {"prompt": "...", "chat_template": true, "thinking": true,
      "max_tokens": 512, "stop": ["..."], "temperature": 0.7, ...}
 
+`thinking_default: true` says the client chose no thinking level: the engine's own
+"reasoning_effort" then decides (none turns the thinking off, another level is the
+template's effort) instead of `thinking`.
+
 The POM gateway renders a conversation into one prompt text, the same text it
 hands to the first peer of a llama.cpp pipeline, and that peer applies the
 model's chat template to it as a single user turn after the fixed system turn.
@@ -653,6 +657,18 @@ def generation_request(req: dict) -> tuple[str, bool, bool, int, dict]:
         max_tokens, sampling
 
 
+def template_kwargs(svc, req: dict, thinking: bool) -> tuple[bool, dict]:
+    """(thinking, the chat template's kwargs) of a /pom/generate body: a client that chose no thinking level
+    (`thinking_default`) gets the engine's own "reasoning_effort" - none turns the thinking off, another level is the
+    template's effort; a client's own choice (`thinking`) stands."""
+    effort = getattr(svc, "config_effort", None) if req.get("thinking_default") is True else None
+    if effort == "none":
+        return False, {"enable_thinking": False}
+    if effort and thinking:
+        return True, {"enable_thinking": True, "reasoning_effort": effort}
+    return thinking, {"enable_thinking": thinking}
+
+
 def prefill_skip(ids: list[int], decode_holds) -> str | None:
     """Why a prefill_only turn is not read here (None: it is): the part of the prompt the decode machine lacks is
     shorter than PREFILL_MIN_TOKENS. `decode_holds` is what that machine holds of the conversation (0 when unknown)."""
@@ -1031,6 +1047,7 @@ def make_handler(original):
 
             def _pom_generate(self, req: dict) -> None:
                 prompt, chat, thinking, max_tokens, sampling = generation_request(req)
+                thinking, kwargs = template_kwargs(svc, req, thinking)
                 # sessions off: the request's session is not read, and the turn runs as it did before sessions
                 session = req.get("session") if SESSIONS_ON else None
                 if session is not None and P.key_problem(session):
@@ -1066,14 +1083,14 @@ def make_handler(original):
                     messages = [{"role": "system", "content": SYSTEM_PROMPT},
                                 {"role": "user", "content": content}]
                     # No limit asked: prepare answers the room the templated prompt leaves.
-                    ids, thinking, room = svc.prepare(messages, None, {"enable_thinking": thinking}, None)
+                    ids, thinking, room = svc.prepare(messages, None, kwargs, None)
                     max_new = fit_budget(max_tokens, room)
                     if prefix_bytes and labels:
                         # the engine pins the checkpoint at the end of the question's prefix (`strata_prefix`, resolved
                         # against the rendered prompt the same way a client's own would be)
                         head = prompt.encode()[:prefix_bytes].decode("utf-8", "ignore")
                         resolved = svc.resolve_prefix({"message": 1, "chars": len(head)}, messages, None,
-                                                      {"enable_thinking": thinking}, ids)
+                                                      kwargs, ids)
                         if resolved:
                             sampling = {**sampling, "strata_prefix": resolved}
                 else:

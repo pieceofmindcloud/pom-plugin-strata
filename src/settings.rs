@@ -90,6 +90,15 @@ fn all() -> Vec<Setting> {
                 ("Orçamento de raciocínio", "Limita o raciocínio de cada requisição a este número de tokens (vazio: sem limite)."),
             )
         },
+        Setting {
+            options: &["none", "low", "medium", "high"],
+            ..setting(
+                "reasoning_effort",
+                "enum",
+                ("Reasoning effort", "Thinking level of the requests that choose none: none turns the thinking off (empty: the model's own)."),
+                ("Esforço de raciocínio", "Nível de raciocínio das requisições que não escolhem um: none desliga o raciocínio (vazio: o do modelo)."),
+            )
+        },
         setting(
             "fit_max_tokens",
             "boolean",
@@ -277,11 +286,11 @@ mod tests {
     fn the_schema_names_every_key_once_with_both_languages() {
         let schema = schema();
         let entries = schema.as_array().unwrap();
-        assert_eq!(entries.len(), 18);
+        assert_eq!(entries.len(), 19);
         let mut keys: Vec<&str> = entries.iter().map(|e| e["key"].as_str().unwrap()).collect();
         keys.sort();
         keys.dedup();
-        assert_eq!(keys.len(), 18);
+        assert_eq!(keys.len(), 19);
         for entry in entries {
             assert!(entry["label"]["en"].is_string() && entry["label"]["pt-BR"].is_string());
         }
