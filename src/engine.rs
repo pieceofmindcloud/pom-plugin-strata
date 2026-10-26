@@ -1079,10 +1079,10 @@ impl Manager {
         } else if let Some(mtp) = self.mtp_dir(&request.model_path) {
             args.extend(["--spec", "4", "--spec-min-p", "0.5", "--mtp"].map(str::to_owned));
             args.push(mtp.display().to_string());
-            // The decode machine of a prefill/decode split runs every turn in a batch slot (its session is restored
-            // there and the turn is saved from there), where the solo path's drafts never run: each slot proposes
-            // its own MTP token instead.
-            if request.role.as_deref() == Some("decode") {
+            // Every machine of a prefill/decode split answers, and runs its turns in batch slots (a session is
+            // restored there and the turn is saved from there), where the solo path's drafts never run: each slot
+            // proposes its own MTP token instead.
+            if request.role.is_some() {
                 args.push("--batch-mtp".into());
             }
         } else {
