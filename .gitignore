@@ -5,3 +5,4 @@
 /ui/dist
 __pycache__/
 /build-runtime.log
+build-runtime-*.log
