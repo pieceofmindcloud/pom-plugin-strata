@@ -5,6 +5,7 @@
     "en": "Runs a whole Qwen3.8-Flash-Next model (architecture qwen4exp) on this machine with the Strata engine instead of llama.cpp: deploy it with the Strata inference service and the POM pipeline sends prompts to Strata, on one or more GPUs of this machine. Includes Strata's live GPU and speed monitor.",
     "pt-BR": "Executa um modelo Qwen3.8-Flash-Next inteiro (arquitetura qwen4exp) nesta máquina com o motor Strata no lugar do llama.cpp: implante com o serviço de inferência Strata e a pipeline do POM manda os prompts ao Strata, em uma ou mais placas desta máquina. Inclui o monitor de GPU e velocidade do Strata em tempo real."
   },
+  "screenshots": ["docs/screenshots/strata.png"],
   "documentation": {
     "guides": [
       {
