@@ -119,8 +119,11 @@ workspace.
   from npm on the node the first time the app starts (`@deepseek-ai/dsh` at
   `DSH_VERSION`, about 850 MB), so neither the plugin library nor the runtime
   carries it. The app downloads no engine and no model: the POM owns both.
-- The agent works in the POM's common workspace (`workspace_root`), or in
-  `<POM database dir>/strata/app/workspace`. It asks before it changes a file
+- The agent works in the POM's common workspace (`workspace_root`), as the
+  DeepSeek Harness plugin does: it is the app's first workspace (kept so at
+  every start, next to any folder the person adds) and the folder new chats
+  work in; without one, `<POM database dir>/strata/app/workspace`. Folders are
+  chosen in the page (the node has no folder dialog). It asks before it changes a file
   or runs a command unless the chat's mode says otherwise. Anyone with the
   plugin screen (an admin of this POM) can use it.
 

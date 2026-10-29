@@ -347,6 +347,7 @@ impl Manager {
         self.set("starting", Some("starting the app".into()));
         let models = gateway_models(&gateway).unwrap_or_default();
         write_connection(&home.join("data/model-providers.json"), &gateway, &models)?;
+        keep_workspace(&home.join("data/workspaces.json"), &workspace)?;
         let port = free_port()?;
         let log = self.log();
         let _ = std::fs::write(&log, "");
@@ -608,6 +609,33 @@ fn write_connection(file: &Path, gateway: &Gateway, models: &[String]) -> Result
     std::fs::rename(&temp, file).map_err(|error| error.to_string())
 }
 
+/// The app's first workspace (`root`, where chats work unless they choose
+/// another folder) is the POM's common workspace, as the Harness plugin
+/// registers it at every start. Without a saved list the app makes it itself
+/// from `STRATA_WORKSPACE`; a saved one keeps the person's other workspaces.
+fn keep_workspace(file: &Path, workspace: &Path) -> Result<(), String> {
+    let Some(mut list) = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<Value>>(&text).ok())
+        .filter(|list| !list.is_empty())
+    else {
+        return Ok(());
+    };
+    let path = workspace.to_string_lossy();
+    let name = workspace
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let root = json!({"id": "root", "name": name, "path": path});
+    match list.iter_mut().find(|entry| entry["id"] == "root") {
+        Some(entry) if entry["path"] == root["path"] => return Ok(()),
+        Some(entry) => *entry = root,
+        None => list.insert(0, root),
+    }
+    let text = serde_json::to_string_pretty(&list).map_err(|error| error.to_string())?;
+    std::fs::write(file, text).map_err(|error| format!("{}: {error}", file.display()))
+}
+
 fn append(log: &Path, line: &str) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -703,6 +731,25 @@ mod tests {
                 0o600
             );
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_first_workspace_follows_the_pom_workspace() {
+        let dir = std::env::temp_dir().join(format!("pom-strata-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("workspaces.json");
+        keep_workspace(&file, Path::new("/srv/pom/workspace")).unwrap();
+        assert!(!file.exists(), "no saved list: the app makes its own");
+        std::fs::write(&file, r#"[{"id":"root","name":"old","path":"/old"},{"id":"w2","name":"mine","path":"/mine"}]"#).unwrap();
+        keep_workspace(&file, Path::new("/srv/pom/workspace")).unwrap();
+        let list: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(
+            list[0],
+            json!({"id": "root", "name": "workspace", "path": "/srv/pom/workspace"})
+        );
+        assert_eq!(list[1]["id"], "w2");
         let _ = std::fs::remove_dir_all(dir);
     }
 
