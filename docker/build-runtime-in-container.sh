@@ -29,6 +29,8 @@ cmake -G Ninja "${launcher[@]}" -S /src -B "$build" \
   -DSTRATA_ENABLE_CUDA=ON \
   -DSTRATA_BUILD_TESTS=OFF \
   -DSTRATA_PORTABLE=ON \
+  -DSTRATA_Q6K_EXPERTS=ON \
+  -DSTRATA_MMQ_KQUANTS=ON \
   -DCMAKE_CUDA_ARCHITECTURES="$archs" \
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
   -DCMAKE_PROJECT_INCLUDE=/plugin/cmake/pom-static-cuda.cmake \

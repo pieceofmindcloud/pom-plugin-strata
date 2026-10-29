@@ -46,6 +46,8 @@ cmake -G Ninja "${launcher[@]}" -S "$src" -B "$build" \
   -DSTRATA_ENABLE_CUDA=OFF \
   -DSTRATA_BUILD_TESTS=OFF \
   -DSTRATA_PREFILL_MMQ=ON \
+  -DSTRATA_Q6K_EXPERTS=ON \
+  -DSTRATA_MMQ_KQUANTS=ON \
   -DCMAKE_HIP_ARCHITECTURES="$archs" \
   -DCMAKE_HIP_COMPILER="$rocm/llvm/bin/clang++" \
   -DCMAKE_HIP_COMPILER_ROCM_ROOT="$rocm" \
