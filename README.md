@@ -1,7 +1,7 @@
 # pom-plugin-strata
 
 POM plugin that serves a whole **Qwen3.8-Flash-Next** model (GGUF
-architecture `qwen4exp`) with the [Strata](https://github.com/Niko1221/Strata)
+architecture `qwen4exp`), or a **Qwen3.6-35B-A3B** one (`qwen35moe`), with the [Strata](https://github.com/Niko1221/Strata)
 engine (the fork in `strata.lock`, which adds the stage split) instead of
 llama.cpp. A machine with the plugin publishes the
 `inference` service "Strata"; a deployment that picks that service runs the
@@ -33,7 +33,7 @@ POM documentation screen).
 
 | Operation | Who | What |
 |---|---|---|
-| `host.services` | POM | the `inference` service, its state, `architectures: ["qwen4exp"]` and the engine `settings` (`src/settings.rs`) |
+| `host.services` | POM | the `inference` service, its state, `architectures: ["qwen4exp", "qwen35moe"]` and the engine `settings` (`src/settings.rs`) |
 | `engine.load` | the local POM node | loads a model: `model_path`, `model_label`, `n_ctx`, `max_sessions`, `kv`, `gpus`, `settings` (applied with Strata's `serve/runconfig.py` rules by the bridge) |
 | `engine.unload` | the local POM node | stops Strata and gives the GPU back |
 | `engine.status` | the local POM node | `idle`, `installing`, `preparing`, `loading`, `ready`, `stopping` or `error`, with `detail` and `n_ctx` |

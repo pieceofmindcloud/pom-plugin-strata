@@ -418,7 +418,7 @@ impl Snapshot {
             "status": status,
             "version": self.runtime_version,
             "detail": detail.map(|text| text.chars().take(190).collect::<String>()),
-            "architectures": [gguf::STRATA_ARCHITECTURE],
+            "architectures": gguf::ARCHITECTURES,
             // A POM slice of a model runs as one stage of a split across machines.
             "stages": true,
             // The POM settings that apply to those stages (the nodes carry the hidden state between them), and the
@@ -960,8 +960,14 @@ impl Manager {
                 Some(_) => {}
             }
         }
+        let qwen36 = model.architecture == gguf::QWEN36_ARCHITECTURE;
+        if qwen36 && request.role.is_some() {
+            return self.fail(
+                "the prefill/decode split runs Qwen3.8-Flash-Next only; deploy Qwen3.6-35B-A3B without it".into(),
+            );
+        }
         let pack = self.pack_dir(&request.model_path);
-        if pack_ready(&pack) {
+        if pack_ready(&pack, &model) {
             return self.serve(runtime, request, &model, pack);
         }
         self.append_log(&format!(
@@ -973,13 +979,19 @@ impl Manager {
             Ok(command) => command,
             Err(error) => return self.fail(error),
         };
+        // Qwen3.6-35B-A3B needs only its tokenizer: the engine reads the GGUF itself (as Strata's setup does).
+        let tool = if qwen36 {
+            "strata/tools/strata_tokenizer.py"
+        } else {
+            "strata/tools/iq_pack.py"
+        };
         command
-            .arg(runtime.join("strata/tools/iq_pack.py"))
+            .arg(runtime.join(tool))
             .arg("--gguf")
             .arg(&request.model_path)
             .arg("--out")
             .arg(&pack);
-        if model.shards.len() > 2 || model.stage.is_some() {
+        if !qwen36 && (model.shards.len() > 2 || model.stage.is_some()) {
             // Unsloth's files keep small projections as Q8_0; the engine reads them as BF16.
             // (A slice no longer says how many files its model had: the flag only converts what needs it.)
             command.arg("--compat-bf16");
@@ -1050,6 +1062,30 @@ impl Manager {
             Ok(port) => port,
             Err(error) => return self.fail(error),
         };
+        if model.architecture == gguf::QWEN36_ARCHITECTURE {
+            // Strata's setup starts it so (install_own_path): the GGUF as it is, the experts that fit in VRAM and
+            // the rest on the CPU, two drafts per step from the file's MTP block.
+            let args: Vec<String> = [
+                "--native",
+                &request.model_path.display().to_string(),
+                "--max-context",
+                &request.context.to_string(),
+                "--prefill",
+                "auto",
+                "--mtp",
+                "2",
+            ]
+            .map(str::to_owned)
+            .to_vec();
+            return self.start_server(
+                runtime,
+                request,
+                args,
+                pack,
+                port,
+                Some(gguf::QWEN36_ARCHITECTURE),
+            );
+        }
         let mut args: Vec<String> = vec![
             "--pack".into(),
             pack.display().to_string(),
@@ -1118,6 +1154,20 @@ impl Manager {
         if stage_server {
             return self.serve_stage(runtime, request, args, port);
         }
+        self.start_server(runtime, request, args, pack, port, None)
+    }
+
+    /// Strata's server (through the plugin's bridge) for a whole model: its
+    /// config, then the process. `arch` names a family other than Flash-Next.
+    fn start_server(
+        &mut self,
+        runtime: PathBuf,
+        request: LoadRequest,
+        args: Vec<String>,
+        pack: PathBuf,
+        port: u16,
+        arch: Option<&str>,
+    ) {
         let api_key = self
             .shared
             .lock()
@@ -1136,11 +1186,16 @@ impl Manager {
             "api_key": api_key,
             "open_browser": false,
         });
+        if let Some(arch) = arch {
+            config["arch"] = json!(arch);
+        }
         // Several GPUs share the model (or this stage's layers): the bridge adds the layer split for a list.
         // The cards are numbered as the backend's runtime numbers them (HIP_VISIBLE_DEVICES for AMD).
         match request.backend_gpus() {
             [] => {}
             [first] => config["gpu"] = json!(first),
+            // Strata's own path for another family runs on one card (its setup names one): the first chosen
+            [first, ..] if arch.is_some() => config["gpu"] = json!(first),
             many => config["gpu"] = json!(many),
         }
         config["gpus_asked"] = json!(!request.backend_gpus().is_empty());
@@ -1383,16 +1438,16 @@ impl Manager {
                 let request = request.clone();
                 self.work = Work::None;
                 let pack = self.pack_dir(&request.model_path);
-                if !status.success() || !pack_ready(&pack) {
-                    return self.fail(format!(
-                        "preparing the model for Strata failed ({status}); see the Strata log"
-                    ));
-                }
                 let (Some(runtime), Ok(model)) =
                     (self.runtime(), gguf::inspect(&request.model_path))
                 else {
                     return self.fail("the model or the runtime went away".into());
                 };
+                if !status.success() || !pack_ready(&pack, &model) {
+                    return self.fail(format!(
+                        "preparing the model for Strata failed ({status}); see the Strata log"
+                    ));
+                }
                 self.serve(runtime, request, &model, pack);
             }
             Work::Serving { group, .. } => {
@@ -1463,8 +1518,13 @@ fn copy_lines(stream: Box<dyn std::io::Read + Send>, log: &Path) {
     }
 }
 
-/// The pack tool writes `native_experts.txt` and the tokenizer last.
-fn pack_ready(pack: &Path) -> bool {
+/// The pack tool writes `native_experts.txt` and the tokenizer last; for
+/// Qwen3.6-35B-A3B the folder holds only the tokenizer.
+fn pack_ready(pack: &Path, model: &gguf::Model) -> bool {
+    if model.architecture == gguf::QWEN36_ARCHITECTURE {
+        return pack.join("tokenizer/vocab.json").is_file()
+            && pack.join("tokenizer/merges.txt").is_file();
+    }
     pack.join("native_experts.txt").is_file()
         && pack.join("tokenizer/vocab.json").is_file()
         && pack.join("tokenizer/chat_template.jinja").is_file()

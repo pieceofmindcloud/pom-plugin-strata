@@ -13,6 +13,11 @@ const MAX_STRING: u64 = 64 << 20;
 
 /// The architecture Strata's engine runs: Qwen3.8-Flash-Next and its variants.
 pub const STRATA_ARCHITECTURE: &str = "qwen4exp";
+/// Qwen3.6-35B-A3B: Strata's engine runs it on a path of its own, from the
+/// GGUF as it is (no pack), with the file's own MTP block.
+pub const QWEN36_ARCHITECTURE: &str = "qwen35moe";
+/// Every architecture this plugin offers to run.
+pub const ARCHITECTURES: [&str; 2] = [STRATA_ARCHITECTURE, QWEN36_ARCHITECTURE];
 /// The n-gram (per-layer embedding) table Strata reads from its own shard.
 pub const PLE_TENSOR: &str = "per_layer_token_embd.weight";
 
@@ -245,6 +250,8 @@ impl Stage {
 /// What the plugin knows about a model before Strata reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
+    /// One of [`ARCHITECTURES`].
+    pub architecture: String,
     pub shards: Vec<PathBuf>,
     /// The shard that holds the n-gram table, when there is one.
     pub ple_shard: Option<PathBuf>,
@@ -258,15 +265,14 @@ pub struct Model {
 pub fn inspect(first: &Path) -> Result<Model, String> {
     let shards = shards_of(first)?;
     let header = read_header(first).map_err(|error| format!("{}: {error}", first.display()))?;
-    match header.architecture.as_deref() {
-        Some(STRATA_ARCHITECTURE) => {}
-        Some(other) => {
-            return Err(format!(
-                "Strata runs the {STRATA_ARCHITECTURE} architecture (Qwen3.8-Flash-Next); this model is {other}"
-            ))
-        }
+    let architecture = match header.architecture.as_deref() {
+        Some(arch) if ARCHITECTURES.contains(&arch) => arch.to_owned(),
+        Some(other) => return Err(format!(
+            "Strata runs the {STRATA_ARCHITECTURE} (Qwen3.8-Flash-Next) and {QWEN36_ARCHITECTURE} \
+                 (Qwen3.6-35B-A3B) architectures; this model is {other}"
+        )),
         None => return Err("the model declares no architecture".into()),
-    }
+    };
     let stage = match (
         header.pom_start_layer,
         header.pom_end_layer,
@@ -280,6 +286,15 @@ pub fn inspect(first: &Path) -> Result<Model, String> {
     };
     if stage.is_some() && shards.len() > 1 {
         return Err("a POM slice is one file".into());
+    }
+    if architecture == QWEN36_ARCHITECTURE {
+        // Strata's own path for it reads one whole GGUF: no slices, no split files.
+        if stage.is_some() {
+            return Err("Strata splits only Qwen3.8-Flash-Next across machines".into());
+        }
+        if shards.len() > 1 {
+            return Err("Strata runs Qwen3.6-35B-A3B from a single GGUF file".into());
+        }
     }
     let layers = stage
         .map(|stage| stage.total)
@@ -300,6 +315,7 @@ pub fn inspect(first: &Path) -> Result<Model, String> {
         }
     }
     Ok(Model {
+        architecture,
         shards,
         ple_shard,
         layers,
@@ -382,7 +398,8 @@ mod tests {
         let dir = temp_dir("refused");
         let llama = dir.join("llama.gguf");
         write_model(&llama, "llama", &[], &[]);
-        assert!(inspect(&llama).unwrap_err().contains("qwen4exp"));
+        let refused = inspect(&llama).unwrap_err();
+        assert!(refused.contains("qwen4exp") && refused.contains("qwen35moe"));
         let slice = dir.join("slice.gguf");
         write_model(&slice, "qwen4exp", &[("pom.start_layer", 0)], &[]);
         assert!(inspect(&slice).unwrap_err().contains("slice"));
@@ -392,6 +409,34 @@ mod tests {
         let second = dir.join("m-00002-of-00003.gguf");
         write_model(&second, "qwen4exp", &[], &[]);
         assert!(inspect(&second).unwrap_err().contains("first part"));
+    }
+
+    #[test]
+    fn qwen36_runs_as_one_whole_file() {
+        let dir = temp_dir("qwen36");
+        let model_file = dir.join("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf");
+        write_model(&model_file, "qwen35moe", &[], &["blk.0.attn_q.weight"]);
+        let model = inspect(&model_file).unwrap();
+        assert_eq!(model.architecture, QWEN36_ARCHITECTURE);
+        assert_eq!(model.shards.len(), 1);
+        let slice = dir.join("q36-slice.gguf");
+        write_model(
+            &slice,
+            "qwen35moe",
+            &[
+                ("pom.start_layer", 0),
+                ("pom.end_layer", 9),
+                ("pom.original_block_count", 40),
+            ],
+            &[],
+        );
+        assert!(inspect(&slice)
+            .unwrap_err()
+            .contains("only Qwen3.8-Flash-Next"));
+        let first = dir.join("q36-00001-of-00002.gguf");
+        write_model(&first, "qwen35moe", &[], &[]);
+        write_model(&dir.join("q36-00002-of-00002.gguf"), "qwen35moe", &[], &[]);
+        assert!(inspect(&first).unwrap_err().contains("single GGUF"));
     }
 
     #[test]

@@ -7,13 +7,20 @@ Strata keeps the dense part of the model and the most used experts on the GPU
 and the rest of the experts in system RAM, so a model of about 80 GB runs on a
 machine with one or more consumer cards and enough RAM.
 
+It also runs **Qwen3.6-35B-A3B** (GGUF architecture `qwen35moe`, Unsloth's
+files with the MTP block) on Strata's own path for it, as Strata's setup does:
+the GGUF as it is (only its tokenizer is extracted, no pack), the experts that
+fit in VRAM and the rest on the CPU, two drafts per step from the file's MTP
+block. One file on one card: no layer slices, no split files, no prefill/decode
+split.
+
 ## How a deployment uses it
 
 1. Install the plugin on every machine that should be able to run Strata. The
    machine then shows the **Strata** inference service on the dashboard.
 2. Open **Deploy**, choose the model, and in **Inference service** pick
-   **Strata**. Only `qwen4exp` models and only machines with this plugin are
-   offered. The deployment is a whole model on one machine, or the two layer
+   **Strata**. Only `qwen4exp` and `qwen35moe` models and only machines with
+   this plugin are offered. The deployment is a whole model on one machine, or the two layer
    slices of a model on two machines (see "A model split across two
    machines").
 3. The settings of the deployment apply: the context size, the GPUs of the
