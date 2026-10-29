@@ -120,10 +120,12 @@ fi
 
 echo "== server and tools"
 cp -a "$src/serve" "$src/tools" "$src/data" "$src/LICENSE" "$out.tmp/strata/"
+# the packages the server imports from the source root (strata_control, strata_cli), where the source has them
+for pkg in strata_control strata_cli; do [[ ! -d "$src/$pkg" ]] || cp -a "$src/$pkg" "$out.tmp/strata/"; done
 mkdir -p "$out.tmp/strata/third_party/llama.cpp"
 cp -a "$src/third_party/llama.cpp/gguf-py" "$out.tmp/strata/third_party/llama.cpp/"
 find "$out.tmp/strata" -name '__pycache__' -prune -exec rm -rf {} +
-find "$out.tmp/strata/serve" -name 'test_*.py' -delete
+find "$out.tmp/strata/serve" "$out.tmp/strata/strata_control" "$out.tmp/strata/strata_cli" -name 'test_*.py' -delete 2>/dev/null || true
 install -m 0644 "$plugin/runtime/pom_strata_server.py" "$out.tmp/pom_strata_server.py"
 install -m 0644 "$plugin/runtime/pom_sessions.py" "$out.tmp/pom_sessions.py"
 
