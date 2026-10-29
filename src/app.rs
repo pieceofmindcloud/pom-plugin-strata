@@ -27,6 +27,8 @@ const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 /// The id of the connection this plugin writes into the app's model list.
 const CONNECTION_ID: &str = "pom";
 const POLL: Duration = Duration::from_secs(2);
+/// How often the POM's model list is compared with the app's connection.
+const MODELS_EVERY: Duration = Duration::from_secs(15);
 
 /// What the POM hands over in `host.configure` that the app needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +146,9 @@ struct Running {
     runtime: PathBuf,
     port: u16,
     since: Instant,
+    /// The models the app's "POM" connection lists, and when the POM was last asked.
+    models: Vec<String>,
+    checked: Instant,
 }
 
 struct Manager {
@@ -256,7 +261,9 @@ impl Manager {
                 } else if since.elapsed() > Duration::from_secs(120) {
                     self.fail("the app did not answer within 2 minutes".into());
                 }
+                return;
             }
+            self.refresh_models();
             return;
         }
         if self.retry_at.is_some_and(|at| Instant::now() < at) {
@@ -282,6 +289,40 @@ impl Manager {
         }
     }
 
+    /// The POM serves the models it is deployed with, which change while the
+    /// app runs (a model loads after the app started, another is deployed):
+    /// the app's "POM" connection follows them through the app's own API, so
+    /// its picker updates without a restart.
+    fn refresh_models(&mut self) {
+        let Some(running) = self.running.as_mut() else {
+            return;
+        };
+        if running.checked.elapsed() < MODELS_EVERY {
+            return;
+        }
+        running.checked = Instant::now();
+        let Some(models) = gateway_models(&running.gateway) else {
+            return;
+        };
+        // (an empty list is not saved: the app keeps a connection's last models)
+        if models.is_empty() || models == running.models {
+            return;
+        }
+        match post_connection(running.port, &running.gateway, &models) {
+            Ok(()) => {
+                running.models = models;
+                let line = format!("[pom] the POM's models now: {}", running.models.join(", "));
+                let _ = append(&self.log(), &line);
+            }
+            Err(error) => {
+                let _ = append(
+                    &self.log(),
+                    &format!("[pom] updating the app's model list failed: {error}"),
+                );
+            }
+        }
+    }
+
     fn launch(&mut self, gateway: Gateway, runtime: PathBuf) -> Result<Running, String> {
         let node = runtime.join("node/bin/node");
         let meta: Value = std::fs::read_to_string(runtime.join("app/APP.json"))
@@ -304,7 +345,7 @@ impl Manager {
         let harness = self.harness(&node, &runtime, &version)?;
         self.update(|state| state.harness = Some(version.clone()));
         self.set("starting", Some("starting the app".into()));
-        let models = gateway_models(&gateway);
+        let models = gateway_models(&gateway).unwrap_or_default();
         write_connection(&home.join("data/model-providers.json"), &gateway, &models)?;
         let port = free_port()?;
         let log = self.log();
@@ -345,6 +386,8 @@ impl Manager {
             runtime,
             port,
             since: Instant::now(),
+            models,
+            checked: Instant::now(),
         })
     }
 
@@ -479,27 +522,51 @@ fn healthy(port: u16) -> bool {
         .is_ok()
 }
 
-/// The models the POM's endpoint lists now (ids as the POM names them).
-fn gateway_models(gateway: &Gateway) -> Vec<String> {
-    let answer = ureq::get(&format!("{}/models", gateway.openai_base_url))
+/// The models the POM's endpoint lists now (ids as the POM names them);
+/// `None` when it did not answer.
+fn gateway_models(gateway: &Gateway) -> Option<Vec<String>> {
+    let answer: Value = ureq::get(&format!("{}/models", gateway.openai_base_url))
         .set("Authorization", &format!("Bearer {}", gateway.api_key))
         .timeout(Duration::from_secs(10))
         .call()
-        .ok()
-        .and_then(|response| response.into_json::<Value>().ok());
-    answer
-        .as_ref()
-        .and_then(|value| value["data"].as_array())
-        .map(|models| {
-            models
-                .iter()
-                .filter_map(|model| model["id"].as_str())
-                .filter(|id| !id.is_empty() && id.len() <= 256 && !id.contains(['\r', '\n']))
-                .take(100)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+        .ok()?
+        .into_json()
+        .ok()?;
+    Some(
+        answer["data"]
+            .as_array()?
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .filter(|id| !id.is_empty() && id.len() <= 256 && !id.contains(['\r', '\n']))
+            .take(100)
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// The connection's model rows, as the app stores them.
+fn model_rows(models: &[String]) -> Vec<Value> {
+    models
+        .iter()
+        .map(|id| json!({"id": id, "name": id, "contextMax": null, "maxOutput": null, "vision": null, "reasoning": null}))
+        .collect()
+}
+
+/// Saves the connection's new model list through the running app's API (the
+/// app keeps the key it already has for an unchanged address).
+fn post_connection(port: u16, gateway: &Gateway, models: &[String]) -> Result<(), String> {
+    ureq::post(&format!("http://127.0.0.1:{port}/api/model-providers"))
+        .timeout(Duration::from_secs(10))
+        .send_json(json!({
+            "id": CONNECTION_ID,
+            "kind": "custom",
+            "name": "POM",
+            "baseUrl": gateway.openai_base_url,
+            "protocol": "openai-chat",
+            "models": model_rows(models),
+        }))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Writes (or replaces) this plugin's connection in the app's model list,
@@ -521,9 +588,7 @@ fn write_connection(file: &Path, gateway: &Gateway, models: &[String]) -> Result
             "baseUrl": gateway.openai_base_url,
             "protocol": "openai-chat",
             "apiKey": gateway.api_key,
-            "models": models.iter().map(|id| json!({
-                "id": id, "name": id, "contextMax": null, "maxOutput": null, "vision": null, "reasoning": null,
-            })).collect::<Vec<_>>(),
+            "models": model_rows(models),
         }),
     );
     if let Some(parent) = file.parent() {
