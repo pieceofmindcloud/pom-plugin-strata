@@ -5,3 +5,8 @@
 STRATA_REPOSITORY=https://github.com/pieceofmindcloud/Strata.git
 STRATA_BRANCH=pom
 LLAMA_CPP_COMMIT=3cf03257f219afbe7334045ff7c6a06ac68c627d
+# Strata's app (apps/host: the web shell with chats, tasks, workspaces and the agent) runs on this portable Node.js,
+# which the runtime carries (scripts/build-app.sh). The agent is the DeepSeek Harness from npm at this exact version,
+# installed on the node the first time the app starts (src/app.rs), never in the plugin library or the runtime.
+NODE_VERSION=24.21.0
+DSH_VERSION=0.2.1-rc.5

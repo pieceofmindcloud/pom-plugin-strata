@@ -16,6 +16,8 @@ export type StrataStatus = {
   earlierStage: boolean;
   runtime: { ready: boolean; version: string | null; error: string | null };
   log: string[] | null;
+  /** Strata's app (chats, tasks and the agent, through the POM's endpoint), served under `/app/`. */
+  app: { state: string; detail: string | null; harness: string | null } | null;
 };
 
 const STATES: State[] = ["idle", "installing", "preparing", "loading", "ready", "stopping", "error"];
@@ -48,6 +50,14 @@ export function normalizeStatus(value: unknown): StrataStatus | null {
     earlierStage: raw.earlier_stage === true,
     runtime: { ready: runtime.ready === true, version: text(runtime.version), error: text(runtime.error) },
     log: Array.isArray(raw.log) ? raw.log.filter((line): line is string => typeof line === "string") : null,
+    app:
+      typeof raw.app === "object" && raw.app !== null && typeof (raw.app as Record<string, unknown>).state === "string"
+        ? {
+            state: (raw.app as Record<string, unknown>).state as string,
+            detail: text((raw.app as Record<string, unknown>).detail),
+            harness: text((raw.app as Record<string, unknown>).harness),
+          }
+        : null,
   };
 }
 
@@ -126,6 +136,15 @@ export function StatusView({ status, failed }: { status: StrataStatus | null; fa
                 <KeyValue label={t("modelPath")}>
                   <span className="pb-mono">{status.modelPath ?? t("none")}</span>
                 </KeyValue>
+                {status.app && (
+                  <KeyValue label={t("app")}>
+                    <span className="pb-mono">
+                      {t(`app.${status.app.state}`)}
+                      {status.app.detail ? ` - ${status.app.detail}` : ""}
+                      {status.app.harness ? ` (agent ${status.app.harness})` : ""}
+                    </span>
+                  </KeyValue>
+                )}
               </dl>
             </div>
           </Panel>

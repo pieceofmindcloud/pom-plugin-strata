@@ -9,25 +9,27 @@ declare const __POM_PLUGIN_CODE__: string;
  * the plugin through the POM plugin proxy. */
 const APP = `/api/ui/plugins/${encodeURIComponent(__POM_PLUGIN_CODE__)}/proxy/`;
 
-type Tab = "strata" | "status";
-const TABS: Tab[] = ["strata", "status"];
+type Tab = "app" | "strata" | "status";
 const STORAGE_KEY = "pom-strata.tab";
+const ICONS: Record<Tab, string> = { app: "✦", strata: "◆", status: "≡" };
 
-function initialTab(): Tab {
+function savedTab(): Tab | null {
   try {
-    return localStorage.getItem(STORAGE_KEY) === "status" ? "status" : "strata";
+    const saved = localStorage.getItem(STORAGE_KEY);
+    return saved === "app" || saved === "strata" || saved === "status" ? saved : null;
   } catch {
-    return "strata";
+    return null;
   }
 }
 
-/** The single Strata screen. With no model served, or on an earlier stage of a
- * split model, it is the engine's status; while this machine serves a model,
- * Strata's own app and the status are tabs. */
+/** The single Strata screen: Strata's app (chats, tasks and the agent, whose
+ * requests go through the POM like any client's) while it runs, Strata's own
+ * web page while this machine serves a model, and the engine's status. With
+ * neither, it is the status alone. */
 export function StrataApp() {
   const { t } = usePluginI18n();
   const { status, failed } = useStatus();
-  const [tab, setTab] = useState<Tab>(initialTab);
+  const [chosen, setTab] = useState<Tab | null>(savedTab);
   const choose = (next: Tab) => {
     setTab(next);
     try {
@@ -41,9 +43,13 @@ export function StrataApp() {
   // first poll answered (or failed), not over the empty page before it.
   useScreenReady(status !== null || failed);
 
-  // Strata's app runs on the machine that serves the requests; an earlier
-  // stage of a split model has only the engine, so it shows the status alone.
-  if (status?.state !== "ready" || status.earlierStage) {
+  // Strata's web page runs on the machine that serves the requests; an earlier
+  // stage of a split model has only the engine. The app needs no local engine.
+  const serving = status?.state === "ready" && !status.earlierStage;
+  const appReady = status?.app?.state === "ready";
+  const tabs: Tab[] = [...(appReady ? (["app"] as Tab[]) : []), ...(serving ? (["strata"] as Tab[]) : []), "status"];
+  const tab: Tab = chosen && tabs.includes(chosen) ? chosen : tabs[0];
+  if (tabs.length === 1) {
     return (
       <div className="pb-scroll">
         <StatusView status={status} failed={failed} />
@@ -53,7 +59,7 @@ export function StrataApp() {
   return (
     <div className="pb-shell">
       <div className="pb-shell-tabs" role="tablist" aria-label="Strata">
-        {TABS.map((value) => (
+        {tabs.map((value) => (
           <button
             key={value}
             type="button"
@@ -64,14 +70,15 @@ export function StrataApp() {
             className={tab === value ? "pb-shell-tab pb-shell-tab-on" : "pb-shell-tab"}
             onClick={() => choose(value)}
           >
-            <span aria-hidden="true">{value === "strata" ? "◆" : "≡"}</span>
+            <span aria-hidden="true">{ICONS[value]}</span>
             {t(`tab.${value}`)}
           </button>
         ))}
       </div>
       <div className="pb-shell-panel" id="pb-shell-panel" role="tabpanel" aria-labelledby={`pb-tab-${tab}`}>
         {/* The app stays mounted while the model is served: switching tabs keeps its page and its chat. */}
-        <iframe className="pb-frame" title={t("monitorTitle")} src={APP} hidden={tab !== "strata"} />
+        {appReady && <iframe className="pb-frame" title={t("appTitle")} src={`${APP}app/`} hidden={tab !== "app"} />}
+        {serving && <iframe className="pb-frame" title={t("monitorTitle")} src={APP} hidden={tab !== "strata"} />}
         {tab === "status" && (
           <div className="pb-scroll">
             <StatusView status={status} failed={failed} />

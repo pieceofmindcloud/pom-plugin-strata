@@ -12,6 +12,11 @@
 //! `/v1/status`, `/load`): HTML pages get those quoted `/web/` paths rebased
 //! and load `/_pom/base.js` first, which puts the prefix back on same-origin
 //! `fetch`, `XMLHttpRequest` and `EventSource` calls that left without it.
+//!
+//! Strata's app (the web shell with chats, tasks and the agent, `src/app.rs`)
+//! is served under `/app/`: its page names the prefix in `__STRATA_HOST__`
+//! and loads `/_pom/app.js`, which moves every absolute same-origin address
+//! it asks for (calls, pictures, frames, links) under `<prefix>/app`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -64,9 +69,61 @@ const BASE_SCRIPT: &str = r#"(function () {
 })();
 "#;
 
+const APP_SCRIPT_PATH: &str = "/_pom/app.js";
+
+/// The base script for the app's page, plus the addresses the page writes into
+/// elements (`src`, `href`) and `window.open`: the app uses absolute paths
+/// (`/api/files/raw?...`, `/brand/...`) that must stay under its prefix.
+const APP_SCRIPT_EXTRA: &str = r#"(function () {
+  var prefix = "__PREFIX__";
+  function rebase(url) {
+    try {
+      var parsed = new URL(url, window.location.href);
+      if (parsed.origin !== window.location.origin) return url;
+      if (parsed.pathname === prefix || parsed.pathname.indexOf(prefix + "/") === 0) return url;
+      parsed.pathname = prefix + parsed.pathname;
+      return parsed.href;
+    } catch (error) {
+      return url;
+    }
+  }
+  function absolute(value) {
+    return typeof value === "string" && value.charAt(0) === "/" && value.charAt(1) !== "/";
+  }
+  function fix(element) {
+    if (!element || element.nodeType !== 1) return;
+    ["src", "href", "poster"].forEach(function (name) {
+      var value = element.getAttribute && element.getAttribute(name);
+      if (absolute(value)) {
+        var target = rebase(value);
+        if (target !== value) element.setAttribute(name, target);
+      }
+    });
+  }
+  new MutationObserver(function (records) {
+    records.forEach(function (record) {
+      if (record.type === "attributes") fix(record.target);
+      else record.addedNodes.forEach(function (node) {
+        fix(node);
+        if (node.querySelectorAll) node.querySelectorAll("[src],[href],[poster]").forEach(fix);
+      });
+    });
+  }).observe(document.documentElement, {subtree: true, childList: true, attributes: true, attributeFilter: ["src", "href", "poster"]});
+  var nativeWindowOpen = window.open;
+  window.open = function (url) {
+    var args = Array.prototype.slice.call(arguments);
+    if (typeof url === "string") args[0] = rebase(url);
+    return nativeWindowOpen.apply(window, args);
+  };
+})();
+"#;
+
 /// Where Strata answers right now, read on every request (the port changes
 /// when another model is loaded).
 pub type Upstream = Arc<dyn Fn() -> Option<(u16, String)> + Send + Sync>;
+
+/// Where Strata's app answers right now (`src/app.rs`), when it runs.
+pub type AppUpstream = Arc<dyn Fn() -> Option<u16> + Send + Sync>;
 
 pub struct UiServer {
     pub port: u16,
@@ -76,7 +133,7 @@ pub struct UiServer {
 }
 
 impl UiServer {
-    pub fn start(upstream: Upstream, token: String) -> Result<Self, String> {
+    pub fn start(upstream: Upstream, app: AppUpstream, token: String) -> Result<Self, String> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
         listener
             .set_nonblocking(true)
@@ -90,7 +147,7 @@ impl UiServer {
         let thread_token = token.clone();
         let thread = thread::Builder::new()
             .name("pom-plugin-strata-ui".into())
-            .spawn(move || serve(listener, upstream, thread_token, thread_stop))
+            .spawn(move || serve(listener, upstream, app, thread_token, thread_stop))
             .map_err(|error| error.to_string())?;
         Ok(Self {
             port,
@@ -110,17 +167,24 @@ impl Drop for UiServer {
     }
 }
 
-fn serve(listener: TcpListener, upstream: Upstream, token: String, stop: Arc<AtomicBool>) {
+fn serve(
+    listener: TcpListener,
+    upstream: Upstream,
+    app: AppUpstream,
+    token: String,
+    stop: Arc<AtomicBool>,
+) {
     let token = Arc::new(token);
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let upstream = Arc::clone(&upstream);
+                let app = Arc::clone(&app);
                 let token = Arc::clone(&token);
                 let _ = thread::Builder::new()
                     .name("pom-plugin-strata-ui-request".into())
                     .spawn(move || {
-                        let _ = handle(stream, &upstream, &token);
+                        let _ = handle(stream, &upstream, &app, &token);
                     });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -230,6 +294,30 @@ pub fn rewrite_page(html: &str, prefix: &str) -> String {
     }
 }
 
+/// The app's page: it names its prefix (`__STRATA_HOST__`, read by the app's
+/// API client) and loads the app script before anything else.
+pub fn rewrite_app_page(html: &str, app_prefix: &str) -> String {
+    let tag = format!(
+        "<script>window.__STRATA_HOST__=\"{app_prefix}\";</script><script src=\"{app_prefix}{APP_SCRIPT_PATH}\"></script>"
+    );
+    match html.find("<head>") {
+        Some(head) => {
+            let at = head + "<head>".len();
+            format!("{}{tag}{}", &html[..at], &html[at..])
+        }
+        None => format!("{tag}{html}"),
+    }
+}
+
+/// How `forward` treats an HTML answer under a prefix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pages {
+    /// Strata's own pages (`rewrite_page`).
+    Strata,
+    /// The app's page (`rewrite_app_page`).
+    App,
+}
+
 /// Headers that describe one connection, carry the browser's credentials or
 /// identity, or that this server sets itself.
 fn is_dropped_header(name: &str) -> bool {
@@ -258,7 +346,12 @@ fn is_dropped_header(name: &str) -> bool {
         || name.to_ascii_lowercase().starts_with("sec-fetch-")
 }
 
-fn handle(stream: TcpStream, upstream: &Upstream, token: &str) -> std::io::Result<()> {
+fn handle(
+    stream: TcpStream,
+    upstream: &Upstream,
+    app: &AppUpstream,
+    token: &str,
+) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -288,6 +381,54 @@ fn handle(stream: TcpStream, upstream: &Upstream, token: &str) -> std::io::Resul
             script.as_bytes(),
         );
     }
+    if request.path() == "/app" {
+        let location = format!("{prefix}/app/");
+        return write!(
+            stream,
+            "HTTP/1.1 308 Permanent Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+    }
+    if let Some(rest) = request.target.strip_prefix("/app/") {
+        let app_prefix = format!("{prefix}/app");
+        if request.path() == format!("/app{APP_SCRIPT_PATH}") {
+            let script = format!(
+                "{}\n{}",
+                BASE_SCRIPT.replace("__PREFIX__", &app_prefix),
+                APP_SCRIPT_EXTRA.replace("__PREFIX__", &app_prefix)
+            );
+            return respond(
+                &mut stream,
+                "200 OK",
+                "text/javascript; charset=utf-8",
+                script.as_bytes(),
+            );
+        }
+        let Some(port) = app() else {
+            let page = "<!doctype html><meta charset=utf-8><body style=\"font-family:sans-serif;padding:2rem\">\
+                        <h3>Strata's app is not running</h3><p>It starts with the plugin once the Strata runtime \
+                        and the agent are installed on this machine; the plugin screen's status says how far it is.</p></body>";
+            return respond(
+                &mut stream,
+                "503 Service Unavailable",
+                "text/html; charset=utf-8",
+                page.as_bytes(),
+            );
+        };
+        let inner = Request {
+            method: request.method.clone(),
+            target: format!("/{rest}"),
+            headers: request.headers.clone(),
+        };
+        return forward(
+            &mut stream,
+            &mut reader,
+            &inner,
+            port,
+            None,
+            &app_prefix,
+            Pages::App,
+        );
+    }
     let Some((port, key)) = upstream() else {
         let page = "<!doctype html><meta charset=utf-8><body style=\"font-family:sans-serif;padding:2rem\">\
                     <h3>Strata is not running</h3><p>Deploy a model on this machine with the Strata \
@@ -299,7 +440,15 @@ fn handle(stream: TcpStream, upstream: &Upstream, token: &str) -> std::io::Resul
             page.as_bytes(),
         );
     };
-    forward(&mut stream, &mut reader, &request, port, &key, &prefix)
+    forward(
+        &mut stream,
+        &mut reader,
+        &request,
+        port,
+        Some(&key),
+        &prefix,
+        Pages::Strata,
+    )
 }
 
 fn forward(
@@ -307,8 +456,9 @@ fn forward(
     reader: &mut BufReader<TcpStream>,
     request: &Request,
     port: u16,
-    key: &str,
+    key: Option<&str>,
     prefix: &str,
+    pages: Pages,
 ) -> std::io::Result<()> {
     if request.header("transfer-encoding").is_some() {
         return respond(
@@ -328,9 +478,10 @@ fn forward(
         .redirects(0)
         .build();
     let url = format!("http://127.0.0.1:{port}{}", request.target);
-    let mut call = agent
-        .request(&request.method, &url)
-        .set("Authorization", &format!("Bearer {key}"));
+    let mut call = agent.request(&request.method, &url);
+    if let Some(key) = key {
+        call = call.set("Authorization", &format!("Bearer {key}"));
+    }
     for (name, value) in &request.headers {
         if !is_dropped_header(name) {
             call = call.set(name, value);
@@ -367,7 +518,12 @@ fn forward(
             stream,
             &status,
             "text/html; charset=utf-8",
-            rewrite_page(&body, prefix).as_bytes(),
+            if pages == Pages::App {
+                rewrite_app_page(&body, prefix)
+            } else {
+                rewrite_page(&body, prefix)
+            }
+            .as_bytes(),
         );
     }
     write!(
@@ -423,6 +579,65 @@ mod tests {
     }
 
     #[test]
+    fn the_app_page_names_its_prefix_and_loads_the_app_script_first() {
+        let page = rewrite_app_page(
+            r#"<html><head><script src="./assets/index.js"></script></head></html>"#,
+            "/api/ui/plugins/strata/proxy/app",
+        );
+        assert!(page.starts_with(
+            r#"<html><head><script>window.__STRATA_HOST__="/api/ui/plugins/strata/proxy/app";</script><script src="/api/ui/plugins/strata/proxy/app/_pom/app.js"></script>"#
+        ));
+        assert!(page.contains(r#"src="./assets/index.js""#));
+    }
+
+    #[test]
+    fn app_paths_go_to_the_app_without_strata_key() {
+        let app = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let app_port = app.local_addr().unwrap().port();
+        let seen = thread::spawn(move || {
+            let (stream, _) = app.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let request = read_request(&mut reader).unwrap();
+            let mut stream = stream;
+            respond(
+                &mut stream,
+                "200 OK",
+                "text/html",
+                b"<html><head></head></html>",
+            )
+            .unwrap();
+            (
+                request.target.clone(),
+                request.header("authorization").map(str::to_owned),
+            )
+        });
+        let server = UiServer::start(
+            Arc::new(|| Some((1, "strata-key".into()))),
+            Arc::new(move || Some(app_port)),
+            "token-123".into(),
+        )
+        .unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        write!(
+            stream,
+            "GET /app/api/health?x=1 HTTP/1.1\r\nHost: x\r\n{TOKEN_HEADER}: token-123\r\n{PREFIX_HEADER}: /p\r\nAuthorization: Bearer browser\r\n\r\n"
+        )
+        .unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        let (target, authorization) = seen.join().unwrap();
+        assert_eq!(target, "/api/health?x=1");
+        assert_eq!(authorization, None);
+        assert!(answer.starts_with("HTTP/1.1 200"));
+        assert!(answer.contains(r#"window.__STRATA_HOST__="/p/app""#));
+        let mut redirect = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        write!(redirect, "GET /app HTTP/1.1\r\nHost: x\r\n{TOKEN_HEADER}: token-123\r\n{PREFIX_HEADER}: /p\r\n\r\n").unwrap();
+        let mut answer = String::new();
+        redirect.read_to_string(&mut answer).unwrap();
+        assert!(answer.starts_with("HTTP/1.1 308") && answer.contains("Location: /p/app/"));
+    }
+
+    #[test]
     fn the_browser_never_sends_credentials_or_its_origin_to_strata() {
         for name in [
             "Authorization",
@@ -455,7 +670,12 @@ mod tests {
 
     #[test]
     fn requests_need_the_token_and_strata_down_is_a_readable_page() {
-        let server = UiServer::start(Arc::new(|| None), "secret-token-123".into()).unwrap();
+        let server = UiServer::start(
+            Arc::new(|| None),
+            Arc::new(|| None),
+            "secret-token-123".into(),
+        )
+        .unwrap();
         let ask = |token: Option<&str>| {
             let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
             let token = token

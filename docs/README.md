@@ -103,12 +103,36 @@ that session, restores it and reads only the rest, then writes the answer.
   decode machine to read the prompt itself.
 - Turns with images or a typed decision skip the split.
 
+## Strata's app (agent)
+
+The plugin screen's **Agent** tab is Strata's own app (`apps/host` of the
+Strata source): chats, tasks, workspaces, skills, file previews and the
+DeepSeek Harness agent, which reads and writes files and runs commands in the
+workspace.
+
+- Its requests never go to Strata directly: its model connection, "POM", is
+  the POM's OpenAI endpoint with the key the POM hands to the plugin
+  (`host.configure`), so they reach any model the network serves, Strata's or
+  not, as any client's do. The tab works on a machine without a Strata engine.
+- The runtime carries the app and the portable Node.js it runs on
+  (`scripts/build-app.sh`, versions in `strata.lock`). The agent is installed
+  from npm on the node the first time the app starts (`@deepseek-ai/dsh` at
+  `DSH_VERSION`, about 850 MB), so neither the plugin library nor the runtime
+  carries it. The app downloads no engine and no model: the POM owns both.
+- The agent works in the POM's common workspace (`workspace_root`), or in
+  `<POM database dir>/strata/app/workspace`. It asks before it changes a file
+  or runs a command unless the chat's mode says otherwise. Anyone with the
+  plugin screen (an admin of this POM) can use it.
+
 ## Where things live on a node
 
 - `<POM database dir>/strata/packs/<model>` - the model prepared for Strata.
 - `<POM database dir>/strata/run/strata-server.log` - Strata's server log.
 - `<POM database dir>/strata/runtime/` - the downloaded Strata runtime of a
   release build.
+- `<POM database dir>/strata/app/` - the app's data (`home/`), the agent
+  (`harness/<version>`) and its default workspace; its log is
+  `run/strata-app.log`.
 
 ## Limits
 

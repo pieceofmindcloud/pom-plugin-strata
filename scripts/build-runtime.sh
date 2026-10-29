@@ -132,6 +132,9 @@ fi
   -v "$root/build:/out" \
   "$image"
 
+# Strata's app (web shell, host server and the Node.js it runs on), next to the engine and server
+"$root/scripts/build-app.sh" "$work" "$root/build/$runtime_dir"
+
 if ((archive)); then
   mkdir -p "$root/dist-release"
   asset="$root/dist-release/$asset_name"

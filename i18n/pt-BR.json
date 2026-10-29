@@ -33,5 +33,14 @@
   "copyLog": "Copiar log",
   "logCopied": "Log copiado",
   "logCopyFailed": "Não foi possível copiar o log",
-  "earlierStageHint": "Esta máquina roda um estágio anterior de um modelo dividido entre máquinas: só o motor do Strata, que entrega o trabalho das camadas dela à próxima máquina. O app do Strata, com o chat e o monitor, fica na máquina do último estágio, que atende as requisições."
+  "earlierStageHint": "Esta máquina roda um estágio anterior de um modelo dividido entre máquinas: só o motor do Strata, que entrega o trabalho das camadas dela à próxima máquina. O app do Strata, com o chat e o monitor, fica na máquina do último estágio, que atende as requisições.",
+  "tab.app": "Agente",
+  "appTitle": "App do Strata",
+  "app": "App do Strata",
+  "app.waiting": "aguardando",
+  "app.installing": "instalando",
+  "app.starting": "iniciando",
+  "app.ready": "rodando",
+  "app.error": "erro",
+  "app.unavailable": "ausente neste runtime"
 }

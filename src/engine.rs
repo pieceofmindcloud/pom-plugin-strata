@@ -250,14 +250,20 @@ impl LoadRequest {
                 }
                 None => None,
             },
-            mmproj_path: match value["mmproj_path"].as_str().filter(|path| !path.is_empty()) {
+            mmproj_path: match value["mmproj_path"]
+                .as_str()
+                .filter(|path| !path.is_empty())
+            {
                 Some(path) => {
                     let path = PathBuf::from(path);
                     if !path.is_absolute() {
                         return Err("mmproj_path must be absolute".into());
                     }
                     if !path.is_file() {
-                        return Err(format!("the vision projector {} is not on this machine", path.display()));
+                        return Err(format!(
+                            "the vision projector {} is not on this machine",
+                            path.display()
+                        ));
                     }
                     Some(path)
                 }
@@ -540,12 +546,12 @@ impl Drop for Engine {
 }
 
 /// A child process in its own group.
-struct Group {
+pub(crate) struct Group {
     child: Child,
 }
 
 impl Group {
-    fn spawn(command: &mut Command) -> std::io::Result<Self> {
+    pub(crate) fn spawn(command: &mut Command) -> std::io::Result<Self> {
         #[cfg(unix)]
         unsafe {
             use std::os::unix::process::CommandExt;
@@ -569,7 +575,17 @@ impl Group {
     /// node's log, which is what reaches the network's admins as the process
     /// log - the same path llama.cpp's lines take.
     fn forward_output(&mut self, log: &Path) {
-        let streams: Vec<Box<dyn std::io::Read + Send>> = [
+        for stream in self.take_output() {
+            let log = log.to_path_buf();
+            let _ = thread::Builder::new()
+                .name("pom-plugin-strata-output".into())
+                .spawn(move || copy_lines(stream, &log));
+        }
+    }
+
+    /// The child's stdout and stderr, once.
+    pub(crate) fn take_output(&mut self) -> Vec<Box<dyn std::io::Read + Send>> {
+        [
             self.child
                 .stdout
                 .take()
@@ -581,16 +597,10 @@ impl Group {
         ]
         .into_iter()
         .flatten()
-        .collect();
-        for stream in streams {
-            let log = log.to_path_buf();
-            let _ = thread::Builder::new()
-                .name("pom-plugin-strata-output".into())
-                .spawn(move || copy_lines(stream, &log));
-        }
+        .collect()
     }
 
-    fn exited(&mut self) -> Option<std::process::ExitStatus> {
+    pub(crate) fn exited(&mut self) -> Option<std::process::ExitStatus> {
         self.child.try_wait().ok().flatten()
     }
 
@@ -602,7 +612,7 @@ impl Group {
     }
 
     /// Asks the group to end, then forces it after `grace`.
-    fn stop(mut self, grace: Duration) {
+    pub(crate) fn stop(mut self, grace: Duration) {
         #[cfg(unix)]
         self.signal(libc::SIGTERM);
         #[cfg(not(unix))]
@@ -1573,8 +1583,14 @@ mod tests {
         .unwrap();
         assert_eq!(threshold.prefill_min_tokens, Some(2048));
         assert!(role("other").is_err());
-        assert!(LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "mmproj_path": "rel.gguf"})).is_err());
-        assert!(LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "mmproj_path": "/no/such/mmproj.gguf"})).is_err());
+        assert!(LoadRequest::from_json(
+            &json!({"model_path": "/m/x.gguf", "mmproj_path": "rel.gguf"})
+        )
+        .is_err());
+        assert!(LoadRequest::from_json(
+            &json!({"model_path": "/m/x.gguf", "mmproj_path": "/no/such/mmproj.gguf"})
+        )
+        .is_err());
         assert!(LoadRequest::from_json(&json!({})).is_err());
     }
 

@@ -12,12 +12,14 @@
 //! The library only supervises. Strata's engine, server and pack tools live in
 //! a runtime directory built by `scripts/build-runtime.sh` (`runtime`).
 
+pub mod app;
 pub mod engine;
 pub mod gguf;
 pub mod proxy;
 pub mod runtime;
 pub mod settings;
 
+use app::{App, Gateway};
 use engine::{Engine, LoadRequest};
 use proxy::UiServer;
 use serde_json::{json, Value};
@@ -74,6 +76,8 @@ struct PluginState {
     /// An error when the plugin has no directory to work in.
     engine: Result<Arc<Engine>, String>,
     ui: Option<UiServer>,
+    /// Strata's app (`app.rs`), when the plugin has a directory.
+    app: Option<Arc<App>>,
 }
 
 include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
@@ -132,7 +136,14 @@ fn query_inner(state: &PluginState, request: &[u8]) -> Result<Value, String> {
     match request["operation"].as_str().unwrap_or_default() {
         // Nothing of the node context is needed: the model path comes with
         // the deployment.
-        "host.configure" | "host.event" => Ok(json!({"status": "ok"})),
+        "host.event" => Ok(json!({"status": "ok"})),
+        // The POM's OpenAI endpoint and key: Strata's app sends its requests there.
+        "host.configure" => {
+            if let (Some(app), Some(gateway)) = (&state.app, Gateway::from_configure(&request)) {
+                app.configure(gateway);
+            }
+            Ok(json!({"status": "ok"}))
+        }
         // The inference service this machine offers, and the architectures
         // it runs, for the dashboard and the deploy screen.
         "host.services" => match &state.engine {
@@ -167,6 +178,9 @@ fn query_inner(state: &PluginState, request: &[u8]) -> Result<Value, String> {
             let mut status = engine.snapshot().status_json();
             if request["profile"] == "admin" {
                 status["log"] = json!(engine.log_tail(500));
+            }
+            if let Some(app) = &state.app {
+                status["app"] = app.status_json();
             }
             Ok(status)
         }
@@ -203,15 +217,29 @@ unsafe extern "C" fn create(_: HostCallbacks, config: ByteSlice) -> PluginHandle
             serde_json::from_slice::<Value>(config).map_err(|error| error.to_string())?;
         }
         let engine = engine::plugin_directory().map(|base| Arc::new(Engine::start(base)));
+        let app = match (&engine, engine::plugin_directory()) {
+            (Ok(engine), Ok(base)) => {
+                let engine = Arc::clone(engine);
+                let runtime: app::RuntimeDir = Arc::new(move || {
+                    let snapshot = engine.snapshot();
+                    snapshot.runtime.or(snapshot.runtime_hip)
+                });
+                Some(Arc::new(App::start(base, runtime)))
+            }
+            _ => None,
+        };
         let ui = engine.as_ref().ok().and_then(|engine| {
             let engine = Arc::clone(engine);
             let upstream: proxy::Upstream = Arc::new(move || {
                 let snapshot = engine.snapshot();
                 snapshot.port.map(|port| (port, snapshot.api_key.clone()))
             });
-            UiServer::start(upstream, ui_token()).ok()
+            let app_port = app.clone();
+            let app_upstream: proxy::AppUpstream =
+                Arc::new(move || app_port.as_ref().and_then(|app| app.port()));
+            UiServer::start(upstream, app_upstream, ui_token()).ok()
         });
-        let state = PluginState { engine, ui };
+        let state = PluginState { engine, ui, app };
         Ok::<_, String>(Box::into_raw(Box::new(state)).cast::<c_void>())
     }));
     match result {
@@ -257,9 +285,10 @@ unsafe extern "C" fn free_buffer(buffer: ByteBuffer) {
 unsafe extern "C" fn shutdown(handle: PluginHandle) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !handle.is_null() {
-            // The interface server first, then Strata and its manager thread.
+            // The interface server first, then the app, then Strata and its manager thread.
             let mut state = Box::from_raw(handle.cast::<PluginState>());
             state.ui = None;
+            state.app = None;
             drop(state);
         }
     }));
@@ -295,6 +324,7 @@ mod tests {
         PluginState {
             engine: Err("no plugin directory".into()),
             ui: None,
+            app: None,
         }
     }
 
