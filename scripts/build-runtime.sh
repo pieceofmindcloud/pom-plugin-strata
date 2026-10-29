@@ -126,6 +126,7 @@ fi
   -e STRATA_COMMIT="$STRATA_COMMIT" \
   -e LLAMA_CPP_COMMIT="$LLAMA_CPP_COMMIT" \
   -e RUNTIME_VERSION="$version" \
+  -e CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-4G}" \
   -v "$work:/src:ro" \
   -v "$root:/plugin:ro" \
   -v "$root/build/cache:/work" \

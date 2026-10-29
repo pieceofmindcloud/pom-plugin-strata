@@ -78,11 +78,19 @@ in ROCm's image into `build/runtime-hip` (with `--native` and `ROCM_PATH`, on
 the host, e.g. with AMD's TheRock wheels), carrying the ROCm libraries the
 engine needs.
 
+**Runtimes** are built by the `Build Strata runtime` workflow
+(`.github/workflows/runtime.yml`, 50+ minutes): both runtimes for the NVIDIA and
+AMD families, on their own runners, from the head of the Strata branch
+`strata.lock` names, published to the release `strata-runtime` (replacing the
+previous ones; its `RUNTIME.txt` names their Strata commit). The compiler cache
+(ccache) is kept in the Actions cache per backend, so a build after a small
+change in Strata compiles only what changed. Run it when Strata changes.
+
 **Releases** are made by the `Publish release` workflow
-(`.github/workflows/release.yml`): it builds both runtimes for the NVIDIA and
-AMD families on their own runners and attaches four files to the GitHub
-release `v<version>`: the library, `pom-plugin-linux-x86_64.json`,
-`strata-runtime-linux-x86_64.tar.gz` and
+(`.github/workflows/release.yml`, a few minutes): it takes the runtimes of
+`strata-runtime` (or, with `build_runtime`, builds them first) and attaches four
+files to the GitHub release `v<version>`: the library,
+`pom-plugin-linux-x86_64.json`, `strata-runtime-linux-x86_64.tar.gz` and
 `strata-runtime-hip-linux-x86_64.tar.gz`, whose URLs, sizes and SHA-256 the
 library pins; a node downloads and verifies the runtime its GPUs need on first
 use.

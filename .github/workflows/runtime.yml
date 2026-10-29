@@ -1,0 +1,117 @@
+name: Build Strata runtime
+
+# The Strata runtimes (engine, server, app and their Python packages), built
+# from the head of the Strata branch strata.lock names: CUDA for the NVIDIA
+# families a POM node may have, and HIP for the AMD ones, each on a runner of
+# its own (each image needs most of a runner's disk). They are published to the
+# release `strata-runtime`, replacing the previous ones, where the plugin
+# release (release.yml) takes them without building them again.
+#
+# The compiler cache (ccache, build/cache/ccache) is kept in the Actions cache
+# per backend, so a build after a small change in Strata compiles only what
+# changed.
+on:
+  workflow_dispatch:
+  # release.yml calls it when asked to build the runtimes too
+  workflow_call:
+
+permissions:
+  contents: write
+
+env:
+  # Turing to Blackwell: what CUDA 13 compiles for.
+  CUDA_ARCHITECTURES: '75;80;86;89;90;100;120'
+  # RDNA2 to RDNA4 and Strix Halo, the wave32 families Strata's HIP kernels target.
+  HIP_ARCHITECTURES: 'gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201'
+
+jobs:
+  runtime:
+    name: Runtime ${{ matrix.backend }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - backend: cuda
+            flags: ''
+            asset: strata-runtime-linux-x86_64.tar.gz
+          - backend: hip
+            flags: '--hip'
+            asset: strata-runtime-hip-linux-x86_64.tar.gz
+    steps:
+      # The CUDA and ROCm build images take tens of GB.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The newest cache of this backend comes back; this run saves its own at the end.
+      - name: Compiler cache
+        uses: actions/cache@v4
+        with:
+          path: build/cache/ccache
+          key: ccache-${{ matrix.backend }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.backend }}-
+
+      - name: Build the ${{ matrix.backend }} runtime
+        shell: bash
+        run: |
+          # no version: a runtime serves several plugin releases, and RUNTIME.json names its Strata commit
+          ./scripts/build-runtime.sh --archive ${{ matrix.flags }}
+          test -f "dist-release/${{ matrix.asset }}"
+        env:
+          BUILD_JOBS: '4'
+          # two backends share the repository's 10 GB of Actions cache
+          CCACHE_MAXSIZE: '3G'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-${{ matrix.backend }}
+          path: dist-release/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish to strata-runtime
+    needs: runtime
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-*
+          path: runtimes
+          merge-multiple: true
+
+      - name: Describe the runtimes
+        shell: bash
+        run: |
+          {
+            for archive in runtimes/*.tar.gz; do
+              printf '%s\n' "$(basename "$archive")"
+              tar -xzOf "$archive" runtime/RUNTIME.json
+              printf 'sha256 %s\n\n' "$(sha256sum "$archive" | cut -d' ' -f1)"
+            done
+          } | tee runtimes/RUNTIME.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: strata-runtime
+          name: Strata runtime (latest build)
+          prerelease: true
+          make_latest: false
+          body_path: runtimes/RUNTIME.txt
+          files: |
+            runtimes/strata-runtime-linux-x86_64.tar.gz
+            runtimes/strata-runtime-hip-linux-x86_64.tar.gz
+            runtimes/RUNTIME.txt

@@ -1,9 +1,10 @@
 name: Publish release
 
-# Manual entry point. The Strata runtime is built twice, on runners of their
-# own (each image needs most of a runner's disk): CUDA for the NVIDIA families
-# a POM node may have, and HIP for the AMD ones. The library is then built
-# pinned to both archives, and the three go to the GitHub release v<version>.
+# Manual entry point. The library is built pinned to the two Strata runtimes
+# (CUDA and HIP) and the three go to the GitHub release v<version>. The
+# runtimes are the latest ones of the release `strata-runtime`, which
+# runtime.yml builds (50+ minutes); with "build_runtime" this run builds them
+# first, the same way.
 on:
   workflow_dispatch:
     inputs:
@@ -15,67 +16,25 @@ on:
         description: 'Publish as a prerelease'
         type: boolean
         default: true
+      build_runtime:
+        description: 'Build the Strata runtimes first (else: the latest of the strata-runtime release)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
-env:
-  # Turing to Blackwell: what CUDA 13 compiles for.
-  CUDA_ARCHITECTURES: '75;80;86;89;90;100;120'
-  # RDNA2 to RDNA4 and Strix Halo, the wave32 families Strata's HIP kernels target.
-  HIP_ARCHITECTURES: 'gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201'
-
 jobs:
   runtime:
-    name: Runtime ${{ matrix.backend }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - backend: cuda
-            flags: ''
-            asset: strata-runtime-linux-x86_64.tar.gz
-          - backend: hip
-            flags: '--hip'
-            asset: strata-runtime-hip-linux-x86_64.tar.gz
-    steps:
-      # The CUDA and ROCm build images take tens of GB.
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Build the ${{ matrix.backend }} runtime
-        shell: bash
-        run: |
-          ./scripts/build-runtime.sh --archive --version "${{ inputs.version }}" ${{ matrix.flags }}
-          test -f "dist-release/${{ matrix.asset }}"
-        env:
-          RUNTIME_VERSION: ${{ inputs.version }}
-          BUILD_JOBS: '4'
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: runtime-${{ matrix.backend }}
-          path: dist-release/${{ matrix.asset }}
-          if-no-files-found: error
-          retention-days: 1
+    name: Strata runtimes
+    if: ${{ inputs.build_runtime }}
+    uses: ./.github/workflows/runtime.yml
 
   package:
     name: Package ${{ inputs.version }}
     needs: runtime
+    # the runtimes were built by this run, or are taken from strata-runtime
+    if: ${{ !cancelled() && (needs.runtime.result == 'success' || needs.runtime.result == 'skipped') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -94,10 +53,28 @@ jobs:
           cache-dependency-path: ui/package-lock.json
 
       - uses: actions/download-artifact@v4
+        if: ${{ inputs.build_runtime }}
         with:
           pattern: runtime-*
           path: runtimes
           merge-multiple: true
+
+      - name: Take the latest runtimes
+        if: ${{ !inputs.build_runtime }}
+        shell: bash
+        run: |
+          gh release download strata-runtime --repo "${{ github.repository }}" --dir runtimes \
+            --pattern 'strata-runtime-linux-x86_64.tar.gz' --pattern 'strata-runtime-hip-linux-x86_64.tar.gz' \
+            || { echo 'no runtimes in the strata-runtime release: run "Build Strata runtime" first, or this one with build_runtime' >&2; exit 1; }
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Runtimes in this release
+        shell: bash
+        run: |
+          for archive in runtimes/*.tar.gz; do
+            echo "$(basename "$archive"): $(tar -xzOf "$archive" runtime/RUNTIME.json | tr -d '\n ')"
+          done
 
       - name: Build and package
         id: package
@@ -129,7 +106,8 @@ jobs:
     name: License server v${{ inputs.version }}
     needs: package
     # Prereleases never reach the license server.
-    if: ${{ !inputs.prerelease }}
+    # (the runtimes job may be skipped: only the package's result counts)
+    if: ${{ !cancelled() && needs.package.result == 'success' && !inputs.prerelease }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

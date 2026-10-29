@@ -19,6 +19,17 @@ rocm="${ROCM_PATH:-/opt/rocm}"
 build="$work/build-hip"
 out="${OUT_DIR:-/out}/runtime-hip"
 
+# ccache, kept in the mounted work cache (CI restores it between runs): a rebuild compiles only what changed.
+# The source is unpacked fresh every build, so files are compared by content, not by time.
+launcher=()
+if command -v ccache >/dev/null 2>&1; then
+  export CCACHE_DIR="${CCACHE_DIR:-$work/ccache}" CCACHE_BASEDIR="$src" CCACHE_NOHASHDIR=1 CCACHE_COMPILERCHECK=content \
+    CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros,pch_defines CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-4G}"
+  launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache)
+  ccache --zero-stats >/dev/null
+fi
+
 rm -rf "$out.tmp"
 mkdir -p "$out.tmp/engine" "$out.tmp/strata" "$out.tmp/lib" "$build"
 
@@ -29,7 +40,7 @@ bitcode="$rocm/amdgcn/bitcode"
 [[ -d "$bitcode" ]] || bitcode="$rocm/lib/llvm/amdgcn/bitcode"
 
 echo "== engine: ROCm $(cat "$rocm/.info/version" 2>/dev/null || echo '?'), archs $archs"
-cmake -G Ninja -S "$src" -B "$build" \
+cmake -G Ninja "${launcher[@]}" -S "$src" -B "$build" \
   -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_HIP=ON \
   -DSTRATA_ENABLE_CUDA=OFF \
@@ -106,7 +117,7 @@ echo "   $(du -sh "$out.tmp/lib" | cut -f1) in lib/"
 # The vision encoder (llama.cpp's mtmd at the engine's pinned commit) runs on the CPU: the plugin reads images there,
 # so the model keeps the whole card (engine.rs, the config's vision section). Portable: AVX2 baseline, no OpenMP.
 echo "== vision encoder"
-cmake -G Ninja -S /src/tools/vision -B /work/build-vision \
+cmake -G Ninja "${launcher[@]}" -S /src/tools/vision -B /work/build-vision \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLAMA_DIR=/src/third_party/llama.cpp \
   -DSTRATA_PORTABLE=ON \
@@ -157,4 +168,5 @@ PY
 
 rm -rf "$out"
 mv "$out.tmp" "$out"
+[[ ${#launcher[@]} -eq 0 ]] || ccache --show-stats | sed -n '1,12p'
 echo "== runtime ready: $out"
