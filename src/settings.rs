@@ -206,6 +206,12 @@ fn all() -> Vec<Setting> {
             ("Lazy load", "Starts without loading the model; the first request loads it (text only)."),
             ("Carga sob demanda", "Sobe sem carregar o modelo; a primeira requisição o carrega (só texto)."),
         ),
+        setting(
+            "mtp",
+            "boolean",
+            ("Draft layer (MTP)", "Off starts the engine without it: about 1 GB less VRAM, fewer words per second (empty or on: as installed)."),
+            ("Camada de rascunho (MTP)", "Desligada, o motor sobe sem ela: cerca de 1 GB a menos de VRAM, menos palavras por segundo (vazio ou ligada: como instalado)."),
+        ),
         Setting {
             min: Some(0.0),
             ..setting(
@@ -286,11 +292,11 @@ mod tests {
     fn the_schema_names_every_key_once_with_both_languages() {
         let schema = schema();
         let entries = schema.as_array().unwrap();
-        assert_eq!(entries.len(), 19);
+        assert_eq!(entries.len(), 20);
         let mut keys: Vec<&str> = entries.iter().map(|e| e["key"].as_str().unwrap()).collect();
         keys.sort();
         keys.dedup();
-        assert_eq!(keys.len(), 19);
+        assert_eq!(keys.len(), 20);
         for entry in entries {
             assert!(entry["label"]["en"].is_string() && entry["label"]["pt-BR"].is_string());
         }
