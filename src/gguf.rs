@@ -18,6 +18,8 @@ pub const STRATA_ARCHITECTURE: &str = "qwen4exp";
 pub const QWEN36_ARCHITECTURE: &str = "qwen35moe";
 /// Every architecture this plugin offers to run.
 pub const ARCHITECTURES: [&str; 2] = [STRATA_ARCHITECTURE, QWEN36_ARCHITECTURE];
+/// The architectures this plugin also runs as POM slices across machines.
+pub const STAGE_ARCHITECTURES: [&str; 1] = [STRATA_ARCHITECTURE];
 /// The n-gram (per-layer embedding) table Strata reads from its own shard.
 pub const PLE_TENSOR: &str = "per_layer_token_embd.weight";
 
@@ -267,10 +269,12 @@ pub fn inspect(first: &Path) -> Result<Model, String> {
     let header = read_header(first).map_err(|error| format!("{}: {error}", first.display()))?;
     let architecture = match header.architecture.as_deref() {
         Some(arch) if ARCHITECTURES.contains(&arch) => arch.to_owned(),
-        Some(other) => return Err(format!(
+        Some(other) => {
+            return Err(format!(
             "Strata runs the {STRATA_ARCHITECTURE} (Qwen3.8-Flash-Next) and {QWEN36_ARCHITECTURE} \
                  (Qwen3.6-35B-A3B) architectures; this model is {other}"
-        )),
+        ))
+        }
         None => return Err("the model declares no architecture".into()),
     };
     let stage = match (

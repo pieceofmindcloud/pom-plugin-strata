@@ -421,6 +421,8 @@ impl Snapshot {
             "architectures": gguf::ARCHITECTURES,
             // A POM slice of a model runs as one stage of a split across machines.
             "stages": true,
+            // Only Flash-Next runs in slices: the POM offers Qwen3.6 as the whole model only (stage_architectures).
+            "stage_architectures": gguf::STAGE_ARCHITECTURES,
             // The POM settings that apply to those stages (the nodes carry the hidden state between them), and the
             // prefill/decode role of a machine that runs the whole model.
             "pom_settings": [
