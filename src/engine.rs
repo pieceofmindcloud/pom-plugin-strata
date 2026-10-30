@@ -220,7 +220,7 @@ impl LoadRequest {
             .map(|slots| slots.min(64) as u32);
         let role = match value["role"].as_str() {
             None | Some("both") => None,
-            Some(role @ ("prefill" | "decode")) => Some(role.to_owned()),
+            Some(role @ ("prefill" | "shared")) => Some(role.to_owned()),
             Some(other) => return Err(format!("unknown inference role {other}")),
         };
         let prefill_min_tokens = value["prefill_min_tokens"]
@@ -938,7 +938,7 @@ impl Manager {
     }
 
     /// The load once the runtime of its backend is here.
-    fn load_with(&mut self, runtime: PathBuf, request: LoadRequest) {
+    fn load_with(&mut self, runtime: PathBuf, mut request: LoadRequest) {
         let model = match gguf::inspect(&request.model_path) {
             Ok(model) => model,
             Err(error) => return self.fail(error),
@@ -963,10 +963,20 @@ impl Manager {
             }
         }
         let qwen36 = model.architecture == gguf::QWEN36_ARCHITECTURE;
-        if qwen36 && request.role.is_some() {
+        // Qwen3.6's engine has no batch slots to hand a prompt over in: a prefill machine cannot work, but a machine
+        // that only shares the whole model with others answers on its own, without sessions
+        if qwen36 && request.role.as_deref() == Some("prefill") {
             return self.fail(
-                "the prefill/decode split runs Qwen3.8-Flash-Next only; deploy Qwen3.6-35B-A3B without it".into(),
+                "a prefill machine runs Qwen3.8-Flash-Next only; give this Qwen3.6-35B-A3B machine the prefill and \
+                 decode role"
+                    .into(),
             );
+        }
+        if qwen36 && request.role.is_some() {
+            self.append_log(
+                "Qwen3.6-35B-A3B shares no sessions with the other machines: each one reads its own prompts",
+            );
+            request.role = None;
         }
         let pack = self.pack_dir(&request.model_path);
         if pack_ready(&pack, &model) {
@@ -1639,6 +1649,8 @@ mod tests {
             |role: &str| LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "role": role}));
         assert_eq!(role("prefill").unwrap().role.as_deref(), Some("prefill"));
         assert_eq!(role("both").unwrap().role, None);
+        assert_eq!(role("shared").unwrap().role.as_deref(), Some("shared"));
+        assert!(role("decode").is_err());
         let threshold = LoadRequest::from_json(
             &json!({"model_path": "/m/x.gguf", "role": "prefill", "prefill_min_tokens": 2048}),
         )

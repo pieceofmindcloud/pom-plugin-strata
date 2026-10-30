@@ -142,7 +142,8 @@ def in_flight_count() -> int:
 # re-reads its prompt faster than the save and the sync cost.
 MIN_SESSION_TOKENS = 8000
 
-# The deployment's prefill/decode role (`inference_role`: "prefill", "decode", or None for both; apply_pom_settings).
+# The deployment's prefill/decode role (`inference_role`: "prefill", "shared" - a machine that shares the whole model with
+# others, which the POM gives every one not set to prefill - or None for a machine alone; apply_pom_settings).
 ROLE = None
 # A prefill machine reads a prompt for the decode machine only when the part that machine lacks (the prompt less what
 # it already holds of the conversation, `decode_holds`) has this many tokens: below it, the decode machine reads it
@@ -1269,7 +1270,7 @@ def apply_pom_settings(argv: list[str]) -> None:
     SESSIONS_ON = bool(settings.pop("session_save", False))
     # the prefill/decode role is the bridge's own too; the split hands the prompt's state over as a session
     role = settings.pop("inference_role", None)
-    ROLE = role if role in ("prefill", "decode") else None
+    ROLE = role if role in ("prefill", "shared") else None
     # the deployment's threshold of the split (POM settings, prefill_min_tokens), over the environment's
     threshold = settings.pop("prefill_min_tokens", None)
     if isinstance(threshold, int) and not isinstance(threshold, bool) and threshold >= 0:
