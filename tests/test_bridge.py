@@ -49,6 +49,13 @@ def test_the_poms_ceiling_fits_the_room_the_templated_prompt_leaves():
     assert B.fit_budget(0, 249926) == 249926
 
 
+
+def test_the_bridge_times_its_part_of_a_turn():
+    t = B.bridge_timings(10.0, 10.25, 10.3, 11.3)
+    assert t == {"prepare_ms": 250.0, "restore_ms": 50.0, "first_token_ms": 1000.0}
+    assert B.bridge_timings(10.0, 10.0, 10.0, None)["first_token_ms"] is None
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

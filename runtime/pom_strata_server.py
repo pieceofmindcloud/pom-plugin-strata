@@ -197,12 +197,21 @@ def batch_engine(svc):
     return engine if engine is not None and getattr(engine, "batch", 0) else None
 
 
-def restore_for_prompt(svc, ids: list[int]) -> None:
+def restore_for_prompt(svc, ids: list[int], session: str | None = None) -> None:
     """Before a turn: a saved session that starts the prompt further than any slot holds it is restored into a free
-    slot, so the engine reads only the rest.  A session that cannot be restored leaves the slots as they were."""
+    slot, so the engine reads only the rest.  A session that cannot be restored leaves the slots as they were.  The
+    turn's own conversation parked in a slot skips the disk: its saves come from that slot, so no file holds more."""
     engine = batch_engine(svc)
     if engine is None or not svc.loaded():
         return
+    if session is not None:
+        with engine.slot_cv:
+            parked = any(k == session and P.reuse_len(ids, engine.slot_held[slot]) > 0
+                         for slot, (k, _) in slot_bases.items() if slot < len(engine.slot_held))
+        if parked:
+            print(f"pom: session {session} is parked in a slot: the saved sessions are not read",
+                  file=sys.stderr, flush=True)
+            return
     sessions = P.read_sessions(session_dir())
     if not sessions:
         return
@@ -639,6 +648,15 @@ SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "
                  "repeat_penalty", "seed")
 
 
+def bridge_timings(started: float, prepared: float, restored: float, first_event: float | None) -> dict:
+    """The bridge's part of a turn, in ms: `prepare_ms` (load check, template, tokens), `restore_ms` (the saved session
+    restore), and `first_token_ms` from the engine's start to its first answer piece; that one less the engine's own
+    `prompt_ms` is the admission (a parked conversation copied into its slot) the engine does not time."""
+    ms = lambda a, b: round((b - a) * 1000, 1)  # noqa: E731
+    return {"prepare_ms": ms(started, prepared), "restore_ms": ms(prepared, restored),
+            "first_token_ms": ms(restored, first_event) if first_event is not None else None}
+
+
 def generation_request(req: dict) -> tuple[str, bool, bool, int, dict]:
     """(prompt, chat_template, thinking, max_tokens, sampling) of a /pom/generate body; ValueError if malformed."""
     prompt = req.get("prompt")
@@ -1057,6 +1075,7 @@ def make_handler(original):
                 if prefill_only and session is None:
                     raise ValueError("'prefill_only' needs a session, and the sessions on (inference_role or "
                                      "session_save)")
+                started_at = time.monotonic()
                 self.record = svc.begin_request("/pom/generate", {"model": svc.model, "stream": True,
                                                                   "max_tokens": max_tokens})
                 # a decision probe (POM /v1/systemone): the label distribution of the first generated token
@@ -1123,8 +1142,12 @@ def make_handler(original):
                     return
                 svc.engine.last_probe = None
                 svc.engine.probe_request = probe_groups(svc, labels) if labels and not prefill_only else None
+                # the bridge's own time before the engine runs, reported in the done line (`pom_timings`): the
+                # template and tokens, then the restore of a saved session
+                prepared_at = time.monotonic()
                 if SESSIONS_ON:
-                    restore_for_prompt(svc, list(ids))
+                    restore_for_prompt(svc, list(ids), session)
+                restored_at = time.monotonic()
                 cancel = threading.Event()
                 self._watch_client(cancel)
                 self.send_response(200)
@@ -1157,6 +1180,7 @@ def make_handler(original):
                     turn["ran"] = True
                     turn["deferred"] = defer_save(svc, session, list(ids), slot, held)
                 pending_done = None
+                first_event_at = None
 
                 def write_done(x) -> None:
                     # the turn's save is deferred in its slot window (the hook above); the done line says so
@@ -1179,6 +1203,7 @@ def make_handler(original):
                         "cached_tokens": x.get("reused") or 0,
                         "timings": x.get("timings"),
                         "stop_sequence": x.get("stop_sequence"),
+                        "pom_timings": bridge_timings(started_at, prepared_at, restored_at, first_event_at),
                     }})
 
                 # A prefill turn runs without the thinking budget: its one token would reach a budget capped at 1, and
@@ -1196,6 +1221,8 @@ def make_handler(original):
                         elif kind == "event":
                             event = None if prefill_only else pom_event(x)
                             if event is not None:
+                                if first_event_at is None:
+                                    first_event_at = time.monotonic()
                                 field, text = event
                                 self._line({field: text})
                         elif kind == "done":
