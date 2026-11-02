@@ -104,7 +104,9 @@ use.
 - **DeepSeek-V4.1-Flash** (`deepseek41`) runs on `engine/strata-dsv41`, from a
   pack of its own (`tools/dsv41/pack_gguf.py`), whole or as POM slices. The only
   valid cut of the published model is layer 20. It runs text only, without saved
-  sessions, a drafter or the prefill/decode split. A prompt chunk of a split is
+  sessions or the prefill/decode split. A DSpark drafter in
+  `mtp/dspark-deepseek41/dspark-*.gguf`, beside the model's folder, is packed and
+  turned on for the stage with the head. A prompt chunk of a split is
   at most 512 rows, one at a time. **The split's output has not been compared
   with the whole model's yet.**
 - Linux x86_64 with NVIDIA cards of compute capability 7.5 or newer (CUDA) or
