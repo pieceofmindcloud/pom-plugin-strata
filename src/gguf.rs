@@ -16,10 +16,17 @@ pub const STRATA_ARCHITECTURE: &str = "qwen4exp";
 /// Qwen3.6-35B-A3B: Strata's engine runs it on a path of its own, from the
 /// GGUF as it is (no pack), with the file's own MTP block.
 pub const QWEN36_ARCHITECTURE: &str = "qwen35moe";
+/// DeepSeek-V4.1-Flash: an engine of its own (`engine/strata-dsv41`) and a pack
+/// of its own (`tools/dsv41/pack_gguf.py`), from the GGUF's shards.
+pub const DEEPSEEK41_ARCHITECTURE: &str = "deepseek41";
 /// Every architecture this plugin offers to run.
-pub const ARCHITECTURES: [&str; 2] = [STRATA_ARCHITECTURE, QWEN36_ARCHITECTURE];
+pub const ARCHITECTURES: [&str; 3] = [
+    STRATA_ARCHITECTURE,
+    QWEN36_ARCHITECTURE,
+    DEEPSEEK41_ARCHITECTURE,
+];
 /// The architectures this plugin also runs as POM slices across machines.
-pub const STAGE_ARCHITECTURES: [&str; 1] = [STRATA_ARCHITECTURE];
+pub const STAGE_ARCHITECTURES: [&str; 2] = [STRATA_ARCHITECTURE, DEEPSEEK41_ARCHITECTURE];
 /// The n-gram (per-layer embedding) table Strata reads from its own shard.
 pub const PLE_TENSOR: &str = "per_layer_token_embd.weight";
 
@@ -271,8 +278,9 @@ pub fn inspect(first: &Path) -> Result<Model, String> {
         Some(arch) if ARCHITECTURES.contains(&arch) => arch.to_owned(),
         Some(other) => {
             return Err(format!(
-            "Strata runs the {STRATA_ARCHITECTURE} (Qwen3.8-Flash-Next) and {QWEN36_ARCHITECTURE} \
-                 (Qwen3.6-35B-A3B) architectures; this model is {other}"
+            "Strata runs the {STRATA_ARCHITECTURE} (Qwen3.8-Flash-Next), {QWEN36_ARCHITECTURE} \
+                 (Qwen3.6-35B-A3B) and {DEEPSEEK41_ARCHITECTURE} (DeepSeek-V4.1-Flash) architectures; \
+                 this model is {other}"
         ))
         }
         None => return Err("the model declares no architecture".into()),
@@ -413,6 +421,42 @@ mod tests {
         let second = dir.join("m-00002-of-00003.gguf");
         write_model(&second, "qwen4exp", &[], &[]);
         assert!(inspect(&second).unwrap_err().contains("first part"));
+    }
+
+    #[test]
+    fn deepseek41_runs_from_its_shards_or_as_a_stage() {
+        let dir = temp_dir("deepseek41");
+        let whole = dir.join("ds41-00001-of-00002.gguf");
+        write_model(
+            &whole,
+            "deepseek41",
+            &[("split.count", 2)],
+            &["blk.0.attn_q.weight"],
+        );
+        write_model(
+            &dir.join("ds41-00002-of-00002.gguf"),
+            "deepseek41",
+            &[],
+            &[PLE_TENSOR],
+        );
+        let model = inspect(&whole).unwrap();
+        assert_eq!(model.architecture, DEEPSEEK41_ARCHITECTURE);
+        assert_eq!(model.shards.len(), 2);
+        assert!(STAGE_ARCHITECTURES.contains(&DEEPSEEK41_ARCHITECTURE));
+
+        let slice = dir.join("ds41-slice.gguf");
+        write_model(
+            &slice,
+            "deepseek41",
+            &[
+                ("pom.start_layer", 20),
+                ("pom.end_layer", 39),
+                ("pom.original_block_count", 40),
+            ],
+            &[],
+        );
+        let stage = inspect(&slice).unwrap().stage.unwrap();
+        assert!(stage.last() && !stage.first());
     }
 
     #[test]
