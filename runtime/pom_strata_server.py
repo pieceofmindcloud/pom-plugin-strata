@@ -1300,7 +1300,7 @@ def apply_pom_settings(argv: list[str]) -> None:
         print(f"[pom] engine settings: {', '.join(changed) or 'no change'}", flush=True)
     # the same setting turns on the engine's asynchronous session write (SAVING, then the file on a thread)
     args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
-    if SESSIONS_ON and "--session-async-save" not in args:
+    if SESSIONS_ON and "--session-async-save" not in args and cfg.get("arch") != "deepseek41":
         cfg["args"] = [*args, "--session-async-save"]
     ENGINE_ARGS[:] = [str(a) for a in cfg.get("args") or []]
     path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")

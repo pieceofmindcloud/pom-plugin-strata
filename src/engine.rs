@@ -963,6 +963,14 @@ impl Manager {
             }
         }
         let qwen36 = model.architecture == gguf::QWEN36_ARCHITECTURE;
+        let deepseek41 = model.architecture == gguf::DEEPSEEK41_ARCHITECTURE;
+        // Sessions carry a prompt from a prefill machine to a decode machine, and this engine's are off here: a
+        // machine that only shares the whole model with others answers on its own.
+        if deepseek41 && matches!(request.role.as_deref(), Some("prefill" | "decode")) {
+            return self.fail(
+                "the prefill/decode split runs Qwen3.8-Flash-Next only; deploy DeepSeek-V4.1-Flash without it".into(),
+            );
+        }
         // Qwen3.6's engine has no batch slots to hand a prompt over in: a prefill machine cannot work, but a machine
         // that only shares the whole model with others answers on its own, without sessions
         if qwen36 && request.role.as_deref() == Some("prefill") {
@@ -992,17 +1000,26 @@ impl Manager {
             Err(error) => return self.fail(error),
         };
         // Qwen3.6-35B-A3B needs only its tokenizer: the engine reads the GGUF itself (as Strata's setup does).
-        let tool = if qwen36 {
+        let tool = if deepseek41 {
+            "strata/tools/dsv41/pack_gguf.py"
+        } else if qwen36 {
             "strata/tools/strata_tokenizer.py"
         } else {
             "strata/tools/iq_pack.py"
         };
-        command
-            .arg(runtime.join(tool))
-            .arg("--gguf")
-            .arg(&request.model_path)
-            .arg("--out")
-            .arg(&pack);
+        command.arg(runtime.join(tool));
+        if deepseek41 {
+            match deepseek41_pack_args(&model.shards, &pack) {
+                Ok(args) => command.args(args),
+                Err(error) => return self.fail(error),
+            };
+        } else {
+            command
+                .arg("--gguf")
+                .arg(&request.model_path)
+                .arg("--out")
+                .arg(&pack);
+        }
         if !qwen36 && (model.shards.len() > 2 || model.stage.is_some()) {
             // Unsloth's files keep small projections as Q8_0; the engine reads them as BF16.
             // (A slice no longer says how many files its model had: the flag only converts what needs it.)
@@ -1074,6 +1091,26 @@ impl Manager {
             Ok(port) => port,
             Err(error) => return self.fail(error),
         };
+        if model.architecture == gguf::DEEPSEEK41_ARCHITECTURE {
+            if request.mmproj_path.is_some() {
+                self.append_log(
+                    "[pom] DeepSeek-V4.1-Flash runs text only here: the projector is not used",
+                );
+            }
+            let prev = request.link.as_ref().and_then(|link| link.prev_port);
+            let args = deepseek41_engine_args(&pack, request.context, prev);
+            if model.stage.is_some_and(|stage| !stage.last()) {
+                return self.serve_stage(runtime, request, args, port, "engine/strata-dsv41");
+            }
+            return self.start_server(
+                runtime,
+                request,
+                args,
+                pack,
+                port,
+                Some(gguf::DEEPSEEK41_ARCHITECTURE),
+            );
+        }
         if model.architecture == gguf::QWEN36_ARCHITECTURE {
             // Strata's setup starts it so (install_own_path): the GGUF as it is, the experts that fit in VRAM and
             // the rest on the CPU, two drafts per step from the file's MTP block.
@@ -1164,7 +1201,7 @@ impl Manager {
             args.push(KV_RESIDENT.into());
         }
         if stage_server {
-            return self.serve_stage(runtime, request, args, port);
+            return self.serve_stage(runtime, request, args, port, "engine/strata");
         }
         self.start_server(runtime, request, args, pack, port, None)
     }
@@ -1185,8 +1222,14 @@ impl Manager {
             .lock()
             .map(|snapshot| snapshot.api_key.clone())
             .unwrap_or_default();
+        let deepseek41 = arch == Some(gguf::DEEPSEEK41_ARCHITECTURE);
+        let engine = if deepseek41 {
+            "engine/strata-dsv41"
+        } else {
+            "engine/strata"
+        };
         let mut config = json!({
-            "exe": runtime.join("engine/strata").display().to_string(),
+            "exe": runtime.join(engine).display().to_string(),
             "args": args,
             "cwd": self.base.join("run").display().to_string(),
             "tokenizer": pack.join("tokenizer").display().to_string(),
@@ -1213,7 +1256,7 @@ impl Manager {
         config["gpus_asked"] = json!(!request.backend_gpus().is_empty());
         // Vision: the projector is read on the CPU, so the image encoder does not take VRAM from the model.
         // Strata's vision section names its encoder, the projector and the model the projector belongs to.
-        if let Some(mmproj) = &request.mmproj_path {
+        if let Some(mmproj) = request.mmproj_path.as_ref().filter(|_| !deepseek41) {
             let encoder = runtime.join("engine/strata-vision");
             if !encoder.is_file() {
                 return self.fail(format!(
@@ -1289,7 +1332,8 @@ impl Manager {
             .arg(&config_path)
             .arg("--port")
             .arg(port.to_string());
-        if let Some(dir) = &request.session_dir {
+        // DeepSeek-V4.1-Flash's sessions are not saved here: a split holds its state across machines.
+        if let Some(dir) = request.session_dir.as_ref().filter(|_| !deepseek41) {
             command.env("POM_STRATA_SESSIONS", dir);
         }
         self.append_log(&format!(
@@ -1328,6 +1372,7 @@ impl Manager {
         request: LoadRequest,
         args: Vec<String>,
         port: u16,
+        engine: &str,
     ) {
         let Some(token) = self
             .shared
@@ -1337,7 +1382,7 @@ impl Manager {
         else {
             return self.fail("the earlier stage has no link secret".into());
         };
-        let mut command = Command::new(runtime.join("engine/strata"));
+        let mut command = Command::new(runtime.join(engine));
         command
             .arg("--serve")
             .arg("--stage-serve")
@@ -1532,7 +1577,49 @@ fn copy_lines(stream: Box<dyn std::io::Read + Send>, log: &Path) {
 
 /// The pack tool writes `native_experts.txt` and the tokenizer last; for
 /// Qwen3.6-35B-A3B the folder holds only the tokenizer.
+/// `tools/dsv41/pack_gguf.py` reads the shards by name from their folder.
+fn deepseek41_pack_args(shards: &[PathBuf], pack: &Path) -> Result<Vec<String>, String> {
+    let folder = shards
+        .first()
+        .and_then(|first| first.parent())
+        .ok_or("the model has no folder")?;
+    let mut args = vec![
+        "--model".to_string(),
+        folder.display().to_string(),
+        "--out".to_string(),
+        pack.display().to_string(),
+        "--shards".to_string(),
+    ];
+    for shard in shards {
+        let name = shard
+            .file_name()
+            .ok_or_else(|| format!("no file name in {}", shard.display()))?;
+        args.push(name.to_string_lossy().into_owned());
+    }
+    Ok(args)
+}
+
+/// What `strata-dsv41` takes: it places the experts itself and has no flag for the rest of the Qwen engine's.
+fn deepseek41_engine_args(pack: &Path, context: u32, prev_port: Option<u16>) -> Vec<String> {
+    let mut args = vec![
+        "--pack".to_string(),
+        pack.display().to_string(),
+        "--max-context".to_string(),
+        context.to_string(),
+    ];
+    if let Some(port) = prev_port {
+        args.push("--stage-prev".to_string());
+        args.push(format!("127.0.0.1:{port}"));
+    }
+    args
+}
+
 fn pack_ready(pack: &Path, model: &gguf::Model) -> bool {
+    if model.architecture == gguf::DEEPSEEK41_ARCHITECTURE {
+        return pack.join("ds4.txt").is_file()
+            && pack.join("tensors.txt").is_file()
+            && pack.join("tokenizer/vocab.json").is_file();
+    }
     if model.architecture == gguf::QWEN36_ARCHITECTURE {
         return pack.join("tokenizer/vocab.json").is_file()
             && pack.join("tokenizer/merges.txt").is_file();
@@ -1729,6 +1816,45 @@ mod tests {
         assert_eq!(radeon.backend_gpus(), &[0, 1]);
         let none = LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"})).unwrap();
         assert_eq!(none.backend(), runtime::Backend::Cuda);
+    }
+
+    #[test]
+    fn deepseek41_packs_with_its_own_tool_from_the_model_folder() {
+        let shards = vec![
+            PathBuf::from("/m/IQ2/a-00001-of-00002.gguf"),
+            PathBuf::from("/m/IQ2/a-00002-of-00002.gguf"),
+        ];
+        assert_eq!(
+            deepseek41_pack_args(&shards, Path::new("/p")).unwrap(),
+            [
+                "--model",
+                "/m/IQ2",
+                "--out",
+                "/p",
+                "--shards",
+                "a-00001-of-00002.gguf",
+                "a-00002-of-00002.gguf",
+            ]
+        );
+    }
+
+    #[test]
+    fn deepseek41_starts_from_the_pack_and_links_to_the_earlier_stage() {
+        assert_eq!(
+            deepseek41_engine_args(Path::new("/p"), 8192, Some(4100)),
+            [
+                "--pack",
+                "/p",
+                "--max-context",
+                "8192",
+                "--stage-prev",
+                "127.0.0.1:4100",
+            ]
+        );
+        assert_eq!(
+            deepseek41_engine_args(Path::new("/p"), 8192, None),
+            ["--pack", "/p", "--max-context", "8192"]
+        );
     }
 
     #[test]

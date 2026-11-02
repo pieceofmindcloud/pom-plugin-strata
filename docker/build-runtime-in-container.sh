@@ -31,20 +31,22 @@ cmake -G Ninja "${launcher[@]}" -S /src -B "$build" \
   -DSTRATA_PORTABLE=ON \
   -DSTRATA_Q6K_EXPERTS=ON \
   -DSTRATA_MMQ_KQUANTS=ON \
+  -DSTRATA_BUILD_DSV41=ON \
   -DCMAKE_CUDA_ARCHITECTURES="$archs" \
   -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
   -DCMAKE_PROJECT_INCLUDE=/plugin/cmake/pom-static-cuda.cmake \
   -DSTRATA_GGML_DIR=/src/third_party/llama.cpp
-cmake --build "$build" --target strata -j "$jobs"
+cmake --build "$build" --target strata strata-dsv41 -j "$jobs"
 install -m 0755 "$build/strata" "$out.tmp/engine/strata"
+install -m 0755 "$build/strata-dsv41" "$out.tmp/engine/strata-dsv41"
 
 # The engine may need the driver and the C/C++ runtime, and nothing of CUDA:
 # a POM node image has no CUDA shared library to give it.
-if ldd "$out.tmp/engine/strata" | grep -E 'libcu(dart|blas|blasLt)' ; then
+if ldd "$out.tmp/engine/strata" "$out.tmp/engine/strata-dsv41" | grep -E 'libcu(dart|blas|blasLt)' ; then
   echo "the engine links a CUDA shared library; it must use the static ones" >&2
   exit 1
 fi
-if ldd "$out.tmp/engine/strata" | grep 'not found' | grep -v 'libcuda.so.1' ; then
+if ldd "$out.tmp/engine/strata" "$out.tmp/engine/strata-dsv41" | grep 'not found' | grep -v 'libcuda.so.1' ; then
   echo "the engine has unresolved libraries" >&2
   exit 1
 fi
