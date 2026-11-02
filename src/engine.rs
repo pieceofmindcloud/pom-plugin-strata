@@ -963,19 +963,17 @@ impl Manager {
             }
         }
         let qwen36 = model.architecture == gguf::QWEN36_ARCHITECTURE;
-<<<<<<< ours
-        // Qwen3.6's engine has no batch slots to hand a prompt over in: a prefill machine cannot work, but a machine
-        // that only shares the whole model with others answers on its own, without sessions
-        if qwen36 && request.role.as_deref() == Some("prefill") {
-=======
         let deepseek41 = model.architecture == gguf::DEEPSEEK41_ARCHITECTURE;
-        if deepseek41 && request.role.is_some() {
+        // Sessions carry a prompt from a prefill machine to a decode machine, and this engine's are off here: a
+        // machine that only shares the whole model with others answers on its own.
+        if deepseek41 && matches!(request.role.as_deref(), Some("prefill" | "decode")) {
             return self.fail(
                 "the prefill/decode split runs Qwen3.8-Flash-Next only; deploy DeepSeek-V4.1-Flash without it".into(),
             );
         }
-        if qwen36 && request.role.is_some() {
->>>>>>> theirs
+        // Qwen3.6's engine has no batch slots to hand a prompt over in: a prefill machine cannot work, but a machine
+        // that only shares the whole model with others answers on its own, without sessions
+        if qwen36 && request.role.as_deref() == Some("prefill") {
             return self.fail(
                 "a prefill machine runs Qwen3.8-Flash-Next only; give this Qwen3.6-35B-A3B machine the prefill and \
                  decode role"
