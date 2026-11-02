@@ -1244,12 +1244,8 @@ impl Manager {
         }
         // Several GPUs share the model (or this stage's layers): the bridge adds the layer split for a list.
         // The cards are numbered as the backend's runtime numbers them (HIP_VISIBLE_DEVICES for AMD).
-        match request.backend_gpus() {
-            [] => {}
-            [first] => config["gpu"] = json!(first),
-            // Strata's own path for another family runs on one card (its setup names one): the first chosen
-            [first, ..] if arch.is_some() => config["gpu"] = json!(first),
-            many => config["gpu"] = json!(many),
+        if let Some(gpu) = config_gpu(request.backend_gpus(), arch) {
+            config["gpu"] = gpu;
         }
         config["gpus_asked"] = json!(!request.backend_gpus().is_empty());
         // Vision: the projector is read on the CPU, so the image encoder does not take VRAM from the model.
@@ -1575,6 +1571,17 @@ fn copy_lines(stream: Box<dyn std::io::Read + Send>, log: &Path) {
 
 /// The pack tool writes `native_experts.txt` and the tokenizer last; for
 /// Qwen3.6-35B-A3B the folder holds only the tokenizer.
+/// The config's cards. Qwen3.6's own path runs on one card (its setup names one), the first chosen; the others
+/// spread the model over a list, the Qwen engine by the bridge's layer split, DeepSeek-V4.1's by itself.
+fn config_gpu(gpus: &[u32], arch: Option<&str>) -> Option<Value> {
+    match gpus {
+        [] => None,
+        [first] => Some(json!(first)),
+        [first, ..] if arch == Some(gguf::QWEN36_ARCHITECTURE) => Some(json!(first)),
+        many => Some(json!(many)),
+    }
+}
+
 /// Unsloth's Qwen files keep small projections as Q8_0; the engine reads them as BF16. A slice no longer says
 /// how many files its model had, and the flag only converts what needs it. Only `iq_pack.py` takes it.
 fn pack_needs_compat_bf16(model: &gguf::Model) -> bool {
@@ -1821,6 +1828,24 @@ mod tests {
         assert_eq!(radeon.backend_gpus(), &[0, 1]);
         let none = LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"})).unwrap();
         assert_eq!(none.backend(), runtime::Backend::Cuda);
+    }
+
+    #[test]
+    fn only_qwen36_is_held_to_the_first_card() {
+        assert_eq!(config_gpu(&[], None), None);
+        assert_eq!(
+            config_gpu(&[1], Some(gguf::QWEN36_ARCHITECTURE)),
+            Some(json!(1))
+        );
+        assert_eq!(
+            config_gpu(&[0, 1], Some(gguf::QWEN36_ARCHITECTURE)),
+            Some(json!(0))
+        );
+        assert_eq!(config_gpu(&[0, 1], None), Some(json!([0, 1])));
+        assert_eq!(
+            config_gpu(&[0, 1], Some(gguf::DEEPSEEK41_ARCHITECTURE)),
+            Some(json!([0, 1]))
+        );
     }
 
     #[test]
