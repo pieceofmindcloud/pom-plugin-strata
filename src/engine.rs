@@ -1020,9 +1020,7 @@ impl Manager {
                 .arg("--out")
                 .arg(&pack);
         }
-        if !qwen36 && (model.shards.len() > 2 || model.stage.is_some()) {
-            // Unsloth's files keep small projections as Q8_0; the engine reads them as BF16.
-            // (A slice no longer says how many files its model had: the flag only converts what needs it.)
+        if pack_needs_compat_bf16(&model) {
             command.arg("--compat-bf16");
         }
         match Group::spawn(&mut command) {
@@ -1577,6 +1575,13 @@ fn copy_lines(stream: Box<dyn std::io::Read + Send>, log: &Path) {
 
 /// The pack tool writes `native_experts.txt` and the tokenizer last; for
 /// Qwen3.6-35B-A3B the folder holds only the tokenizer.
+/// Unsloth's Qwen files keep small projections as Q8_0; the engine reads them as BF16. A slice no longer says
+/// how many files its model had, and the flag only converts what needs it. Only `iq_pack.py` takes it.
+fn pack_needs_compat_bf16(model: &gguf::Model) -> bool {
+    model.architecture == gguf::STRATA_ARCHITECTURE
+        && (model.shards.len() > 2 || model.stage.is_some())
+}
+
 /// `tools/dsv41/pack_gguf.py` reads the shards by name from their folder.
 fn deepseek41_pack_args(shards: &[PathBuf], pack: &Path) -> Result<Vec<String>, String> {
     let folder = shards
@@ -1816,6 +1821,52 @@ mod tests {
         assert_eq!(radeon.backend_gpus(), &[0, 1]);
         let none = LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"})).unwrap();
         assert_eq!(none.backend(), runtime::Backend::Cuda);
+    }
+
+    #[test]
+    fn only_the_qwen_pack_tool_takes_the_bf16_compatibility_flag() {
+        let stage = gguf::Stage {
+            start: 20,
+            end: 39,
+            total: 40,
+        };
+        let model = |architecture: &str, shards: usize, stage: Option<gguf::Stage>| gguf::Model {
+            architecture: architecture.into(),
+            shards: vec![PathBuf::from("/m/a.gguf"); shards],
+            ple_shard: None,
+            layers: 40,
+            stage,
+        };
+        assert!(pack_needs_compat_bf16(&model(
+            gguf::STRATA_ARCHITECTURE,
+            1,
+            Some(stage)
+        )));
+        assert!(pack_needs_compat_bf16(&model(
+            gguf::STRATA_ARCHITECTURE,
+            3,
+            None
+        )));
+        assert!(!pack_needs_compat_bf16(&model(
+            gguf::STRATA_ARCHITECTURE,
+            2,
+            None
+        )));
+        assert!(!pack_needs_compat_bf16(&model(
+            gguf::DEEPSEEK41_ARCHITECTURE,
+            1,
+            Some(stage)
+        )));
+        assert!(!pack_needs_compat_bf16(&model(
+            gguf::DEEPSEEK41_ARCHITECTURE,
+            6,
+            None
+        )));
+        assert!(!pack_needs_compat_bf16(&model(
+            gguf::QWEN36_ARCHITECTURE,
+            3,
+            None
+        )));
     }
 
     #[test]
