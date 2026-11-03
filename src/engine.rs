@@ -61,6 +61,8 @@ pub struct LoadRequest {
     pub session_dir: Option<PathBuf>,
     /// The vision projector (mmproj) the deployment chose: the engine reads images with it. `None` = text only.
     pub mmproj_path: Option<PathBuf>,
+    /// The drafter the deployment chose (`draft_architectures`). None leaves it out.
+    pub mtp_draft_path: Option<PathBuf>,
     /// The machine's part in the POM's prefill/decode split (`prefill` or `decode`; `None` = both). The bridge keeps
     /// the sessions on for it: the split hands a prompt's state from one machine to the other as a session.
     pub role: Option<String>,
@@ -269,6 +271,25 @@ impl LoadRequest {
                 }
                 None => None,
             },
+            mtp_draft_path: match value["mtp_draft_path"]
+                .as_str()
+                .filter(|path| !path.is_empty())
+            {
+                Some(path) => {
+                    let path = PathBuf::from(path);
+                    if !path.is_absolute() {
+                        return Err("mtp_draft_path must be absolute".into());
+                    }
+                    if !path.is_file() {
+                        return Err(format!(
+                            "the drafter {} is not on this machine",
+                            path.display()
+                        ));
+                    }
+                    Some(path)
+                }
+                None => None,
+            },
         })
     }
 }
@@ -423,6 +444,8 @@ impl Snapshot {
             "stages": true,
             // Only Flash-Next runs in slices: the POM offers Qwen3.6 as the whole model only (stage_architectures).
             "stage_architectures": gguf::STAGE_ARCHITECTURES,
+            // Where the POM offers a drafter file to choose: the other families' drafts are the engine's own.
+            "draft_architectures": [gguf::DEEPSEEK41_ARCHITECTURE],
             // The POM settings that apply to those stages (the nodes carry the hidden state between them), and the
             // prefill/decode role of a machine that runs the whole model.
             "pom_settings": [
@@ -987,7 +1010,8 @@ impl Manager {
             request.role = None;
         }
         let pack = self.pack_dir(&request.model_path);
-        if pack_ready(&pack, &model) {
+        let drafter = request.mtp_draft_path.as_deref();
+        if pack_ready(&pack, &model, drafter) {
             return self.serve(runtime, request, &model, pack);
         }
         self.append_log(&format!(
@@ -1009,11 +1033,11 @@ impl Manager {
         };
         command.arg(runtime.join(tool));
         if deepseek41 {
-            let drafter = deepseek41_drafter(&model, &request.model_path);
-            if let Some(path) = &drafter {
+            let drafter = deepseek41_drafter(&model, request.mtp_draft_path.as_deref());
+            if let Some(path) = drafter {
                 self.append_log(&format!("[pom] DSpark drafter: {}", path.display()));
             }
-            match deepseek41_pack_args(&model.shards, &pack, drafter.as_deref()) {
+            match deepseek41_pack_args(&model.shards, &pack, drafter) {
                 Ok(args) => command.args(args),
                 Err(error) => return self.fail(error),
             };
@@ -1100,7 +1124,7 @@ impl Manager {
                 );
             }
             let prev = request.link.as_ref().and_then(|link| link.prev_port);
-            let drafter = deepseek41_drafter(model, &request.model_path).is_some();
+            let drafter = deepseek41_drafter(model, request.mtp_draft_path.as_deref()).is_some();
             let args = deepseek41_engine_args(&pack, request.context, prev, drafter);
             if model.stage.is_some_and(|stage| !stage.last()) {
                 return self.serve_stage(runtime, request, args, port, "engine/strata-dsv41");
@@ -1499,7 +1523,9 @@ impl Manager {
                 else {
                     return self.fail("the model or the runtime went away".into());
                 };
-                if !status.success() || !pack_ready(&pack, &model) {
+                if !status.success()
+                    || !pack_ready(&pack, &model, request.mtp_draft_path.as_deref())
+                {
                     return self.fail(format!(
                         "preparing the model for Strata failed ({status}); see the Strata log"
                     ));
@@ -1632,36 +1658,30 @@ fn deepseek41_pack_args(
     Ok(args)
 }
 
-/// The DSpark drafter, for the stage with the head: `mtp/dspark-deepseek41/dspark-*.gguf` beside the model's folder.
-/// It reads layers 37-39 and runs before the head, so the earlier stages have no use for it.
-fn deepseek41_drafter(model: &gguf::Model, path: &Path) -> Option<PathBuf> {
+/// The drafter the deployment chose, for the stage with the head: it reads layers 37-39 and borrows the head, so the
+/// earlier stages have no use for it.
+fn deepseek41_drafter<'a>(model: &gguf::Model, chosen: Option<&'a Path>) -> Option<&'a Path> {
     if model.stage.is_some_and(|stage| !stage.last()) {
         return None;
     }
-    path.ancestors().skip(1).take(3).find_map(|ancestor| {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(ancestor.join("mtp/dspark-deepseek41"))
-            .ok()?
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|file| {
-                file.extension()
-                    .is_some_and(|extension| extension == "gguf")
-                    && file
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with("dspark-"))
-            })
-            .collect();
-        files.sort();
-        files.into_iter().next()
-    })
+    chosen
 }
 
-/// A pack made before the drafter was there has none of its tensors, and is made again.
-fn deepseek41_pack_ready(pack: &Path, drafter: bool) -> bool {
-    pack.join("ds4.txt").is_file()
-        && pack.join("tokenizer/vocab.json").is_file()
-        && std::fs::read_to_string(pack.join("tensors.txt"))
-            .is_ok_and(|tensors| !drafter || tensors.contains(" mtp.0."))
+/// A pack made for no drafter, or for another one, is made again. One that has a drafter serves without it too: the
+/// engine leaves it out with `--dspark none`.
+fn deepseek41_pack_ready(pack: &Path, drafter: Option<&Path>) -> bool {
+    if !pack.join("ds4.txt").is_file() || !pack.join("tokenizer/vocab.json").is_file() {
+        return false;
+    }
+    let Ok(tensors) = std::fs::read_to_string(pack.join("tensors.txt")) else {
+        return false;
+    };
+    drafter.is_none_or(|drafter| {
+        tensors.contains(" mtp.0.")
+            && drafter
+                .file_name()
+                .is_some_and(|name| tensors.contains(&*name.to_string_lossy()))
+    })
 }
 
 /// What `strata-dsv41` takes: it places the experts itself and has no flag for the rest of the Qwen engine's.
@@ -1681,21 +1701,15 @@ fn deepseek41_engine_args(
         args.push("--stage-prev".to_string());
         args.push(format!("127.0.0.1:{port}"));
     }
-    if drafter {
-        // Asked for outright: "auto" leaves it out where the routed experts are far more than the GPUs hold.
-        args.push("--dspark".to_string());
-        args.push("on".to_string());
-    }
+    // Asked for outright: "auto" leaves it out where the routed experts are far more than the GPUs hold.
+    args.push("--dspark".to_string());
+    args.push(if drafter { "on" } else { "none" }.to_string());
     args
 }
 
-fn pack_ready(pack: &Path, model: &gguf::Model) -> bool {
+fn pack_ready(pack: &Path, model: &gguf::Model, drafter: Option<&Path>) -> bool {
     if model.architecture == gguf::DEEPSEEK41_ARCHITECTURE {
-        let drafter = model
-            .shards
-            .first()
-            .is_some_and(|first| deepseek41_drafter(model, first).is_some());
-        return deepseek41_pack_ready(pack, drafter);
+        return deepseek41_pack_ready(pack, deepseek41_drafter(model, drafter));
     }
     if model.architecture == gguf::QWEN36_ARCHITECTURE {
         return pack.join("tokenizer/vocab.json").is_file()
@@ -1896,16 +1910,8 @@ mod tests {
     }
 
     #[test]
-    fn deepseek41_drafter_is_found_beside_the_slices_for_the_stage_with_the_head() {
-        let root = std::env::temp_dir().join(format!("pom-ds41-drafter-{}", std::process::id()));
-        let folder = root.join("mtp/dspark-deepseek41");
-        std::fs::create_dir_all(&folder).unwrap();
-        std::fs::write(
-            folder.join("dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"),
-            b"x",
-        )
-        .unwrap();
-        let slice = root.join("DeepSeek-ee51cb29/cd91.gguf");
+    fn deepseek41_uses_the_chosen_drafter_on_the_stage_with_the_head_only() {
+        let slice = PathBuf::from("/m/cd91.gguf");
         let model = |stage: Option<gguf::Stage>| gguf::Model {
             architecture: gguf::DEEPSEEK41_ARCHITECTURE.into(),
             shards: vec![slice.clone()],
@@ -1913,6 +1919,7 @@ mod tests {
             layers: 40,
             stage,
         };
+        let chosen = PathBuf::from("/d/dspark.gguf");
         let last = gguf::Stage {
             start: 20,
             end: 39,
@@ -1924,13 +1931,40 @@ mod tests {
             total: 40,
         };
         assert_eq!(
-            deepseek41_drafter(&model(Some(last)), &slice),
-            Some(folder.join("dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"))
+            deepseek41_drafter(&model(Some(last)), Some(&chosen)),
+            Some(chosen.as_path())
         );
-        assert_eq!(deepseek41_drafter(&model(Some(first)), &slice), None);
-        let elsewhere = std::env::temp_dir().join("pom-no-drafter-here/a/b.gguf");
-        assert_eq!(deepseek41_drafter(&model(Some(last)), &elsewhere), None);
-        let _ = std::fs::remove_dir_all(root);
+        assert_eq!(
+            deepseek41_drafter(&model(None), Some(&chosen)),
+            Some(chosen.as_path())
+        );
+        assert_eq!(deepseek41_drafter(&model(Some(first)), Some(&chosen)), None);
+        assert_eq!(deepseek41_drafter(&model(Some(last)), None), None);
+    }
+
+    #[test]
+    fn the_drafter_choice_is_read_and_checked() {
+        let file = std::env::temp_dir().join(format!("pom-dspark-{}.gguf", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let ok =
+            LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "mtp_draft_path": file}))
+                .unwrap();
+        assert_eq!(ok.mtp_draft_path.as_deref(), Some(file.as_path()));
+        assert_eq!(
+            LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"}))
+                .unwrap()
+                .mtp_draft_path,
+            None
+        );
+        assert!(LoadRequest::from_json(
+            &json!({"model_path": "/m/x.gguf", "mtp_draft_path": "rel.gguf"})
+        )
+        .is_err());
+        assert!(LoadRequest::from_json(
+            &json!({"model_path": "/m/x.gguf", "mtp_draft_path": "/no/such.gguf"})
+        )
+        .is_err());
+        let _ = std::fs::remove_file(file);
     }
 
     #[test]
@@ -1955,29 +1989,40 @@ mod tests {
     }
 
     #[test]
-    fn a_pack_without_the_drafter_is_made_again_when_there_is_one() {
+    fn a_pack_is_made_again_for_another_drafter() {
         let pack = std::env::temp_dir().join(format!("pom-ds41-pack-{}", std::process::id()));
         std::fs::create_dir_all(pack.join("tokenizer")).unwrap();
         std::fs::write(pack.join("ds4.txt"), b"x").unwrap();
         std::fs::write(pack.join("tokenizer/vocab.json"), b"{}").unwrap();
-        std::fs::write(pack.join("tensors.txt"), "t layers.0.x F32 0 0 4 1\n").unwrap();
-        assert!(deepseek41_pack_ready(&pack, false));
-        assert!(!deepseek41_pack_ready(&pack, true));
         std::fs::write(
             pack.join("tensors.txt"),
-            "t mtp.0.main_proj.weight F32 0 0 4 1\n",
+            "file 0 a.gguf\nt layers.0.x F32 0 0 4 1\n",
         )
         .unwrap();
-        assert!(deepseek41_pack_ready(&pack, true));
+        let chosen = PathBuf::from("/d/dspark-q8.gguf");
+        let other = PathBuf::from("/d/dspark-bf16.gguf");
+        assert!(deepseek41_pack_ready(&pack, None));
+        assert!(!deepseek41_pack_ready(&pack, Some(&chosen)));
+        std::fs::write(
+            pack.join("tensors.txt"),
+            "file 0 a.gguf\nfile 1 ../d/dspark-q8.gguf\nt mtp.0.main_proj.weight F32 1 0 4 1\n",
+        )
+        .unwrap();
+        assert!(deepseek41_pack_ready(&pack, Some(&chosen)));
+        assert!(!deepseek41_pack_ready(&pack, Some(&other)));
+        assert!(
+            deepseek41_pack_ready(&pack, None),
+            "the engine leaves the drafter out with --dspark none"
+        );
         let _ = std::fs::remove_dir_all(pack);
     }
 
     #[test]
-    fn deepseek41_asks_for_the_drafter_only_when_it_has_one() {
-        let args = deepseek41_engine_args(Path::new("/p"), 8192, None, true);
-        assert_eq!(args[args.len() - 2..], ["--dspark", "on"]);
-        assert!(!deepseek41_engine_args(Path::new("/p"), 8192, None, false)
-            .contains(&"--dspark".to_string()));
+    fn deepseek41_turns_the_drafter_on_or_leaves_it_out() {
+        let on = deepseek41_engine_args(Path::new("/p"), 8192, None, true);
+        assert_eq!(on[on.len() - 2..], ["--dspark", "on"]);
+        let off = deepseek41_engine_args(Path::new("/p"), 8192, None, false);
+        assert_eq!(off[off.len() - 2..], ["--dspark", "none"]);
     }
 
     #[test]
@@ -2075,11 +2120,13 @@ mod tests {
                 "8192",
                 "--stage-prev",
                 "127.0.0.1:4100",
+                "--dspark",
+                "none",
             ]
         );
         assert_eq!(
             deepseek41_engine_args(Path::new("/p"), 8192, None, false),
-            ["--pack", "/p", "--max-context", "8192"]
+            ["--pack", "/p", "--max-context", "8192", "--dspark", "none"]
         );
     }
 
