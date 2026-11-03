@@ -48,14 +48,16 @@ cmake -G Ninja "${launcher[@]}" -S "$src" -B "$build" \
   -DSTRATA_PREFILL_MMQ=ON \
   -DSTRATA_Q6K_EXPERTS=ON \
   -DSTRATA_MMQ_KQUANTS=ON \
+  -DSTRATA_BUILD_DSV41=ON \
   -DCMAKE_HIP_ARCHITECTURES="$archs" \
   -DCMAKE_HIP_COMPILER="$rocm/llvm/bin/clang++" \
   -DCMAKE_HIP_COMPILER_ROCM_ROOT="$rocm" \
   -DCMAKE_HIP_FLAGS="--rocm-path=$rocm --rocm-device-lib-path=$bitcode" \
   -DCMAKE_PREFIX_PATH="$rocm" \
   -DSTRATA_GGML_DIR="$src/third_party/llama.cpp"
-cmake --build "$build" --target strata -j "$jobs"
+cmake --build "$build" --target strata strata-dsv41 -j "$jobs"
 install -m 0755 "$build/strata" "$out.tmp/engine/strata"
+install -m 0755 "$build/strata-dsv41" "$out.tmp/engine/strata-dsv41"
 
 # THE ROCm LIBRARIES THE ENGINE LOADS: every shared library ldd resolves, and
 # the ones HIP opens itself (the code object manager, libamd_comgr), with all
@@ -75,6 +77,7 @@ copy_deps() {   # the libraries $1 needs that lib/ does not have yet; prints the
   done
 }
 pending="$(copy_deps "$out.tmp/engine/strata")"
+pending+=$'\n'"$(copy_deps "$out.tmp/engine/strata-dsv41")"
 for opened in libamd_comgr.so.3 libamd_comgr.so.2; do
   found="$(find -L "$rocm/lib" -maxdepth 1 -name "$opened" | head -1)"
   if [[ -n "$found" ]]; then
@@ -110,7 +113,7 @@ for lib in rocblas hipblaslt; do
     fi
   done
 done
-if LD_LIBRARY_PATH="$out.tmp/lib" ldd "$out.tmp/engine/strata" | grep 'not found'; then
+if LD_LIBRARY_PATH="$out.tmp/lib" ldd "$out.tmp/engine/strata" "$out.tmp/engine/strata-dsv41" | grep 'not found'; then
   echo "the engine has unresolved libraries" >&2
   exit 1
 fi
