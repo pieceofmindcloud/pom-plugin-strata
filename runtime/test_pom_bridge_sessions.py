@@ -479,6 +479,11 @@ class SessionSaveSetting(unittest.TestCase):
                                  "pom_settings": {"vram_reserve_mib": 500}})
         self.assertNotIn("--vram-reserve-mib", written["args"])     # strata-dsv41 refuses it: unknown option
         self.assertEqual(written["args"][written["args"].index("--reserve-mib") + 1], "500")
+        # Strata's rules keep the value in user_args too, which the server merges over args at every start: the merge
+        # must not bring the Qwen name back
+        merged = S.user_args.merge(written["args"], written.get("user_args") or [])
+        self.assertNotIn("--vram-reserve-mib", merged)
+        self.assertEqual(merged[merged.index("--reserve-mib") + 1], "500")
 
     @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
     def test_other_engines_keep_vram_reserve_mib(self):

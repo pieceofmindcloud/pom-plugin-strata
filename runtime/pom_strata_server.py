@@ -1301,10 +1301,15 @@ def apply_pom_settings(argv: list[str]) -> None:
     # the same setting turns on the engine's asynchronous session write (SAVING, then the file on a thread)
     args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
     # strata-dsv41 names the VRAM reserve --reserve-mib; Strata's rules write the Qwen engine's --vram-reserve-mib,
-    # which it refuses ("unknown option") and the load never starts
-    if cfg.get("arch") == "deepseek41" and "--vram-reserve-mib" in args:
-        args = ["--reserve-mib" if a == "--vram-reserve-mib" else a for a in args]
-        cfg["args"] = args
+    # which it refuses ("unknown option") and the load never starts. They write it in "user_args" too, which the
+    # server merges over "args" at every start (strata_control/user_args.py): renamed in both, or the merge brings the
+    # Qwen name back
+    if cfg.get("arch") == "deepseek41":
+        for key in ("args", "user_args"):
+            listed = cfg.get(key)
+            if isinstance(listed, list) and "--vram-reserve-mib" in listed:
+                cfg[key] = ["--reserve-mib" if a == "--vram-reserve-mib" else a for a in listed]
+        args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
     if SESSIONS_ON and "--session-async-save" not in args and cfg.get("arch") != "deepseek41":
         cfg["args"] = [*args, "--session-async-save"]
     ENGINE_ARGS[:] = [str(a) for a in cfg.get("args") or []]
