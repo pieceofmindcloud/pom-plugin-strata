@@ -688,6 +688,26 @@ def template_kwargs(svc, req: dict, thinking: bool) -> tuple[bool, dict]:
     return thinking, {"enable_thinking": thinking}
 
 
+def client_conversation(svc, req: dict):
+    """(messages, tools, template kwargs) of the conversation the POM forwards as its client sent it (`chat`: {api,
+    request}, a request with tools), read by Strata's own OpenAI and Anthropic readers; None without one (an older POM,
+    a request without tools), and the flattened prompt is the turn as before.
+
+    The flattened prompt describes the tools in Qwen's `<tool_call><function=...>` form, the gateway's own: DeepSeek-V4.1
+    (DSML) got its first call right and then looped on broken copies of that example. Rendered by the engine's chat
+    template the tools and the replayed calls are the model's own form; its calls come back to the POM as text in the
+    form it reads (tool_call_text), as before. ValueError (the turn's 400) for a malformed one."""
+    chat = req.get("chat")
+    if chat is None:
+        return None
+    if not isinstance(chat, dict) or chat.get("api") not in ("openai", "anthropic") \
+            or not isinstance(chat.get("request"), dict):
+        raise ValueError("'chat' must be {\"api\": \"openai\" or \"anthropic\", \"request\": {...}}")
+    if chat["api"] == "anthropic":
+        return S.anthropic_to_messages(chat["request"], getattr(svc, "anthropic_think_unasked", True))
+    return S.openai_to_messages(chat["request"])
+
+
 def prefill_skip(ids: list[int], decode_holds) -> str | None:
     """Why a prefill_only turn is not read here (None: it is): the part of the prompt the decode machine lacks is
     shorter than PREFILL_MIN_TOKENS. `decode_holds` is what that machine holds of the conversation (0 when unknown)."""
@@ -1091,7 +1111,14 @@ def make_handler(original):
                                                  or prefix_bytes < 1):
                     raise ValueError("'probe.prefix_bytes' must be a positive whole number")
                 svc.load()
-                if chat:
+                client_chat = client_conversation(svc, req) if chat else None
+                if client_chat is not None:
+                    # the conversation as the client sent it (a request with tools): the engine's own template renders
+                    # the tools and the calls - DSML for DeepSeek-V4.1, which the flattened prompt's Qwen form made loop
+                    messages, tools, extra = client_chat
+                    ids, thinking, room = svc.prepare(messages, tools, {**extra, **kwargs}, None)
+                    max_new = fit_budget(max_tokens, room)
+                elif chat:
                     # the images of the turn (data: URLs) come before its text; the engine reads them through the
                     # deployment's projector (prepare() encodes them and run() takes the embeddings)
                     images = req.get("images") or []

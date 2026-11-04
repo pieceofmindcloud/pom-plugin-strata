@@ -492,6 +492,41 @@ class SessionSaveSetting(unittest.TestCase):
         self.assertNotIn("--reserve-mib", written["args"])
 
 
+class ClientConversation(unittest.TestCase):
+    """A request with tools: the POM forwards the conversation as its client sent it, and the engine's own template
+    renders the tools (DeepSeek-V4.1 looped on the Qwen form the flattened prompt teaches)."""
+
+    svc = types.SimpleNamespace(anthropic_think_unasked=True)
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_without_one_the_flattened_prompt_is_the_turn(self):
+        self.assertIsNone(B.client_conversation(self.svc, {"prompt": "User: oi"}))
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_an_openai_conversation_gives_its_messages_and_tools(self):
+        messages, tools, _ = B.client_conversation(self.svc, {"chat": {"api": "openai", "request": {
+            "messages": [{"role": "user", "content": "write a file"}],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "writes",
+                                                        "parameters": {"type": "object"}}}]}}})
+        self.assertEqual(messages[-1]["role"], "user")
+        self.assertTrue(tools and "write" in json.dumps(tools))
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_an_anthropic_conversation_gives_its_system_and_tools(self):
+        messages, tools, _ = B.client_conversation(self.svc, {"chat": {"api": "anthropic", "request": {
+            "system": "be brief",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "write a file"}]}],
+            "tools": [{"name": "write", "description": "writes", "input_schema": {"type": "object"}}]}}})
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertTrue(tools and "write" in json.dumps(tools))
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_a_malformed_one_is_refused(self):
+        for chat in ({"api": "other", "request": {}}, {"api": "openai"}, "x"):
+            with self.assertRaises(ValueError):
+                B.client_conversation(self.svc, {"chat": chat})
+
+
 if __name__ == "__main__":
     unittest.main()
 
