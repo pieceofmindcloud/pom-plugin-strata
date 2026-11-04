@@ -1,19 +1,41 @@
 name: Build Strata runtime
 
 # The Strata runtimes (engine, server, app and their Python packages), built
-# from the head of the Strata branch strata.lock names: CUDA for the NVIDIA
-# families a POM node may have, and HIP for the AMD ones, each on a runner of
-# its own (each image needs most of a runner's disk). They are published to the
-# release `strata-runtime`, replacing the previous ones, where the plugin
-# release (release.yml) takes them without building them again.
+# from the head of the Strata branch strata.lock names, one per platform and
+# backend, each on a runner of its own:
+#   linux-x86_64   CUDA (NVIDIA) and HIP (AMD), in the POM's build images
+#   macos-aarch64  Metal (Apple Silicon)
+#   windows-x86_64 CUDA (NVIDIA)
+# They are published to the release `strata-runtime`, replacing the previous
+# ones, where the plugin release (release.yml) takes them without building them.
 #
-# The compiler cache (ccache, build/cache/ccache) is kept in the Actions cache
-# per backend, so a build after a small change in Strata compiles only what
-# changed.
+# Nothing is compiled twice (scripts/runtime-key.sh):
+# - a runtime whose key matches the one already in strata-runtime is skipped
+#   (same Strata commit, same build files, same bridge): "force" rebuilds it;
+# - an engine whose key matches one in the Actions cache is reused, and only
+#   the runtime around it (bridge, Python packages, app) is assembled again;
+# - otherwise ccache (build/cache/ccache, per backend) compiles only what
+#   changed in Strata.
 on:
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Backends to consider (comma separated): cuda, hip, metal, cuda-windows'
+        type: string
+        default: 'cuda,hip,metal,cuda-windows'
+      force:
+        description: 'Build even when strata-runtime already has the same runtime'
+        type: boolean
+        default: false
   # release.yml calls it when asked to build the runtimes too
   workflow_call:
+    inputs:
+      platforms:
+        type: string
+        default: 'cuda,hip,metal,cuda-windows'
+      force:
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -23,25 +45,82 @@ env:
   CUDA_ARCHITECTURES: '75;80;86;89;90;100;120'
   # RDNA2 to RDNA4 and Strix Halo, the wave32 families Strata's HIP kernels target.
   HIP_ARCHITECTURES: 'gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201'
+  # The CUDA toolkit of the Windows build (Strata's own Windows engine is built with 13.0).
+  CUDA_WINDOWS_VERSION: '13.0.2'
 
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      build: ${{ steps.plan.outputs.build }}
+      strata_commit: ${{ steps.plan.outputs.strata_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: plan
+        shell: bash
+        run: |
+          commit="$(scripts/runtime-key.sh cuda | sed -n 's/^strata_commit=//p')"
+          echo "strata_commit=$commit" >> "$GITHUB_OUTPUT"
+          # the keys of the runtimes strata-runtime has now
+          mkdir -p published
+          gh release download strata-runtime --repo "$GITHUB_REPOSITORY" --dir published --pattern '*.key' 2>/dev/null || true
+          entries=()
+          add() { # backend runner asset
+            [[ ",$PLATFORMS," == *",$1,"* ]] || return 0
+            local keys engine runtime
+            keys="$(scripts/runtime-key.sh "$1" "$commit")"
+            engine="$(sed -n 's/^engine_key=//p' <<<"$keys")"
+            runtime="$(sed -n 's/^runtime_key=//p' <<<"$keys")"
+            if [[ "$FORCE" != true && "$(cat "published/$3.key" 2>/dev/null)" == "$runtime" ]]; then
+              echo "$3: up to date ($runtime), not built"
+              return 0
+            fi
+            entries+=("$(jq -cn --arg backend "$1" --arg runner "$2" --arg asset "$3" \
+              --arg engine_key "$engine" --arg runtime_key "$runtime" \
+              '{backend:$backend, runner:$runner, asset:$asset, engine_key:$engine_key, runtime_key:$runtime_key}')")
+          }
+          add cuda         ubuntu-24.04 strata-runtime-linux-x86_64.tar.gz
+          add hip          ubuntu-24.04 strata-runtime-hip-linux-x86_64.tar.gz
+          add metal        macos-26     strata-runtime-macos-aarch64.tar.gz
+          add cuda-windows windows-2022 strata-runtime-windows-x86_64.tar.gz
+          if ((${#entries[@]})); then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "matrix=$(printf '%s\n' "${entries[@]}" | jq -cs '{include: .}')" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLATFORMS: ${{ inputs.platforms || 'cuda,hip,metal,cuda-windows' }}
+          FORCE: ${{ inputs.force && 'true' || 'false' }}
+
   runtime:
     name: Runtime ${{ matrix.backend }}
-    runs-on: ubuntu-24.04
+    needs: plan
+    if: ${{ needs.plan.outputs.build == 'true' }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     strategy:
-      fail-fast: true
-      matrix:
-        include:
-          - backend: cuda
-            flags: ''
-            asset: strata-runtime-linux-x86_64.tar.gz
-          - backend: hip
-            flags: '--hip'
-            asset: strata-runtime-hip-linux-x86_64.tar.gz
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      STRATA_COMMIT: ${{ needs.plan.outputs.strata_commit }}
+      ENGINE_KEY: ${{ matrix.engine_key }}
+      BUILD_JOBS: '4'
+      # the backends share the repository's 10 GB of Actions cache
+      CCACHE_MAXSIZE: '2G'
     steps:
       # The CUDA and ROCm build images take tens of GB.
       - name: Free disk space
+        if: ${{ runner.os == 'Linux' }}
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: true
@@ -56,62 +135,120 @@ jobs:
         with:
           persist-credentials: false
 
-      # The newest cache of this backend comes back; this run saves its own at the end.
+      # A compiled engine under the same key: the runtime is assembled around it, nothing is compiled.
+      - name: Engine cache
+        id: engine
+        uses: actions/cache@v4
+        with:
+          path: build/cache/engine
+          key: engine-${{ matrix.backend }}-${{ matrix.engine_key }}
+
+      # The newest compiler cache of this backend comes back; this run saves its own at the end.
       - name: Compiler cache
+        if: ${{ steps.engine.outputs.cache-hit != 'true' }}
         uses: actions/cache@v4
         with:
           path: build/cache/ccache
           key: ccache-${{ matrix.backend }}-${{ github.run_id }}
           restore-keys: ccache-${{ matrix.backend }}-
 
-      - name: Build the ${{ matrix.backend }} runtime
-        shell: bash
+      - name: Tools (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: brew install bash ninja ccache
+
+      - name: Tools (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        run: choco install -y --no-progress ninja ccache
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: ${{ runner.os == 'Windows' }}
+        with:
+          arch: x64
+
+      # Only the parts of the toolkit the engine needs, from NVIDIA's network installer; kept in the Actions cache.
+      - name: CUDA toolkit cache (Windows)
+        id: cuda
+        if: ${{ runner.os == 'Windows' && steps.engine.outputs.cache-hit != 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: C:\cuda
+          key: cuda-windows-${{ env.CUDA_WINDOWS_VERSION }}
+      - name: CUDA toolkit (Windows)
+        if: ${{ runner.os == 'Windows' && steps.engine.outputs.cache-hit != 'true' }}
+        shell: pwsh
         run: |
+          $v = $env:CUDA_WINDOWS_VERSION
+          $mm = ($v -split '\.')[0..1] -join '.'
+          if ('${{ steps.cuda.outputs.cache-hit }}' -ne 'true') {
+            $installer = "$env:RUNNER_TEMP\cuda.exe"
+            Invoke-WebRequest "https://developer.download.nvidia.com/compute/cuda/$v/network_installers/cuda_${v}_windows_network.exe" -OutFile $installer
+            $parts = 'nvcc','cudart','cublas','cublas_dev','crt','nvvm','nvptxcompiler','nvrtc','nvrtc_dev','visual_studio_integration' | ForEach-Object { "${_}_$mm" }
+            Start-Process -Wait -FilePath $installer -ArgumentList (@('-s') + $parts)
+            Copy-Item -Recurse "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$mm" C:\cuda
+          }
+          if (-not (Test-Path C:\cuda\bin\nvcc.exe)) { throw "no nvcc.exe in C:\cuda" }
+          "CUDA_PATH=C:\cuda" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "C:\cuda\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Build the ${{ matrix.backend }} runtime
+        run: |
+          flags=()
+          [[ "${{ matrix.backend }}" != hip ]] || flags=(--hip)
           # no version: a runtime serves several plugin releases, and RUNTIME.json names its Strata commit
-          ./scripts/build-runtime.sh --archive ${{ matrix.flags }}
+          ./scripts/build-runtime.sh --archive ${flags[@]+"${flags[@]}"}
           test -f "dist-release/${{ matrix.asset }}"
-        env:
-          BUILD_JOBS: '4'
-          # two backends share the repository's 10 GB of Actions cache
-          CCACHE_MAXSIZE: '3G'
+          printf '%s' "${{ matrix.runtime_key }}" > "dist-release/${{ matrix.asset }}.key"
 
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-${{ matrix.backend }}
-          path: dist-release/${{ matrix.asset }}
+          path: |
+            dist-release/${{ matrix.asset }}
+            dist-release/${{ matrix.asset }}.key
           if-no-files-found: error
           retention-days: 1
 
   publish:
     name: Publish to strata-runtime
-    needs: runtime
+    needs: [plan, runtime]
+    if: ${{ needs.plan.outputs.build == 'true' }}
     runs-on: ubuntu-24.04
     steps:
+      # what strata-runtime has now, then what this run built on top: the description covers all of them
+      - name: The runtimes already published
+        shell: bash
+        run: |
+          mkdir -p runtimes
+          gh release download strata-runtime --repo "$GITHUB_REPOSITORY" --dir runtimes --pattern '*.tar.gz' 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - uses: actions/download-artifact@v4
         with:
           pattern: runtime-*
-          path: runtimes
+          path: built
           merge-multiple: true
 
       - name: Describe the runtimes
         shell: bash
         run: |
+          cp -f built/*.tar.gz runtimes/
           {
             for archive in runtimes/*.tar.gz; do
               printf '%s\n' "$(basename "$archive")"
               tar -xzOf "$archive" runtime/RUNTIME.json
               printf 'sha256 %s\n\n' "$(sha256sum "$archive" | cut -d' ' -f1)"
             done
-          } | tee runtimes/RUNTIME.txt
+          } | tee RUNTIME.txt
 
+      # only what this run built is uploaded: the other runtimes stay as they are in the release
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: strata-runtime
           name: Strata runtime (latest build)
           prerelease: true
           make_latest: false
-          body_path: runtimes/RUNTIME.txt
+          body_path: RUNTIME.txt
           files: |
-            runtimes/strata-runtime-linux-x86_64.tar.gz
-            runtimes/strata-runtime-hip-linux-x86_64.tar.gz
-            runtimes/RUNTIME.txt
+            built/*
+            RUNTIME.txt

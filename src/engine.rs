@@ -136,14 +136,14 @@ impl LoadRequest {
         if self.gpus.is_empty() && !self.amd_gpus.is_empty() {
             runtime::Backend::Hip
         } else {
-            runtime::Backend::Cuda
+            runtime::Backend::Main
         }
     }
 
     /// The cards of this load, numbered as its backend's runtime numbers them.
     pub fn backend_gpus(&self) -> &[u32] {
         match self.backend() {
-            runtime::Backend::Cuda => &self.gpus,
+            runtime::Backend::Main => &self.gpus,
             runtime::Backend::Hip => &self.amd_gpus,
         }
     }
@@ -587,12 +587,34 @@ impl Group {
                 Ok(())
             });
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // its own process group and no console window of its own
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        }
         // The plugin host talks to the POM over its own stdin/stdout: a child
         // must never inherit them.
         command.stdin(Stdio::null());
         Ok(Self {
             child: command.spawn()?,
         })
+    }
+
+    /// Windows has no process group to signal: ends the child's whole tree
+    /// (the bridge, Strata's server and the engine it started).
+    #[cfg(windows)]
+    fn kill_tree(&self) {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &self.child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
     }
 
     /// Copies the child's output, line by line, to the Strata log file and to
@@ -640,8 +662,8 @@ impl Group {
     pub(crate) fn stop(mut self, grace: Duration) {
         #[cfg(unix)]
         self.signal(libc::SIGTERM);
-        #[cfg(not(unix))]
-        let _ = self.child.kill();
+        #[cfg(windows)]
+        self.kill_tree();
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
             if self.exited().is_some() {
@@ -732,8 +754,8 @@ impl Manager {
                 .filter(|dir| runtime::is_runtime(dir))
         });
         self.update(|snapshot| snapshot.runtime_hip = hip);
-        let cuda = runtime::local_runtime(runtime::Backend::Cuda).or_else(|| {
-            runtime::installed_dir(&self.base, runtime::Backend::Cuda)
+        let cuda = runtime::local_runtime(runtime::Backend::Main).or_else(|| {
+            runtime::installed_dir(&self.base, runtime::Backend::Main)
                 .filter(|dir| runtime::is_runtime(dir))
         });
         if let Some(dir) = cuda {
@@ -744,7 +766,7 @@ impl Manager {
             });
             return;
         }
-        if !runtime::has_release(runtime::Backend::Cuda) {
+        if !runtime::has_release(runtime::Backend::Main) {
             self.update(|snapshot| {
                 snapshot.runtime_error = Some(
                     "no Strata runtime: this is a development build without build/runtime \
@@ -754,7 +776,7 @@ impl Manager {
             });
             return;
         }
-        self.install(runtime::Backend::Cuda);
+        self.install(runtime::Backend::Main);
     }
 
     /// Downloads the pinned runtime of `backend` on a thread (poll_installer).
@@ -893,17 +915,15 @@ impl Manager {
     }
 
     fn python_command(&self, runtime: &Path) -> Result<Command, String> {
-        let python = std::env::var_os("STRATA_PYTHON").unwrap_or_else(|| "python3".into());
+        // STRATA_PYTHON, else the runtime's own (macOS, Windows), else the node's (a Linux POM image has 3.12)
+        let python = std::env::var_os("STRATA_PYTHON")
+            .or_else(|| runtime::python(runtime).map(PathBuf::into_os_string))
+            .unwrap_or_else(|| "python3".into());
+        let python_path = std::env::join_paths([runtime.join("pylib"), runtime.join("strata")])
+            .map_err(|error| format!("bad runtime path: {error}"))?;
         let mut command = Command::new(python);
         command
-            .env(
-                "PYTHONPATH",
-                format!(
-                    "{}:{}",
-                    runtime.join("pylib").display(),
-                    runtime.join("strata").display()
-                ),
-            )
+            .env("PYTHONPATH", python_path)
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env(
@@ -1256,7 +1276,7 @@ impl Manager {
             "engine/strata"
         };
         let mut config = json!({
-            "exe": runtime.join(engine).display().to_string(),
+            "exe": runtime::exe(&runtime, engine).display().to_string(),
             "args": args,
             "cwd": self.base.join("run").display().to_string(),
             "tokenizer": pack.join("tokenizer").display().to_string(),
@@ -1280,7 +1300,7 @@ impl Manager {
         // Vision: the projector is read on the CPU, so the image encoder does not take VRAM from the model.
         // Strata's vision section names its encoder, the projector and the model the projector belongs to.
         if let Some(mmproj) = request.mmproj_path.as_ref().filter(|_| !deepseek41) {
-            let encoder = runtime.join("engine/strata-vision");
+            let encoder = runtime::exe(&runtime, "engine/strata-vision");
             if !encoder.is_file() {
                 return self.fail(format!(
                     "this Strata runtime has no vision encoder ({}): build the runtime again \
@@ -1294,6 +1314,9 @@ impl Manager {
                 "model": request.model_path.display().to_string(),
                 "gpu": false,
             });
+        }
+        if cfg!(target_os = "macos") {
+            config["backend"] = json!("metal");
         }
         if request.backend() == runtime::Backend::Hip {
             config["backend"] = json!("hip");
@@ -1405,7 +1428,7 @@ impl Manager {
         else {
             return self.fail("the earlier stage has no link secret".into());
         };
-        let mut command = Command::new(runtime.join(engine));
+        let mut command = Command::new(runtime::exe(&runtime, engine));
         command
             .arg("--serve")
             .arg("--stage-serve")
@@ -1919,7 +1942,7 @@ mod tests {
             "model_path": "/m/x.gguf", "gpus": [0], "gpu_devices": [nvidia, amd(0)]
         }))
         .unwrap();
-        assert_eq!(both.backend(), runtime::Backend::Cuda);
+        assert_eq!(both.backend(), runtime::Backend::Main);
         assert_eq!(both.backend_gpus(), &[0]);
         let radeon = LoadRequest::from_json(&json!({
             "model_path": "/m/x.gguf", "gpus": [], "gpu_devices": [amd(0), amd(1)]
@@ -1928,7 +1951,7 @@ mod tests {
         assert_eq!(radeon.backend(), runtime::Backend::Hip);
         assert_eq!(radeon.backend_gpus(), &[0, 1]);
         let none = LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"})).unwrap();
-        assert_eq!(none.backend(), runtime::Backend::Cuda);
+        assert_eq!(none.backend(), runtime::Backend::Main);
     }
 
     #[test]

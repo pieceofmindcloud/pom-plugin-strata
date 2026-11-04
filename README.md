@@ -78,22 +78,35 @@ in ROCm's image into `build/runtime-hip` (with `--native` and `ROCM_PATH`, on
 the host, e.g. with AMD's TheRock wheels), carrying the ROCm libraries the
 engine needs.
 
+**macOS (Apple Silicon) and Windows** build their runtime natively with the
+same command: `scripts/build-runtime.sh` runs `scripts/build-runtime-macos.sh`
+(the Metal engine; Command Line Tools, cmake, ninja) or, under Git Bash in the
+MSVC environment with `CUDA_PATH`, `scripts/build-runtime-windows.sh` (CUDA,
+with cuBLAS's DLLs beside the engine). Both carry a standalone CPython 3.12 in
+`python/`, since those nodes have no Python of the POM image.
+
 **Runtimes** are built by the `Build Strata runtime` workflow
-(`.github/workflows/runtime.yml`, 50+ minutes): both runtimes for the NVIDIA and
-AMD families, on their own runners, from the head of the Strata branch
-`strata.lock` names, published to the release `strata-runtime` (replacing the
-previous ones; its `RUNTIME.txt` names their Strata commit). The compiler cache
-(ccache) is kept in the Actions cache per backend, so a build after a small
-change in Strata compiles only what changed. Run it when Strata changes.
+(`.github/workflows/runtime.yml`): one per backend - Linux CUDA and HIP, macOS
+Metal, Windows CUDA - each on its own runner, from the head of the Strata
+branch `strata.lock` names, published to the release `strata-runtime` (its
+`RUNTIME.txt` names their Strata commit). Nothing is compiled twice
+(`scripts/runtime-key.sh`): a runtime whose key (Strata commit, build files,
+bridge) matches the `<asset>.key` already in `strata-runtime` is skipped
+(`force` rebuilds it); an engine whose key matches one in the Actions cache is
+reused, so a change to the bridge only reassembles the runtime around it; and
+otherwise ccache compiles only what changed in Strata.
 
 **Releases** are made by the `Publish release` workflow
-(`.github/workflows/release.yml`, a few minutes): it takes the runtimes of
-`strata-runtime` (or, with `build_runtime`, builds them first) and attaches four
-files to the GitHub release `v<version>`: the library,
-`pom-plugin-linux-x86_64.json`, `strata-runtime-linux-x86_64.tar.gz` and
-`strata-runtime-hip-linux-x86_64.tar.gz`, whose URLs, sizes and SHA-256 the
-library pins; a node downloads and verifies the runtime its GPUs need on first
-use.
+(`.github/workflows/release.yml`, a few minutes): for each selected platform
+(Linux x86_64, macOS aarch64, Windows x86_64) it builds the library on that
+platform's runner, pinned to that platform's runtimes from `strata-runtime`
+(with `build_runtime`, it first brings them up to date through the runtime
+workflow, which builds only what changed). The release `v<version>` gets, per
+platform, the library (`pom-plugin-strata-<platform>.so|dylib|dll`),
+`pom-plugin-<platform>.json` and the runtime archives
+(`strata-runtime-<platform>.tar.gz`, plus `strata-runtime-hip-linux-x86_64.tar.gz`
+on Linux), whose URLs, sizes and SHA-256 the library pins; a node downloads and
+verifies the runtime its GPUs need on first use.
 
 ## Known limits
 
@@ -110,7 +123,10 @@ use.
   at most 512 rows, one at a time. **The split's output has not been compared
   with the whole model's yet.**
 - Linux x86_64 with NVIDIA cards of compute capability 7.5 or newer (CUDA) or
-  wave32 AMD cards (HIP).
+  wave32 AMD cards (HIP); Windows x86_64 with NVIDIA cards (CUDA); an Apple
+  Silicon Mac (M1 or newer, macOS 15 or newer, Metal). The macOS and Windows
+  builds are new and not yet validated on a node: the layer-slice stage link
+  on Metal and AMD cards on Windows are untested or absent.
 - The model is prepared once per file into `<POM database dir>/strata/packs/`
   (about 1.5 GB for the IQ3_XXS file). The MTP draft layer is used only when a
   prepared one is found (see the guide).

@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 # Builds the Strata runtime (engine, server, pack tools and their Python
-# packages) for Linux x86_64 in the POM's CUDA build image, into
-# build/runtime/ - or, with --hip, for AMD cards in ROCm's image, into
-# build/runtime-hip/ with the ROCm libraries the engine needs. With --archive
-# it also writes the release asset dist-release/strata-runtime[-hip]-linux-x86_64.tar.gz.
+# packages) for the platform it runs on, into build/runtime/:
+#   Linux x86_64   in the POM's CUDA build image - or, with --hip, for AMD
+#                  cards in ROCm's image, into build/runtime-hip/ with the ROCm
+#                  libraries the engine needs;
+#   macOS aarch64  natively, the Metal engine (scripts/build-runtime-macos.sh);
+#   Windows x86_64 natively under Git Bash with MSVC and the CUDA toolkit
+#                  (scripts/build-runtime-windows.sh).
+# With --archive it also writes the release asset
+# dist-release/strata-runtime[-hip]-<platform>.tar.gz.
+#
+# The engine is the slow part: with ENGINE_KEY set (scripts/runtime-key.sh) a
+# compiled engine kept in build/cache/engine/<backend> under the same key is
+# reused instead of compiled, so a runtime whose engine inputs did not change
+# (only the bridge, the app, the Python packages) builds in minutes.
 #
 # The architectures default to the development machines' cards (CUDA 86;120,
 # HIP gfx1101); a release passes CUDA_ARCHITECTURES and HIP_ARCHITECTURES with
@@ -60,8 +70,9 @@ if ((worktree)); then
   work="$strata_source"
   STRATA_COMMIT="$(git -C "$strata_source" rev-parse HEAD)-dirty"
 else
-# The head of the Strata branch now, every build: the commit is recorded in RUNTIME.json.
-STRATA_COMMIT="$(git ls-remote "$STRATA_REPOSITORY" "refs/heads/$STRATA_BRANCH" | cut -f1)"
+# The head of the Strata branch now (or STRATA_COMMIT, which CI resolves once for the whole run): it is recorded in
+# RUNTIME.json.
+STRATA_COMMIT="${STRATA_COMMIT:-$(git ls-remote "$STRATA_REPOSITORY" "refs/heads/$STRATA_BRANCH" | cut -f1)}"
 [[ -n "$STRATA_COMMIT" ]] || { echo "build-runtime: branch $STRATA_BRANCH not found in $STRATA_REPOSITORY" >&2; exit 2; }
 echo "build-runtime: Strata $STRATA_BRANCH at $STRATA_COMMIT"
 rm -rf "$work"
@@ -95,7 +106,23 @@ fi
 fi
 
 mkdir -p "$root/build/cache"
-if ((hip && native)); then
+case "$(uname -s)" in
+  Darwin) host_os=macos ;;
+  MINGW*|MSYS*|CYGWIN*) host_os=windows ;;
+  *) host_os=linux ;;
+esac
+if [[ "$host_os" != linux ]]; then
+  ((hip == 0)) || { echo 'build-runtime: --hip builds on Linux only' >&2; exit 2; }
+  runtime_dir=runtime
+  if [[ "$host_os" == macos ]]; then
+    asset_name=strata-runtime-macos-aarch64.tar.gz
+  else
+    asset_name=strata-runtime-windows-x86_64.tar.gz
+  fi
+  SRC_DIR="$work" OUT_DIR="$root/build/$runtime_dir" CACHE_DIR="$root/build/cache" \
+    STRATA_COMMIT="$STRATA_COMMIT" LLAMA_CPP_COMMIT="$LLAMA_CPP_COMMIT" RUNTIME_VERSION="$version" \
+    ENGINE_KEY="${ENGINE_KEY:-}" "$root/scripts/build-runtime-${host_os}.sh"
+elif ((hip && native)); then
   [[ -n "${ROCM_PATH:-}" && -x "$ROCM_PATH/llvm/bin/clang++" ]] \
     || { echo 'build-runtime: --native needs ROCM_PATH with llvm/bin/clang++ (a ROCm with the HIP development files)' >&2; exit 2; }
   SRC_DIR="$work" PLUGIN_DIR="$root" WORK_DIR="$root/build/cache" OUT_DIR="$root/build" \
@@ -119,13 +146,14 @@ else
   arch_env=(-e CUDA_ARCHITECTURES="$archs")
 fi
 
-((hip && native)) || docker run --rm \
+[[ "$host_os" != linux ]] || ((hip && native)) || docker run --rm \
   --user "$(id -u):$(id -g)" \
   -e HOME=/tmp \
   "${arch_env[@]}" \
   -e STRATA_COMMIT="$STRATA_COMMIT" \
   -e LLAMA_CPP_COMMIT="$LLAMA_CPP_COMMIT" \
   -e RUNTIME_VERSION="$version" \
+  -e ENGINE_KEY="${ENGINE_KEY:-}" \
   -e CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-4G}" \
   -v "$work:/src:ro" \
   -v "$root:/plugin:ro" \
@@ -140,8 +168,11 @@ if ((archive)); then
   mkdir -p "$root/dist-release"
   asset="$root/dist-release/$asset_name"
   # the archive unpacks as runtime/ whatever the backend (runtime::install)
-  tar -C "$root/build" -czf "$asset" --transform "s,^${runtime_dir},runtime," "$runtime_dir"
-  sha256="$(sha256sum "$asset" | awk '{print $1}')"
+  # (macOS's tar has no --transform; its runtime is already runtime/)
+  transform=()
+  [[ "$runtime_dir" == runtime ]] || transform=(--transform "s,^${runtime_dir},runtime,")
+  tar -C "$root/build" -czf "$asset" "${transform[@]}" "$runtime_dir"
+  sha256="$("$root/scripts/sha256.sh" "$asset")"
   size="$(wc -c < "$asset" | tr -d '[:space:]')"
   printf 'runtime_asset=%s\nruntime_sha256=%s\nruntime_size=%s\n' "$asset" "$sha256" "$size"
 fi

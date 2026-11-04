@@ -16,6 +16,7 @@ feature_set="strata.inference"
 reason="release strata plugin"
 repository="${GITHUB_REPOSITORY:-pieceofmindcloud/pom-plugin-strata}"
 dry_run=false
+platform="linux-x86_64"
 
 usage() {
   printf '%s\n' \
@@ -25,6 +26,7 @@ usage() {
     '  --channel <channel>     release channel (default: stable)' \
     '  --feature-set <a,b>     feature_set metadata (default: strata.inference)' \
     '  --reason <text>         release reason' \
+    '  --platform <platform>   linux-x86_64 (default), macos-aarch64 or windows-x86_64' \
     '  --dry-run               download and verify, without uploading'
 }
 
@@ -40,6 +42,7 @@ while (($# > 0)); do
     --channel) (($# >= 2)) || die '--channel requires a value'; channel="$2"; shift 2 ;;
     --feature-set) (($# >= 2)) || die '--feature-set requires a value'; feature_set="$2"; shift 2 ;;
     --reason) (($# >= 2)) || die '--reason requires a value'; reason="$2"; shift 2 ;;
+    --platform) (($# >= 2)) || die '--platform requires a value'; platform="$2"; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1" ;;
@@ -56,18 +59,21 @@ if [[ "$dry_run" != true ]]; then
 fi
 
 # The names package.sh gives the release assets (see its header and the public manifest it writes).
-platform="linux-x86_64"
-os="linux"
-arch="x86_64"
+case "$platform" in
+  linux-x86_64) os="linux"; arch="x86_64"; ext="so" ;;
+  macos-aarch64) os="macos"; arch="aarch64"; ext="dylib" ;;
+  windows-x86_64) os="windows"; arch="x86_64"; ext="dll" ;;
+  *) die "unsupported platform: $platform" ;;
+esac
 download_dir="$(mktemp -d "${TMPDIR:-/tmp}/pom-plugin-strata-publish.XXXXXX")"
 trap 'rm -rf "$download_dir"' EXIT
 
 gh release download "$version" --repo "$repository" --dir "$download_dir" --clobber \
-  --pattern "pom-plugin-strata-${platform}.so" --pattern "pom-plugin-${platform}.json"
+  --pattern "pom-plugin-strata-${platform}.${ext}" --pattern "pom-plugin-${platform}.json"
 
-artifact="${download_dir}/pom-plugin-strata-${platform}.so"
+artifact="${download_dir}/pom-plugin-strata-${platform}.${ext}"
 manifest="${download_dir}/pom-plugin-${platform}.json"
-[[ -f "$artifact" ]] || die "release ${version} has no library asset: pom-plugin-strata-${platform}.so"
+[[ -f "$artifact" ]] || die "release ${version} has no library asset: pom-plugin-strata-${platform}.${ext}"
 [[ -f "$manifest" ]] || die "release ${version} has no public manifest: pom-plugin-${platform}.json"
 
 expected_sha256="$(jq -r '.sha256' "$manifest")"

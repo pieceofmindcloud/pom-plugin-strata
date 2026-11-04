@@ -14,10 +14,17 @@
 //!    SHA-256), downloaded once into the plugin directory and verified before
 //!    it is unpacked.
 //!
-//! One runtime per GPU backend: CUDA for NVIDIA cards (the above) and HIP for
-//! AMD ones - `STRATA_RUNTIME_HIP_DIR`, `build/runtime-hip`,
-//! `STRATA_RUNTIME_HIP_URL` - which carries the ROCm libraries the engine
-//! needs in its `lib/` (a POM node has none). A process runs one backend.
+//! One runtime per GPU backend. The main one is the platform's: CUDA for
+//! NVIDIA cards on Linux and Windows, Metal on an Apple Silicon Mac. On Linux
+//! there is also HIP for AMD cards - `STRATA_RUNTIME_HIP_DIR`,
+//! `build/runtime-hip`, `STRATA_RUNTIME_HIP_URL` - which carries the ROCm
+//! libraries the engine needs in its `lib/` (a POM node has none). A process
+//! runs one backend.
+//!
+//! The layout is the same on every platform (`scripts/build-runtime*.sh`):
+//! programs carry the platform's executable suffix (`exe`), and the macOS and
+//! Windows runtimes carry their own Python in `python/` (`python`), where a
+//! Linux POM node image already has one.
 
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -28,21 +35,24 @@ include!(concat!(env!("OUT_DIR"), "/runtime_release.rs"));
 /// The GPU backend a runtime's engine was built for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    Cuda,
+    /// The platform's own: CUDA on Linux and Windows, Metal on macOS.
+    Main,
+    /// AMD cards on Linux.
     Hip,
 }
 
 impl Backend {
     pub fn name(self) -> &'static str {
         match self {
-            Backend::Cuda => "cuda",
+            Backend::Main if cfg!(target_os = "macos") => "metal",
+            Backend::Main => "cuda",
             Backend::Hip => "hip",
         }
     }
 
     fn release(self) -> (&'static str, &'static str, u64) {
         match self {
-            Backend::Cuda => (RUNTIME_URL, RUNTIME_SHA256, RUNTIME_SIZE),
+            Backend::Main => (RUNTIME_URL, RUNTIME_SHA256, RUNTIME_SIZE),
             Backend::Hip => (RUNTIME_HIP_URL, RUNTIME_HIP_SHA256, RUNTIME_HIP_SIZE),
         }
     }
@@ -51,9 +61,24 @@ impl Backend {
 /// What a usable runtime directory must contain.
 pub fn is_runtime(dir: &Path) -> bool {
     dir.join("RUNTIME.json").is_file()
-        && dir.join("engine/strata").is_file()
+        && exe(dir, "engine/strata").is_file()
         && dir.join("pom_strata_server.py").is_file()
         && dir.join("strata/serve/server.py").is_file()
+}
+
+/// A program of the runtime, with the platform's executable suffix (`.exe` on Windows).
+pub fn exe(runtime: &Path, name: &str) -> PathBuf {
+    runtime.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// The Python the runtime carries (macOS and Windows), when it carries one.
+pub fn python(runtime: &Path) -> Option<PathBuf> {
+    let path = if cfg!(windows) {
+        runtime.join("python/python.exe")
+    } else {
+        runtime.join("python/bin/python3")
+    };
+    path.is_file().then_some(path)
 }
 
 pub fn version_of(dir: &Path) -> Option<String> {
@@ -71,7 +96,7 @@ pub fn version_of(dir: &Path) -> Option<String> {
 /// A runtime that needs no download, when there is one.
 pub fn local_runtime(backend: Backend) -> Option<PathBuf> {
     let (variable, dev) = match backend {
-        Backend::Cuda => ("STRATA_RUNTIME_DIR", DEV_RUNTIME_DIR),
+        Backend::Main => ("STRATA_RUNTIME_DIR", DEV_RUNTIME_DIR),
         Backend::Hip => ("STRATA_RUNTIME_HIP_DIR", DEV_RUNTIME_HIP_DIR),
     };
     if let Some(dir) = std::env::var_os(variable).map(PathBuf::from) {
