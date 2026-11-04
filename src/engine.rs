@@ -1809,10 +1809,19 @@ fn conversation_cache_args(request: &LoadRequest) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// An absolute path in the form `path.is_absolute()` takes on the platform: Windows wants a drive.
+    fn abs(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
     #[test]
     fn conversation_parking_follows_the_deployment_on_a_whole_model_only() {
         let load = |settings: Value| {
-            LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "settings": settings}))
+            LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf"), "settings": settings}))
                 .unwrap()
         };
         let parked = load(
@@ -1845,7 +1854,7 @@ mod tests {
     #[test]
     fn a_load_request_is_read_with_safe_defaults() {
         let request = LoadRequest::from_json(&json!({
-            "model_path": "/models/Q-IQ3_XXS-00001-of-00002.gguf",
+            "model_path": abs("/models/Q-IQ3_XXS-00001-of-00002.gguf"),
             "model_label": "qwen3.8-flash-next",
             "n_ctx": 65536,
             "gpus": [0, 1, 99],
@@ -1862,30 +1871,31 @@ mod tests {
         assert!(!request.settings.contains_key("kv_cache"));
         assert!(request.settings.contains_key("fit_max_tokens"));
         let plain =
-            LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "kv": "q4_0"})).unwrap();
+            LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf"), "kv": "q4_0"})).unwrap();
         assert_eq!(plain.model_label, "x");
         assert_eq!(plain.context, DEFAULT_CONTEXT);
         assert_eq!(plain.kv, "int8");
         assert!(LoadRequest::from_json(&json!({"model_path": "relative.gguf"})).is_err());
         // the prefill/decode role: both is no role, an unknown one is refused
-        let role =
-            |role: &str| LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "role": role}));
+        let role = |role: &str| {
+            LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf"), "role": role}))
+        };
         assert_eq!(role("prefill").unwrap().role.as_deref(), Some("prefill"));
         assert_eq!(role("both").unwrap().role, None);
         assert_eq!(role("shared").unwrap().role.as_deref(), Some("shared"));
         assert!(role("decode").is_err());
         let threshold = LoadRequest::from_json(
-            &json!({"model_path": "/m/x.gguf", "role": "prefill", "prefill_min_tokens": 2048}),
+            &json!({"model_path": abs("/m/x.gguf"), "role": "prefill", "prefill_min_tokens": 2048}),
         )
         .unwrap();
         assert_eq!(threshold.prefill_min_tokens, Some(2048));
         assert!(role("other").is_err());
         assert!(LoadRequest::from_json(
-            &json!({"model_path": "/m/x.gguf", "mmproj_path": "rel.gguf"})
+            &json!({"model_path": abs("/m/x.gguf"), "mmproj_path": "rel.gguf"})
         )
         .is_err());
         assert!(LoadRequest::from_json(
-            &json!({"model_path": "/m/x.gguf", "mmproj_path": "/no/such/mmproj.gguf"})
+            &json!({"model_path": abs("/m/x.gguf"), "mmproj_path": "/no/such/mmproj.gguf"})
         )
         .is_err());
         assert!(LoadRequest::from_json(&json!({})).is_err());
@@ -1939,18 +1949,18 @@ mod tests {
         let amd = |ordinal: u32| json!({"vendor": "amd", "ordinal": ordinal, "index": ordinal + 1});
         let nvidia = json!({"vendor": "nvidia", "ordinal": 0, "index": 0});
         let both = LoadRequest::from_json(&json!({
-            "model_path": "/m/x.gguf", "gpus": [0], "gpu_devices": [nvidia, amd(0)]
+            "model_path": abs("/m/x.gguf"), "gpus": [0], "gpu_devices": [nvidia, amd(0)]
         }))
         .unwrap();
         assert_eq!(both.backend(), runtime::Backend::Main);
         assert_eq!(both.backend_gpus(), &[0]);
         let radeon = LoadRequest::from_json(&json!({
-            "model_path": "/m/x.gguf", "gpus": [], "gpu_devices": [amd(0), amd(1)]
+            "model_path": abs("/m/x.gguf"), "gpus": [], "gpu_devices": [amd(0), amd(1)]
         }))
         .unwrap();
         assert_eq!(radeon.backend(), runtime::Backend::Hip);
         assert_eq!(radeon.backend_gpus(), &[0, 1]);
-        let none = LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"})).unwrap();
+        let none = LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf")})).unwrap();
         assert_eq!(none.backend(), runtime::Backend::Main);
     }
 
@@ -1991,22 +2001,23 @@ mod tests {
     fn the_drafter_choice_is_read_and_checked() {
         let file = std::env::temp_dir().join(format!("pom-dspark-{}.gguf", std::process::id()));
         std::fs::write(&file, b"x").unwrap();
-        let ok =
-            LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "mtp_draft_path": file}))
-                .unwrap();
+        let ok = LoadRequest::from_json(
+            &json!({"model_path": abs("/m/x.gguf"), "mtp_draft_path": file}),
+        )
+        .unwrap();
         assert_eq!(ok.mtp_draft_path.as_deref(), Some(file.as_path()));
         assert_eq!(
-            LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"}))
+            LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf")}))
                 .unwrap()
                 .mtp_draft_path,
             None
         );
         assert!(LoadRequest::from_json(
-            &json!({"model_path": "/m/x.gguf", "mtp_draft_path": "rel.gguf"})
+            &json!({"model_path": abs("/m/x.gguf"), "mtp_draft_path": "rel.gguf"})
         )
         .is_err());
         assert!(LoadRequest::from_json(
-            &json!({"model_path": "/m/x.gguf", "mtp_draft_path": "/no/such.gguf"})
+            &json!({"model_path": abs("/m/x.gguf"), "mtp_draft_path": "/no/such.gguf"})
         )
         .is_err());
         let _ = std::fs::remove_file(file);
@@ -2193,7 +2204,7 @@ mod tests {
     fn a_stage_link_is_read_and_checked() {
         let token = "t".repeat(32);
         let request = LoadRequest::from_json(&json!({
-            "model_path": "/m/tail.gguf",
+            "model_path": abs("/m/tail.gguf"),
             "link": {"token": token, "prev_port": 4100, "max_inflight": 4}
         }))
         .unwrap();
@@ -2201,7 +2212,7 @@ mod tests {
         assert_eq!(link.prev_port, Some(4100));
         assert_eq!(link.max_inflight, Some(4));
         assert_eq!(link.token.as_deref(), Some(token.as_str()));
-        let first = LoadRequest::from_json(&json!({"model_path": "/m/head.gguf", "link": {}}))
+        let first = LoadRequest::from_json(&json!({"model_path": abs("/m/head.gguf"), "link": {}}))
             .unwrap()
             .link
             .unwrap();
@@ -2212,12 +2223,15 @@ mod tests {
             json!({"token": token, "prev_port": 4100, "max_inflight": 0}),
         ] {
             assert!(
-                LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "link": bad})).is_err()
+                LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf"), "link": bad}))
+                    .is_err()
             );
         }
-        assert!(LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"}))
-            .unwrap()
-            .link
-            .is_none());
+        assert!(
+            LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf")}))
+                .unwrap()
+                .link
+                .is_none()
+        );
     }
 }

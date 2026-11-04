@@ -123,6 +123,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # The self-hosted MacBook has a pom-release `cargo` wrapper in ~/.cargo/bin that stops unless
+      # POM_RELEASE_REAL_CARGO names the cargo it wraps: the toolchain's own cargo is that one, and it
+      # goes first on PATH so this job runs it directly.
+      - name: The toolchain's cargo (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          real="$(rustup which cargo)"
+          echo "POM_RELEASE_REAL_CARGO=$real" >> "$GITHUB_ENV"
+          dirname "$real" >> "$GITHUB_PATH"
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.platform }}

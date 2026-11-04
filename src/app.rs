@@ -710,13 +710,17 @@ mod tests {
     fn the_gateway_comes_from_host_configure() {
         let gateway = Gateway::from_configure(&json!({
             "gateway": {"openai_base_url": "http://127.0.0.1:8080/v1/", "api_key": "k"},
-            "workspace_root": "/data/workspace",
+            "workspace_root": if cfg!(windows) { "C:/data/workspace" } else { "/data/workspace" },
         }))
         .unwrap();
         assert_eq!(gateway.openai_base_url, "http://127.0.0.1:8080/v1");
         assert_eq!(
             gateway.workspace_root,
-            Some(PathBuf::from("/data/workspace"))
+            Some(PathBuf::from(if cfg!(windows) {
+                "C:/data/workspace"
+            } else {
+                "/data/workspace"
+            }))
         );
         assert!(Gateway::from_configure(&json!({"gateway": {"openai_base_url": "x"}})).is_none());
         let relative = Gateway::from_configure(&json!({
