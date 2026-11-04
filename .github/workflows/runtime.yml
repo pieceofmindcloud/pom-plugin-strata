@@ -190,15 +190,16 @@ jobs:
           arch: x64
 
       # Only the parts of the toolkit the engine needs, from NVIDIA's network installer; kept in the Actions cache.
+      # Also when the engine comes from its cache: build-runtime-windows.sh checks nvcc before it looks there.
       - name: CUDA toolkit cache (Windows)
         id: cuda
-        if: ${{ runner.os == 'Windows' && steps.engine.outputs.cache-hit != 'true' }}
+        if: ${{ runner.os == 'Windows' }}
         uses: actions/cache@v4
         with:
           path: C:\cuda
           key: cuda-windows-${{ env.CUDA_WINDOWS_VERSION }}
       - name: CUDA toolkit (Windows)
-        if: ${{ runner.os == 'Windows' && steps.engine.outputs.cache-hit != 'true' }}
+        if: ${{ runner.os == 'Windows' }}
         shell: pwsh
         run: |
           $v = $env:CUDA_WINDOWS_VERSION
