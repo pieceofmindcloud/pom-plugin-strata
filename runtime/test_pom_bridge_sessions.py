@@ -473,6 +473,19 @@ class SessionSaveSetting(unittest.TestCase):
         self.assertEqual(self.run_with(cfg), cfg)
         self.assertFalse(B.SESSIONS_ON)
 
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_deepseek41_takes_the_vram_reserve_as_reserve_mib(self):
+        written = self.run_with({"model": "m", "arch": "deepseek41", "args": ["--pack", "p"],
+                                 "pom_settings": {"vram_reserve_mib": 500}})
+        self.assertNotIn("--vram-reserve-mib", written["args"])     # strata-dsv41 refuses it: unknown option
+        self.assertEqual(written["args"][written["args"].index("--reserve-mib") + 1], "500")
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_other_engines_keep_vram_reserve_mib(self):
+        written = self.run_with({"model": "m", "args": ["--pack", "p"], "pom_settings": {"vram_reserve_mib": 500}})
+        self.assertEqual(written["args"][written["args"].index("--vram-reserve-mib") + 1], "500")
+        self.assertNotIn("--reserve-mib", written["args"])
+
 
 if __name__ == "__main__":
     unittest.main()
