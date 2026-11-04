@@ -94,7 +94,10 @@ branch `strata.lock` names, published to the release `strata-runtime` (its
 bridge) matches the `<asset>.key` already in `strata-runtime` is skipped
 (`force` rebuilds it); an engine whose key matches one in the Actions cache is
 reused, so a change to the bridge only reassembles the runtime around it; and
-otherwise ccache compiles only what changed in Strata.
+otherwise ccache compiles only what changed in Strata. On Windows nvcc also goes
+through ccache. `strata_commits` (e.g. `cuda=<sha>,cuda-windows=<sha>`) keeps a
+backend on a Strata commit whose engine is cached, when a new Strata commit
+only matters to another backend.
 
 **Releases** are made by the `Publish release` workflow
 (`.github/workflows/release.yml`, a few minutes): for each selected platform

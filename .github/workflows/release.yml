@@ -39,6 +39,10 @@ on:
         description: 'Bring the Strata runtimes up to date first (else: the latest of the strata-runtime release as is)'
         type: boolean
         default: false
+      strata_commits:
+        description: 'With build_runtime: pin backends to a Strata commit, e.g. cuda=<sha>,hip=<sha>,cuda-windows=<sha>'
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -85,6 +89,7 @@ jobs:
     uses: ./.github/workflows/runtime.yml
     with:
       platforms: ${{ needs.plan.outputs.backends }}
+      strata_commits: ${{ inputs.strata_commits }}
 
   package:
     name: Package ${{ matrix.platform }} ${{ inputs.version }}

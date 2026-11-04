@@ -27,6 +27,10 @@ on:
         description: 'Build even when strata-runtime already has the same runtime'
         type: boolean
         default: false
+      strata_commits:
+        description: 'Pin backends to a Strata commit, e.g. cuda=caa656b0...,hip=caa656b0... (others: the branch head)'
+        type: string
+        default: ''
   # release.yml calls it when asked to build the runtimes too
   workflow_call:
     inputs:
@@ -36,6 +40,9 @@ on:
       force:
         type: boolean
         default: false
+      strata_commits:
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -55,7 +62,6 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       build: ${{ steps.plan.outputs.build }}
-      strata_commit: ${{ steps.plan.outputs.strata_commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,15 +69,25 @@ jobs:
       - id: plan
         shell: bash
         run: |
-          commit="$(scripts/runtime-key.sh cuda | sed -n 's/^strata_commit=//p')"
-          echo "strata_commit=$commit" >> "$GITHUB_OUTPUT"
+          head="$(scripts/runtime-key.sh cuda | sed -n 's/^strata_commit=//p')"
+          # a backend pinned in strata_commits keeps that commit (and so the engine cached for it); the others take the head
+          commit_for() {
+            local pin
+            pin="$(tr ',' '\n' <<<"$PINS" | sed -n "s/^ *$1=\([0-9a-f]\{40\}\) *$/\1/p" | head -1)"
+            printf '%s' "${pin:-$head}"
+          }
+          if [[ -n "$PINS" ]]; then
+            tr ',' '\n' <<<"$PINS" | grep -vE '^ *(cuda|hip|metal|cuda-windows)=[0-9a-f]{40} *$' | grep . \
+              && { echo 'strata_commits: use backend=<full 40-character commit>, comma separated' >&2; exit 2; }
+          fi
           # the keys of the runtimes strata-runtime has now
           mkdir -p published
           gh release download strata-runtime --repo "$GITHUB_REPOSITORY" --dir published --pattern '*.key' 2>/dev/null || true
           entries=()
           add() { # backend runner asset
             [[ ",$PLATFORMS," == *",$1,"* ]] || return 0
-            local keys engine runtime
+            local keys engine runtime commit
+            commit="$(commit_for "$1")"
             keys="$(scripts/runtime-key.sh "$1" "$commit")"
             engine="$(sed -n 's/^engine_key=//p' <<<"$keys")"
             runtime="$(sed -n 's/^runtime_key=//p' <<<"$keys")"
@@ -79,9 +95,10 @@ jobs:
               echo "$3: up to date ($runtime), not built"
               return 0
             fi
-            entries+=("$(jq -cn --arg backend "$1" --arg runner "$2" --arg asset "$3" \
+            echo "$3: Strata $commit"
+            entries+=("$(jq -cn --arg backend "$1" --arg runner "$2" --arg asset "$3" --arg commit "$commit" \
               --arg engine_key "$engine" --arg runtime_key "$runtime" \
-              '{backend:$backend, runner:$runner, asset:$asset, engine_key:$engine_key, runtime_key:$runtime_key}')")
+              '{backend:$backend, runner:$runner, asset:$asset, commit:$commit, engine_key:$engine_key, runtime_key:$runtime_key}')")
           }
           add cuda         ubuntu-24.04 strata-runtime-linux-x86_64.tar.gz
           add hip          ubuntu-24.04 strata-runtime-hip-linux-x86_64.tar.gz
@@ -98,6 +115,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PLATFORMS: ${{ inputs.platforms || 'cuda,hip,metal,cuda-windows' }}
           FORCE: ${{ inputs.force && 'true' || 'false' }}
+          PINS: ${{ inputs.strata_commits }}
 
   runtime:
     name: Runtime ${{ matrix.backend }}
@@ -112,7 +130,7 @@ jobs:
       run:
         shell: bash
     env:
-      STRATA_COMMIT: ${{ needs.plan.outputs.strata_commit }}
+      STRATA_COMMIT: ${{ matrix.commit }}
       ENGINE_KEY: ${{ matrix.engine_key }}
       BUILD_JOBS: '4'
       # the backends share the repository's 10 GB of Actions cache
@@ -159,6 +177,12 @@ jobs:
       - name: Tools (Windows)
         if: ${{ runner.os == 'Windows' }}
         run: choco install -y --no-progress ninja ccache
+
+      # nvcc through ccache too (CMake reads the launcher from the environment): the CUDA objects are most of the
+      # Windows build's hours. Set here, not in build-runtime-windows.sh, so the engine key stays the same.
+      - name: CUDA compiler cache (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        run: echo "CMAKE_CUDA_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
 
       - uses: ilammy/msvc-dev-cmd@v1
         if: ${{ runner.os == 'Windows' }}
