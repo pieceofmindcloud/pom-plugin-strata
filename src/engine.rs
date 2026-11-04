@@ -1436,10 +1436,18 @@ impl Manager {
                     .env("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
                     .env("CUDA_VISIBLE_DEVICES", list.join(","));
             }
-            if gpus.len() > 1 {
+            // strata-dsv41 spreads its layers over every card it sees and has no --layer-split ("unknown option")
+            if gpus.len() > 1 && engine != "engine/strata-dsv41" {
                 command.args(["--layer-split", "auto"]);
             }
         }
+        // The bridge applies the deployment's engine settings to a whole model or the last stage; an earlier stage
+        // runs the engine alone, and of those settings only the VRAM reserve is about it (the rest are about
+        // answering). Without this it was dropped, and the stage left the engine's default free.
+        command.args(vram_reserve_args(
+            &request.settings,
+            engine == "engine/strata-dsv41",
+        ));
         if request.backend() == runtime::Backend::Hip {
             let lib = runtime.join("lib");
             let path = match std::env::var_os("LD_LIBRARY_PATH") {
@@ -1682,6 +1690,20 @@ fn deepseek41_pack_ready(pack: &Path, drafter: Option<&Path>) -> bool {
                 .file_name()
                 .is_some_and(|name| tensors.contains(&*name.to_string_lossy()))
     })
+}
+
+/// The deployment's `vram_reserve_mib`, as the engine's option: `strata-dsv41` names it `--reserve-mib`, the Qwen
+/// engine `--vram-reserve-mib` (the bridge renames it the same way for a whole model). Empty when not set.
+fn vram_reserve_args(settings: &serde_json::Map<String, Value>, deepseek41: bool) -> Vec<String> {
+    let Some(mib) = settings.get("vram_reserve_mib").and_then(Value::as_u64) else {
+        return Vec::new();
+    };
+    let flag = if deepseek41 {
+        "--reserve-mib"
+    } else {
+        "--vram-reserve-mib"
+    };
+    vec![flag.to_owned(), mib.to_string()]
 }
 
 /// What `strata-dsv41` takes: it places the experts itself and has no flag for the rest of the Qwen engine's.
@@ -2128,6 +2150,20 @@ mod tests {
             deepseek41_engine_args(Path::new("/p"), 8192, None, false),
             ["--pack", "/p", "--max-context", "8192", "--dspark", "none"]
         );
+    }
+
+    /// An earlier stage runs the engine alone: the deployment's VRAM reserve reaches it in the engine's own name.
+    #[test]
+    fn an_earlier_stage_takes_the_vram_reserve_in_its_engine_s_name() {
+        let settings = json!({"vram_reserve_mib": 500, "reasoning_effort": "none"});
+        let settings = settings.as_object().unwrap();
+        assert_eq!(vram_reserve_args(settings, true), ["--reserve-mib", "500"]);
+        assert_eq!(
+            vram_reserve_args(settings, false),
+            ["--vram-reserve-mib", "500"]
+        );
+        let none = json!({"reasoning_effort": "none"});
+        assert!(vram_reserve_args(none.as_object().unwrap(), true).is_empty());
     }
 
     #[test]
