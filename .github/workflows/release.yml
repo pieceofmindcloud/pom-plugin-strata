@@ -39,6 +39,11 @@ on:
         description: 'Bring the Strata runtimes up to date first (else: the latest of the strata-runtime release as is)'
         type: boolean
         default: false
+      mac_runner:
+        description: 'Where the macOS build runs: macos-26 (GitHub), macos-15 (GitHub, older SDK) or macbook (self-hosted)'
+        type: choice
+        options: [macos-26, macos-15, macbook]
+        default: macos-26
       strata_commits:
         description: 'With build_runtime: pin backends to a Strata commit, e.g. cuda=<sha>,hip=<sha>,cuda-windows=<sha>'
         type: string
@@ -60,16 +65,22 @@ jobs:
         run: |
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] \
             || { echo "version must be X.Y.Z without the v: $VERSION" >&2; exit 2; }
+          # runs-on as JSON: a GitHub label, or the self-hosted MacBook's labels
+          case "$MAC_RUNNER" in
+            macbook) mac='["self-hosted","macOS","ARM64","macbook","metal"]' ;;
+            macos-15|macos-26) mac="\"$MAC_RUNNER\"" ;;
+            *) echo "mac_runner: unknown $MAC_RUNNER" >&2; exit 2 ;;
+          esac
           entries=() backends=()
           # name runner platform ext runtimes(space separated)
           add() {
             [[ "$2" == true ]] || return 0
-            entries+=("$(jq -cn --arg platform "$1" --arg runner "$3" --arg ext "$4" --arg runtimes "$5" \
+            entries+=("$(jq -cn --arg platform "$1" --argjson runner "$3" --arg ext "$4" --arg runtimes "$5" \
               '{platform:$platform, runner:$runner, ext:$ext, runtimes:$runtimes}')")
           }
-          add linux-x86_64   "$LINUX"   ubuntu-24.04 so    'strata-runtime-linux-x86_64.tar.gz strata-runtime-hip-linux-x86_64.tar.gz'
-          add macos-aarch64  "$MACOS"   macos-26     dylib 'strata-runtime-macos-aarch64.tar.gz'
-          add windows-x86_64 "$WINDOWS" windows-2022 dll   'strata-runtime-windows-x86_64.tar.gz'
+          add linux-x86_64   "$LINUX"   '"ubuntu-24.04"' so    'strata-runtime-linux-x86_64.tar.gz strata-runtime-hip-linux-x86_64.tar.gz'
+          add macos-aarch64  "$MACOS"   "$mac"           dylib 'strata-runtime-macos-aarch64.tar.gz'
+          add windows-x86_64 "$WINDOWS" '"windows-2022"' dll   'strata-runtime-windows-x86_64.tar.gz'
           [[ "$LINUX" != true ]] || backends+=(cuda hip)
           [[ "$MACOS" != true ]] || backends+=(metal)
           [[ "$WINDOWS" != true ]] || backends+=(cuda-windows)
@@ -81,6 +92,7 @@ jobs:
           LINUX: ${{ inputs.linux }}
           MACOS: ${{ inputs.macos }}
           WINDOWS: ${{ inputs.windows }}
+          MAC_RUNNER: ${{ inputs.mac_runner }}
 
   runtime:
     name: Strata runtimes
@@ -90,6 +102,7 @@ jobs:
     with:
       platforms: ${{ needs.plan.outputs.backends }}
       strata_commits: ${{ inputs.strata_commits }}
+      mac_runner: ${{ inputs.mac_runner }}
 
   package:
     name: Package ${{ matrix.platform }} ${{ inputs.version }}

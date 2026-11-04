@@ -27,6 +27,11 @@ on:
         description: 'Build even when strata-runtime already has the same runtime'
         type: boolean
         default: false
+      mac_runner:
+        description: 'Where the macOS build runs: macos-26 (GitHub), macos-15 (GitHub, older SDK) or macbook (self-hosted)'
+        type: choice
+        options: [macos-26, macos-15, macbook]
+        default: macos-26
       strata_commits:
         description: 'Pin backends to a Strata commit, e.g. cuda=caa656b0...,hip=caa656b0... (others: the branch head)'
         type: string
@@ -43,6 +48,9 @@ on:
       strata_commits:
         type: string
         default: ''
+      mac_runner:
+        type: string
+        default: macos-26
 
 permissions:
   contents: write
@@ -83,6 +91,12 @@ jobs:
           # the keys of the runtimes strata-runtime has now
           mkdir -p published
           gh release download strata-runtime --repo "$GITHUB_REPOSITORY" --dir published --pattern '*.key' 2>/dev/null || true
+          # runs-on as JSON: a GitHub label, or the self-hosted MacBook's labels
+          case "$MAC_RUNNER" in
+            macbook) mac='["self-hosted","macOS","ARM64","macbook","metal"]' ;;
+            macos-15|macos-26) mac="\"$MAC_RUNNER\"" ;;
+            *) echo "mac_runner: unknown $MAC_RUNNER" >&2; exit 2 ;;
+          esac
           entries=()
           add() { # backend runner asset
             [[ ",$PLATFORMS," == *",$1,"* ]] || return 0
@@ -96,14 +110,14 @@ jobs:
               return 0
             fi
             echo "$3: Strata $commit"
-            entries+=("$(jq -cn --arg backend "$1" --arg runner "$2" --arg asset "$3" --arg commit "$commit" \
+            entries+=("$(jq -cn --arg backend "$1" --argjson runner "$2" --arg asset "$3" --arg commit "$commit" \
               --arg engine_key "$engine" --arg runtime_key "$runtime" \
               '{backend:$backend, runner:$runner, asset:$asset, commit:$commit, engine_key:$engine_key, runtime_key:$runtime_key}')")
           }
-          add cuda         ubuntu-24.04 strata-runtime-linux-x86_64.tar.gz
-          add hip          ubuntu-24.04 strata-runtime-hip-linux-x86_64.tar.gz
-          add metal        macos-26     strata-runtime-macos-aarch64.tar.gz
-          add cuda-windows windows-2022 strata-runtime-windows-x86_64.tar.gz
+          add cuda         '"ubuntu-24.04"' strata-runtime-linux-x86_64.tar.gz
+          add hip          '"ubuntu-24.04"' strata-runtime-hip-linux-x86_64.tar.gz
+          add metal        "$mac"           strata-runtime-macos-aarch64.tar.gz
+          add cuda-windows '"windows-2022"' strata-runtime-windows-x86_64.tar.gz
           if ((${#entries[@]})); then
             echo "build=true" >> "$GITHUB_OUTPUT"
             echo "matrix=$(printf '%s\n' "${entries[@]}" | jq -cs '{include: .}')" >> "$GITHUB_OUTPUT"
@@ -116,6 +130,7 @@ jobs:
           PLATFORMS: ${{ inputs.platforms || 'cuda,hip,metal,cuda-windows' }}
           FORCE: ${{ inputs.force && 'true' || 'false' }}
           PINS: ${{ inputs.strata_commits }}
+          MAC_RUNNER: ${{ inputs.mac_runner || 'macos-26' }}
 
   runtime:
     name: Runtime ${{ matrix.backend }}
