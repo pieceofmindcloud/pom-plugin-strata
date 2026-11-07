@@ -74,9 +74,13 @@ library finds `build/runtime` through the source mount, so nothing has to be
 downloaded.
 
 **AMD cards** run the HIP runtime: `scripts/build-runtime.sh --hip` builds it
-in ROCm's image into `build/runtime-hip` (with `--native` and `ROCM_PATH`, on
-the host, e.g. with AMD's TheRock wheels), carrying the ROCm libraries the
-engine needs.
+into `build/runtime-hip`, carrying the ROCm libraries the engine needs. CI
+builds it in ROCm's image (tens of GB). On a development machine, run
+`scripts/setup-host-rocm.sh` once: it installs AMD's TheRock ROCm SDK for one
+GPU family (`ROCM_GPU_FAMILY`, default `gfx110X-all`) into
+`~/.local/share/pom-strata-rocm`, and `--hip` then builds natively with it, no
+image (`--image` forces the image; `--native` with `ROCM_PATH` takes another
+host ROCm). Keep `HIP_ARCHITECTURES` within that family.
 
 **macOS (Apple Silicon) and Windows** build their runtime natively with the
 same command: `scripts/build-runtime.sh` runs `scripts/build-runtime-macos.sh`
