@@ -69,6 +69,11 @@ pub struct LoadRequest {
     /// The split's threshold (the deployment's `prefill_min_tokens`): the bridge of a prefill machine reads a turn
     /// only when the part the decode machine lacks has this many tokens. `None` = the bridge's default.
     pub prefill_min_tokens: Option<u32>,
+    /// A range of the whole model this machine serves as one stage
+    /// (`{start_layer, end_layer}`, inclusive): Strata cuts it from the whole
+    /// model and its whole-model pack at run time (`--stage-layers`), with no
+    /// slice file. `None` = the whole model, or a slice file as it is.
+    pub range: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -228,7 +233,19 @@ impl LoadRequest {
         let prefill_min_tokens = value["prefill_min_tokens"]
             .as_u64()
             .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32);
+        let range = match &value["range"] {
+            Value::Null => None,
+            range => {
+                let start = range["start_layer"].as_u64();
+                let end = range["end_layer"].as_u64();
+                match (start, end) {
+                    (Some(start), Some(end)) if start <= end => Some((start, end)),
+                    _ => return Err("range needs start_layer <= end_layer".into()),
+                }
+            }
+        };
         Ok(Self {
+            range,
             role,
             prefill_min_tokens,
             model_path,
@@ -444,6 +461,9 @@ impl Snapshot {
             "stages": true,
             // Only Flash-Next runs in slices: the POM offers Qwen3.6 as the whole model only (stage_architectures).
             "stage_architectures": gguf::STAGE_ARCHITECTURES,
+            // The architectures whose stage it can also cut from the whole model at run time (`range` in
+            // `engine.load`, Strata's --stage-layers): the machine keeps the whole file, no slice is written.
+            "stage_ranges": [gguf::STRATA_ARCHITECTURE],
             // Where the POM offers a drafter file to choose: the other families' drafts are the engine's own.
             "draft_architectures": [gguf::DEEPSEEK41_ARCHITECTURE],
             // The POM settings that apply to those stages (the nodes carry the hidden state between them), and the
@@ -462,7 +482,7 @@ impl Snapshot {
 }
 
 enum Command_ {
-    Load(LoadRequest),
+    Load(Box<LoadRequest>),
     Unload,
     Stop,
 }
@@ -535,7 +555,7 @@ impl Engine {
     pub fn load(&self, request: LoadRequest) -> Result<(), String> {
         gguf::inspect(&request.model_path)?;
         self.commands
-            .send(Command_::Load(request))
+            .send(Command_::Load(Box::new(request)))
             .map_err(|_| "the engine manager stopped".to_owned())
     }
 
@@ -688,7 +708,7 @@ enum Work {
     None,
     Packing {
         group: Group,
-        request: LoadRequest,
+        request: Box<LoadRequest>,
     },
     Serving {
         group: Group,
@@ -810,7 +830,7 @@ impl Manager {
         self.find_runtime();
         loop {
             match self.commands.recv_timeout(POLL) {
-                Ok(Command_::Load(request)) => self.load(request),
+                Ok(Command_::Load(request)) => self.load(*request),
                 Ok(Command_::Unload) => self.unload(),
                 Ok(Command_::Stop) | Err(RecvTimeoutError::Disconnected) => {
                     self.unload();
@@ -982,10 +1002,15 @@ impl Manager {
 
     /// The load once the runtime of its backend is here.
     fn load_with(&mut self, runtime: PathBuf, mut request: LoadRequest) {
-        let model = match gguf::inspect(&request.model_path) {
+        let mut model = match gguf::inspect(&request.model_path) {
             Ok(model) => model,
             Err(error) => return self.fail(error),
         };
+        if let Some((start, end)) = request.range {
+            if let Err(error) = apply_range(&mut model, start, end) {
+                return self.fail(error);
+            }
+        }
         if let Some(stage) = model.stage {
             match &request.link {
                 None => return self.fail("a POM slice needs the stage link the POM gives".into()),
@@ -1084,7 +1109,10 @@ impl Manager {
                     Phase::Preparing,
                     Some("preparing the model for Strata".into()),
                 );
-                self.work = Work::Packing { group, request };
+                self.work = Work::Packing {
+                    group,
+                    request: Box::new(request),
+                };
             }
             Err(error) => self.fail(format!("the pack tool did not start: {error}")),
         }
@@ -1188,7 +1216,15 @@ impl Manager {
             "--native".into(),
             request.model_path.display().to_string(),
         ];
-        if model.shards.len() <= 2 {
+        if model.range {
+            if let Some(stage) = model.stage {
+                args.push("--stage-layers".into());
+                args.push(format!("{}-{}", stage.start, stage.end));
+            }
+        }
+        // A stage past layer 1 never runs the PLE block: no table to read.
+        let ple_needed = !(model.range && model.stage.is_some_and(|stage| stage.start > 1));
+        if model.shards.len() <= 2 && ple_needed {
             if let Some(ple) = &model.ple_shard {
                 args.push("--ple-gguf".into());
                 args.push(ple.display().to_string());
@@ -1546,14 +1582,20 @@ impl Manager {
                 let Some(status) = group.exited() else {
                     return;
                 };
-                let request = request.clone();
+                let request = (**request).clone();
                 self.work = Work::None;
                 let pack = self.pack_dir(&request.model_path);
-                let (Some(runtime), Ok(model)) =
+                let (Some(runtime), Ok(mut model)) =
                     (self.runtime(), gguf::inspect(&request.model_path))
                 else {
                     return self.fail("the model or the runtime went away".into());
                 };
+                // The range the load asked for, again: the model was read anew.
+                if let Some((start, end)) = request.range {
+                    if let Err(error) = apply_range(&mut model, start, end) {
+                        return self.fail(error);
+                    }
+                }
                 if !status.success()
                     || !pack_ready(&pack, &model, request.mtp_draft_path.as_deref())
                 {
@@ -1648,7 +1690,32 @@ fn config_gpu(gpus: &[u32], arch: Option<&str>) -> Option<Value> {
 /// how many files its model had, and the flag only converts what needs it. Only `iq_pack.py` takes it.
 fn pack_needs_compat_bf16(model: &gguf::Model) -> bool {
     model.architecture == gguf::STRATA_ARCHITECTURE
-        && (model.shards.len() > 2 || model.stage.is_some())
+        && (model.shards.len() > 2 || (model.stage.is_some() && !model.range))
+}
+
+/// A range of the whole model becomes this load's stage: the same first,
+/// middle and last stage rules as a slice, cut by the engine at run time.
+/// Only Qwen3.8-Flash-Next is split across machines.
+fn apply_range(model: &mut gguf::Model, start: u64, end: u64) -> Result<(), String> {
+    if model.stage.is_some() {
+        return Err("a range is cut from the whole model; this file is already a POM slice".into());
+    }
+    if model.architecture != gguf::STRATA_ARCHITECTURE {
+        return Err("Strata splits only Qwen3.8-Flash-Next across machines".into());
+    }
+    if start > end || end >= model.layers {
+        return Err(format!(
+            "the range {start}-{end} is not inside the model's {} layers",
+            model.layers
+        ));
+    }
+    model.stage = Some(gguf::Stage {
+        start,
+        end,
+        total: model.layers,
+    });
+    model.range = true;
+    Ok(())
 }
 
 /// `tools/dsv41/pack_gguf.py` reads the shards by name from their folder.
@@ -1919,6 +1986,10 @@ mod tests {
         assert_eq!(snapshot.service()["kind"], "inference");
         assert_eq!(snapshot.service()["status"], "waiting");
         assert_eq!(snapshot.service()["stages"], true);
+        assert_eq!(
+            snapshot.service()["stage_ranges"][0],
+            gguf::STRATA_ARCHITECTURE
+        );
         assert_eq!(snapshot.service()["vision"], true);
         assert_eq!(snapshot.service()["pom_settings"][1], "hidden_state_dtype");
         snapshot.port = None;
@@ -1954,6 +2025,58 @@ mod tests {
         assert_eq!(none.backend(), runtime::Backend::Main);
     }
 
+    /// A range of the whole Flash-Next model becomes its stage; a slice file, another family or a range past the
+    /// last layer is refused. The whole model's pack stays the plain one.
+    #[test]
+    fn a_range_of_the_whole_model_becomes_its_stage() {
+        let whole = |architecture: &str| gguf::Model {
+            architecture: architecture.into(),
+            shards: vec![
+                PathBuf::from("/m/a-00001-of-00002.gguf"),
+                PathBuf::from("/m/a-00002-of-00002.gguf"),
+            ],
+            ple_shard: None,
+            layers: 48,
+            stage: None,
+            range: false,
+        };
+        let mut model = whole(gguf::STRATA_ARCHITECTURE);
+        apply_range(&mut model, 24, 47).unwrap();
+        assert_eq!(
+            model.stage,
+            Some(gguf::Stage {
+                start: 24,
+                end: 47,
+                total: 48
+            })
+        );
+        assert!(model.range && model.stage.unwrap().last() && !model.stage.unwrap().first());
+        assert!(
+            !pack_needs_compat_bf16(&model),
+            "a range shares the whole model's pack"
+        );
+
+        assert!(apply_range(&mut whole(gguf::STRATA_ARCHITECTURE), 40, 48).is_err());
+        assert!(apply_range(&mut whole(gguf::QWEN36_ARCHITECTURE), 0, 23).is_err());
+        let mut slice = whole(gguf::STRATA_ARCHITECTURE);
+        slice.stage = Some(gguf::Stage {
+            start: 0,
+            end: 23,
+            total: 48,
+        });
+        assert!(apply_range(&mut slice, 0, 23).is_err());
+
+        let request = LoadRequest::from_json(&json!({
+            "model_path": "/m/x.gguf", "range": {"start_layer": 0, "end_layer": 23}
+        }))
+        .unwrap();
+        assert_eq!(request.range, Some((0, 23)));
+        assert!(LoadRequest::from_json(&json!({
+            "model_path": "/m/x.gguf", "range": {"start_layer": 9, "end_layer": 3}
+        }))
+        .is_err());
+    }
+
     #[test]
     fn deepseek41_uses_the_chosen_drafter_on_the_stage_with_the_head_only() {
         let slice = PathBuf::from("/m/cd91.gguf");
@@ -1963,6 +2086,7 @@ mod tests {
             ple_shard: None,
             layers: 40,
             stage,
+            range: false,
         };
         let chosen = PathBuf::from("/d/dspark.gguf");
         let last = gguf::Stage {
@@ -2101,6 +2225,7 @@ mod tests {
             ple_shard: None,
             layers: 40,
             stage,
+            range: false,
         };
         assert!(pack_needs_compat_bf16(&model(
             gguf::STRATA_ARCHITECTURE,

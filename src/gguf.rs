@@ -265,8 +265,12 @@ pub struct Model {
     /// The shard that holds the n-gram table, when there is one.
     pub ple_shard: Option<PathBuf>,
     pub layers: u64,
-    /// Set for a POM slice: the layers it holds.
+    /// Set for a POM slice: the layers it holds. Also set for a range of the
+    /// whole model the POM asked for (`range`).
     pub stage: Option<Stage>,
+    /// `stage` is a range cut from this whole model at run time
+    /// (`--stage-layers`), not a slice file.
+    pub range: bool,
 }
 
 /// Checks that `first` is a model (or a POM slice of one) Strata can run and
@@ -332,6 +336,7 @@ pub fn inspect(first: &Path) -> Result<Model, String> {
         ple_shard,
         layers,
         stage,
+        range: false,
     })
 }
 
