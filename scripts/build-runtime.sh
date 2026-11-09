@@ -26,6 +26,8 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# Large engine intermediates may live on another volume; the runtime stays at build/runtime.
+cache_dir="${STRATA_BUILD_CACHE_DIR:-$root/build/cache}"
 # shellcheck disable=SC1091
 source "$root/strata.lock"
 archs="${CUDA_ARCHITECTURES:-86;120}"
@@ -51,7 +53,8 @@ usage() {
     'Environment: CUDA_ARCHITECTURES (default "86;120", the POM default),' \
     '  HIP_ARCHITECTURES (default "gfx1101"), ROCM_VERSION (default 7.2.4),' \
     '  CUDA_VERSION (default 13.4.1, the POM default),' \
-    '  STRATA_SOURCE_DIR (a local Strata git checkout to take the branch head from).'
+    '  STRATA_SOURCE_DIR (a local Strata git checkout to take the branch head from),' \
+    '  STRATA_BUILD_CACHE_DIR (engine build intermediates; default build/cache).'
 }
 
 while (($# > 0)); do
@@ -124,7 +127,7 @@ fi
 
 fi
 
-mkdir -p "$root/build/cache"
+mkdir -p "$cache_dir"
 case "$(uname -s)" in
   Darwin) host_os=macos ;;
   MINGW*|MSYS*|CYGWIN*) host_os=windows ;;
@@ -138,15 +141,15 @@ if [[ "$host_os" != linux ]]; then
   else
     asset_name=strata-runtime-windows-x86_64.tar.gz
   fi
-  SRC_DIR="$work" OUT_DIR="$root/build/$runtime_dir" CACHE_DIR="$root/build/cache" \
+  SRC_DIR="$work" OUT_DIR="$root/build/$runtime_dir" CACHE_DIR="$cache_dir" \
     STRATA_COMMIT="$STRATA_COMMIT" LLAMA_CPP_COMMIT="$LLAMA_CPP_COMMIT" RUNTIME_VERSION="$version" \
     ENGINE_KEY="${ENGINE_KEY:-}" "$root/scripts/build-runtime-${host_os}.sh"
 elif ((hip && native)); then
   [[ -n "${ROCM_PATH:-}" && -x "$ROCM_PATH/llvm/bin/clang++" ]] \
     || { echo 'build-runtime: --native needs ROCM_PATH with llvm/bin/clang++ (a ROCm with the HIP development files)' >&2; exit 2; }
   # its own work dir: the image's CMake cache records the container's paths (/src, /work)
-  mkdir -p "$root/build/cache/native"
-  SRC_DIR="$work" PLUGIN_DIR="$root" WORK_DIR="$root/build/cache/native" OUT_DIR="$root/build" \
+  mkdir -p "$cache_dir/native"
+  SRC_DIR="$work" PLUGIN_DIR="$root" WORK_DIR="$cache_dir/native" OUT_DIR="$root/build" \
     HIP_ARCHITECTURES="$hip_archs" STRATA_COMMIT="$STRATA_COMMIT" LLAMA_CPP_COMMIT="$LLAMA_CPP_COMMIT" \
     RUNTIME_VERSION="$version" "$root/docker/build-runtime-hip-in-container.sh"
   runtime_dir=runtime-hip
@@ -176,9 +179,10 @@ fi
   -e RUNTIME_VERSION="$version" \
   -e ENGINE_KEY="${ENGINE_KEY:-}" \
   -e CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-4G}" \
+  -e BUILD_JOBS="${BUILD_JOBS:-4}" \
   -v "$work:/src:ro" \
   -v "$root:/plugin:ro" \
-  -v "$root/build/cache:/work" \
+  -v "$cache_dir:/work" \
   -v "$root/build:/out" \
   "$image"
 
