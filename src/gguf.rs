@@ -265,11 +265,17 @@ fn deepseek_external_engram(first: &Path, header: &Header) -> Option<(Vec<PathBu
     for folder in [Some(directory), directory.parent()].into_iter().flatten() {
         let table = folder.join("DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf");
         if let Ok(table_header) = read_header(&table) {
-            if matches!(
+            let named_engram = matches!(
                 table_header.architecture.as_deref(),
                 Some("deepseek41-engram" | "engram")
-            ) && table_header.tensors.iter().any(|name| name == PLE_TENSOR)
-            {
+            ) && table_header.tensors.iter().any(|name| name == PLE_TENSOR);
+            // Converted ISTA-DAS Engram files have no architecture: identify
+            // the last shard by its split metadata and only tensor instead.
+            let converted_engram = table_header.architecture.is_none()
+                && table_header.split_count == Some(u64::from(count))
+                && table_header.split_no == Some(u64::from(count - 1))
+                && table_header.tensors == [PLE_TENSOR];
+            if named_engram || converted_engram {
                 return Some((shards, table));
             }
         }
@@ -398,17 +404,23 @@ mod tests {
     }
 
     pub fn write_model(path: &Path, arch: &str, extra: &[(&str, u32)], tensors: &[&str]) {
+        write_gguf(path, Some(arch), extra, tensors);
+    }
+
+    fn write_gguf(path: &Path, arch: Option<&str>, extra: &[(&str, u32)], tensors: &[&str]) {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&3u32.to_le_bytes());
         out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-        out.extend_from_slice(&((2 + extra.len()) as u64).to_le_bytes());
-        string(&mut out, "general.architecture");
-        out.extend_from_slice(&8u32.to_le_bytes());
-        string(&mut out, arch);
-        string(&mut out, &format!("{arch}.block_count"));
-        out.extend_from_slice(&4u32.to_le_bytes());
-        out.extend_from_slice(&48u32.to_le_bytes());
+        out.extend_from_slice(&((arch.is_some() as usize * 2 + extra.len()) as u64).to_le_bytes());
+        if let Some(arch) = arch {
+            string(&mut out, "general.architecture");
+            out.extend_from_slice(&8u32.to_le_bytes());
+            string(&mut out, arch);
+            string(&mut out, &format!("{arch}.block_count"));
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&48u32.to_le_bytes());
+        }
         for (key, value) in extra {
             string(&mut out, key);
             out.extend_from_slice(&4u32.to_le_bytes());
@@ -531,6 +543,23 @@ mod tests {
         let model = inspect(&first).unwrap();
         assert_eq!(model.shards.len(), 5);
         assert_eq!(model.ple_shard.as_deref(), Some(table.as_path()));
+        write_gguf(
+            &table,
+            None,
+            &[("split.count", 6), ("split.no", 5)],
+            &[PLE_TENSOR],
+        );
+        assert_eq!(
+            inspect(&first).unwrap().ple_shard.as_deref(),
+            Some(table.as_path())
+        );
+        write_gguf(
+            &table,
+            None,
+            &[("split.count", 6), ("split.no", 4)],
+            &[PLE_TENSOR],
+        );
+        assert!(inspect(&first).unwrap_err().contains("missing model part"));
         std::fs::remove_file(quant.join("Coder-00004-of-00006.gguf")).unwrap();
         assert!(inspect(&first).unwrap_err().contains("missing model part"));
     }
