@@ -78,6 +78,22 @@ struct PluginState {
     ui: Option<UiServer>,
     /// Strata's app (`app.rs`), when the plugin has a directory.
     app: Option<Arc<App>>,
+    /// Audit engines of GPU work metering, by id (`engine.audit.*`).
+    audits: std::sync::Mutex<std::collections::HashMap<String, Engine>>,
+}
+
+/// At most this many audit engines at once (a re-execution loads the stages
+/// up to the audited one).
+const MAX_AUDITS: usize = 8;
+
+fn audit_id(request: &Value) -> Result<String, String> {
+    request["params"]["id"]
+        .as_str()
+        .filter(|id| {
+            !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| "a valid audit id is required".into())
 }
 
 include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
@@ -166,6 +182,58 @@ fn query_inner(state: &PluginState, request: &[u8]) -> Result<Value, String> {
         "engine.status" => Ok(engine(state)?.snapshot().status_json()),
         "engine.upstream" => Ok(engine(state)?.snapshot().upstream_json()),
         "engine.link" => Ok(engine(state)?.snapshot().link_json()),
+        // GPU work metering re-executes a stage on the verifier: an audit
+        // engine loads one stage of a model beside the main engine (sharing
+        // its runtime and packs), answers on its stage link like any stage,
+        // and is stopped when the re-execution ends. From this node's POM
+        // process only, like every engine operation.
+        "engine.audit.start" => {
+            let load = LoadRequest::from_json(&request["params"]["load"])?;
+            let id = audit_id(&request)?;
+            let base = engine::plugin_directory()?;
+            let mut audits = state
+                .audits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if audits.len() >= MAX_AUDITS && !audits.contains_key(&id) {
+                return Ok(json!({"status": "error", "error": "too many audit engines"}));
+            }
+            let audit = Engine::start_audit(base.join("audit").join(&id), base);
+            audit.load(load)?;
+            if let Some(old) = audits.insert(id, audit) {
+                old.unload();
+            }
+            Ok(json!({"status": "accepted"}))
+        }
+        "engine.audit.status" => {
+            let id = audit_id(&request)?;
+            let audits = state
+                .audits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match audits.get(&id) {
+                Some(audit) => {
+                    let snapshot = audit.snapshot();
+                    Ok(json!({"status": snapshot.status_json(), "link": snapshot.link_json()}))
+                }
+                None => Ok(json!({"status": {"state": "error", "detail": "unknown audit"}})),
+            }
+        }
+        "engine.audit.stop" => {
+            let id = audit_id(&request)?;
+            let removed = state
+                .audits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            if let Some(audit) = removed {
+                audit.unload();
+                if let Ok(base) = engine::plugin_directory() {
+                    let _ = std::fs::remove_dir_all(base.join("audit").join(&id));
+                }
+            }
+            Ok(json!({"status": "accepted"}))
+        }
         // Where the POM plugin proxy finds Strata's web app and monitor.
         "ui.upstream" => match &state.ui {
             Some(ui) => Ok(json!({"status": "ready", "port": ui.port, "token": ui.token})),
@@ -239,7 +307,12 @@ unsafe extern "C" fn create(_: HostCallbacks, config: ByteSlice) -> PluginHandle
                 Arc::new(move || app_port.as_ref().and_then(|app| app.port()));
             UiServer::start(upstream, app_upstream, ui_token()).ok()
         });
-        let state = PluginState { engine, ui, app };
+        let state = PluginState {
+            engine,
+            ui,
+            app,
+            audits: Default::default(),
+        };
         Ok::<_, String>(Box::into_raw(Box::new(state)).cast::<c_void>())
     }));
     match result {
@@ -325,11 +398,34 @@ mod tests {
             engine: Err("no plugin directory".into()),
             ui: None,
             app: None,
+            audits: Default::default(),
         }
     }
 
     fn query_json(state: &PluginState, request: Value) -> Result<Value, String> {
         query_inner(state, &serde_json::to_vec(&request).unwrap())
+    }
+
+    #[test]
+    fn audit_operations_need_a_valid_id_and_stop_unknown_ones_quietly() {
+        let state = offline_state();
+        let bad = query_json(
+            &state,
+            json!({"operation": "engine.audit.status", "params": {"id": "../x"}}),
+        );
+        assert!(bad.is_err() || bad.unwrap()["error"].is_string());
+        let unknown = query_json(
+            &state,
+            json!({"operation": "engine.audit.status", "params": {"id": "a1"}}),
+        )
+        .unwrap();
+        assert_eq!(unknown["status"]["state"], "error");
+        let stopped = query_json(
+            &state,
+            json!({"operation": "engine.audit.stop", "params": {"id": "a1"}}),
+        )
+        .unwrap();
+        assert_eq!(stopped["status"], "accepted");
     }
 
     #[test]
