@@ -41,8 +41,9 @@ else
     -DSTRATA_BUILD_DSV41=ON \
     -DCMAKE_CUDA_ARCHITECTURES="$archs" \
     -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
-    -DCMAKE_PROJECT_INCLUDE=/plugin/cmake/pom-static-cuda.cmake \
-    -DSTRATA_GGML_DIR=/src/third_party/llama.cpp
+    -DCMAKE_PROJECT_INCLUDE=/plugin/cmake/pom-static-cuda.cmake
+  # Strata's current engine vendors its own ggml with the trellis kernels. The separately
+  # pinned llama.cpp checkout below is only for the CPU vision encoder and gguf-py.
   cmake --build "$build" --target strata strata-dsv41 -j "$jobs"
   install -m 0755 "$build/strata" "$out.tmp/engine/strata"
   install -m 0755 "$build/strata-dsv41" "$out.tmp/engine/strata-dsv41"

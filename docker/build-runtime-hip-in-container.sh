@@ -53,8 +53,8 @@ cmake -G Ninja "${launcher[@]}" -S "$src" -B "$build" \
   -DCMAKE_HIP_COMPILER="$rocm/llvm/bin/clang++" \
   -DCMAKE_HIP_COMPILER_ROCM_ROOT="$rocm" \
   -DCMAKE_HIP_FLAGS="--rocm-path=$rocm --rocm-device-lib-path=$bitcode" \
-  -DCMAKE_PREFIX_PATH="$rocm" \
-  -DSTRATA_GGML_DIR="$src/third_party/llama.cpp"
+  -DCMAKE_PREFIX_PATH="$rocm"
+# Strata vendors ggml with the trellis kernels; llama.cpp is used for vision and gguf-py.
 cmake --build "$build" --target strata strata-dsv41 -j "$jobs"
 install -m 0755 "$build/strata" "$out.tmp/engine/strata"
 install -m 0755 "$build/strata-dsv41" "$out.tmp/engine/strata-dsv41"
@@ -122,13 +122,13 @@ echo "   $(du -sh "$out.tmp/lib" | cut -f1) in lib/"
 # The vision encoder (llama.cpp's mtmd at the engine's pinned commit) runs on the CPU: the plugin reads images there,
 # so the model keeps the whole card (engine.rs, the config's vision section). Portable: AVX2 baseline, no OpenMP.
 echo "== vision encoder"
-cmake -G Ninja "${launcher[@]}" -S "$src/tools/vision" -B "$work/build-vision" \
+cmake -G Ninja "${launcher[@]}" -S "$src/tools/vision" -B "$work/build-vision-hip" \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLAMA_DIR="$src/third_party/llama.cpp" \
   -DSTRATA_PORTABLE=ON \
   -DSTRATA_VISION_CUDA=OFF
-cmake --build "$work/build-vision" --target strata-vision -j "$jobs"
-install -m 0755 "$work/build-vision/bin/strata-vision" "$out.tmp/engine/strata-vision"
+cmake --build "$work/build-vision-hip" --target strata-vision -j "$jobs"
+install -m 0755 "$work/build-vision-hip/bin/strata-vision" "$out.tmp/engine/strata-vision"
 if ldd "$out.tmp/engine/strata-vision" | grep 'not found' ; then
   echo "the vision encoder has unresolved libraries" >&2
   exit 1
