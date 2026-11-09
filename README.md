@@ -1,17 +1,21 @@
 # pom-plugin-strata
 
-POM plugin that serves a whole **Qwen3.8-Flash-Next** model (GGUF
-architecture `qwen4exp`), or a **Qwen3.6-35B-A3B** one (`qwen35moe`), with the [Strata](https://github.com/Niko1221/Strata)
-engine (the fork in `strata.lock`, which adds the stage split) instead of
-llama.cpp. A machine with the plugin publishes the
-`inference` service "Strata"; a deployment that picks that service runs the
-model on that machine's NVIDIA cards (one or more: Strata splits the layers),
+POM plugin that serves **Qwen3.8-Flash-Next** (`qwen4exp`),
+**Qwen3.6-35B-A3B** (`qwen35moe`) and **DeepSeek-V4.1-Flash** (`deepseek41`)
+with the [Strata](https://github.com/Niko1221/Strata) engine (the fork in
+`strata.lock`, which adds the stage split) instead of llama.cpp. A machine
+with the plugin publishes the `inference` service "Strata"; a deployment that
+picks that service runs the model on that machine's NVIDIA or AMD cards,
 and the POM pipeline sends each prompt to Strata, which streams the tokens back.
 The plugin screen embeds Strata's own web app with its live GPU, speed and
 cache monitor.
 
 How the POM uses it is in [docs/README.md](docs/README.md) (also shown in the
-POM documentation screen).
+POM documentation screen). The ISTA-DAS Coder DeepSeek set keeps its Engram
+file beside its quant folder; put all five model shards in that folder and
+`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` beside it. Strata's newer Qwen4
+model shapes need separately compiled engines; this runtime only carries the
+Flash-Next geometry and does not run those shapes.
 
 ## Layout
 
@@ -33,7 +37,7 @@ POM documentation screen).
 
 | Operation | Who | What |
 |---|---|---|
-| `host.services` | POM | the `inference` service, its state, `architectures: ["qwen4exp", "qwen35moe"]` and the engine `settings` (`src/settings.rs`) |
+| `host.services` | POM | the `inference` service, its state, `architectures: ["qwen4exp", "qwen35moe", "deepseek41"]` and the engine `settings` (`src/settings.rs`) |
 | `engine.load` | the local POM node | loads a model: `model_path`, `model_label`, `n_ctx`, `max_sessions`, `kv`, `gpus`, `settings` (applied with Strata's `serve/runconfig.py` rules by the bridge) |
 | `engine.unload` | the local POM node | stops Strata and gives the GPU back |
 | `engine.status` | the local POM node | `idle`, `installing`, `preparing`, `loading`, `ready`, `stopping` or `error`, with `detail` and `n_ctx` |

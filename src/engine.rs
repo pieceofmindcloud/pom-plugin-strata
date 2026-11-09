@@ -1084,7 +1084,11 @@ impl Manager {
                 self.append_log(&format!("[pom] DSpark drafter: {}", path.display()));
             }
             let range = model.stage.filter(|_| model.range);
-            match deepseek41_pack_args(&model.shards, &pack, drafter, range) {
+            let engram = model
+                .ple_shard
+                .as_deref()
+                .filter(|table| !model.shards.iter().any(|shard| shard.as_path() == *table));
+            match deepseek41_pack_args(&model.shards, &pack, drafter, range, engram) {
                 Ok(args) => command.args(args),
                 Err(error) => return self.fail(error),
             };
@@ -1747,6 +1751,7 @@ fn deepseek41_pack_args(
     pack: &Path,
     drafter: Option<&Path>,
     range: Option<gguf::Stage>,
+    engram: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     let folder = shards
         .first()
@@ -1764,6 +1769,10 @@ fn deepseek41_pack_args(
             .file_name()
             .ok_or_else(|| format!("no file name in {}", shard.display()))?;
         args.push(name.to_string_lossy().into_owned());
+    }
+    if let Some(table) = engram {
+        args.push("--engram".to_string());
+        args.push(table.display().to_string());
     }
     if let Some(stage) = range {
         args.push("--layers".to_string());
@@ -2201,6 +2210,7 @@ mod tests {
             Path::new("/p"),
             Some(Path::new("/d/dspark.gguf")),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2326,7 +2336,7 @@ mod tests {
             end: 13,
             total: 40,
         };
-        let args = deepseek41_pack_args(&shards, Path::new("/p"), None, Some(range)).unwrap();
+        let args = deepseek41_pack_args(&shards, Path::new("/p"), None, Some(range), None).unwrap();
         assert_eq!(args[args.len() - 2..], ["--layers", "8-13"]);
     }
 
@@ -2337,7 +2347,7 @@ mod tests {
             PathBuf::from("/m/IQ2/a-00002-of-00002.gguf"),
         ];
         assert_eq!(
-            deepseek41_pack_args(&shards, Path::new("/p"), None, None).unwrap(),
+            deepseek41_pack_args(&shards, Path::new("/p"), None, None, None).unwrap(),
             [
                 "--model",
                 "/m/IQ2",
@@ -2346,6 +2356,28 @@ mod tests {
                 "--shards",
                 "a-00001-of-00002.gguf",
                 "a-00002-of-00002.gguf",
+            ]
+        );
+    }
+
+    #[test]
+    fn deepseek_coder_passes_the_separate_engram_and_range() {
+        let shards = vec![PathBuf::from("/m/IQ2/Coder-00001-of-00006.gguf")];
+        let table = Path::new("/m/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf");
+        let range = gguf::Stage {
+            start: 20,
+            end: 39,
+            total: 40,
+        };
+        let args =
+            deepseek41_pack_args(&shards, Path::new("/p"), None, Some(range), Some(table)).unwrap();
+        assert_eq!(
+            args[6..],
+            [
+                "--engram",
+                "/m/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",
+                "--layers",
+                "20-39"
             ]
         );
     }
