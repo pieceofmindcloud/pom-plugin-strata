@@ -461,9 +461,10 @@ impl Snapshot {
             "stages": true,
             // Only Flash-Next runs in slices: the POM offers Qwen3.6 as the whole model only (stage_architectures).
             "stage_architectures": gguf::STAGE_ARCHITECTURES,
-            // The architectures whose stage it can also cut from the whole model at run time (`range` in
-            // `engine.load`, Strata's --stage-layers): the machine keeps the whole file, no slice is written.
-            "stage_ranges": [gguf::STRATA_ARCHITECTURE],
+            // The architectures whose stage it can also cut from the whole model (`range` in `engine.load`): the
+            // machine keeps the whole file, no slice is written - Flash-Next with Strata's --stage-layers, DeepSeek-V4.1
+            // with a pack of the range's layers read in place (range_pack_dir).
+            "stage_ranges": [gguf::STRATA_ARCHITECTURE, gguf::DEEPSEEK41_ARCHITECTURE],
             // Where the POM offers a drafter file to choose: the other families' drafts are the engine's own.
             "draft_architectures": [gguf::DEEPSEEK41_ARCHITECTURE],
             // The POM settings that apply to those stages (the nodes carry the hidden state between them), and the
@@ -1054,7 +1055,7 @@ impl Manager {
             );
             request.role = None;
         }
-        let pack = self.pack_dir(&request.model_path);
+        let pack = range_pack_dir(self.pack_dir(&request.model_path), &model);
         let drafter = request.mtp_draft_path.as_deref();
         if pack_ready(&pack, &model, drafter) {
             return self.serve(runtime, request, &model, pack);
@@ -1082,7 +1083,8 @@ impl Manager {
             if let Some(path) = drafter {
                 self.append_log(&format!("[pom] DSpark drafter: {}", path.display()));
             }
-            match deepseek41_pack_args(&model.shards, &pack, drafter) {
+            let range = model.stage.filter(|_| model.range);
+            match deepseek41_pack_args(&model.shards, &pack, drafter, range) {
                 Ok(args) => command.args(args),
                 Err(error) => return self.fail(error),
             };
@@ -1584,7 +1586,6 @@ impl Manager {
                 };
                 let request = (**request).clone();
                 self.work = Work::None;
-                let pack = self.pack_dir(&request.model_path);
                 let (Some(runtime), Ok(mut model)) =
                     (self.runtime(), gguf::inspect(&request.model_path))
                 else {
@@ -1596,6 +1597,7 @@ impl Manager {
                         return self.fail(error);
                     }
                 }
+                let pack = range_pack_dir(self.pack_dir(&request.model_path), &model);
                 if !status.success()
                     || !pack_ready(&pack, &model, request.mtp_draft_path.as_deref())
                 {
@@ -1700,8 +1702,12 @@ fn apply_range(model: &mut gguf::Model, start: u64, end: u64) -> Result<(), Stri
     if model.stage.is_some() {
         return Err("a range is cut from the whole model; this file is already a POM slice".into());
     }
-    if model.architecture != gguf::STRATA_ARCHITECTURE {
-        return Err("Strata splits only Qwen3.8-Flash-Next across machines".into());
+    if model.architecture != gguf::STRATA_ARCHITECTURE
+        && model.architecture != gguf::DEEPSEEK41_ARCHITECTURE
+    {
+        return Err(
+            "Strata splits only Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash across machines".into(),
+        );
     }
     if start > end || end >= model.layers {
         return Err(format!(
@@ -1718,11 +1724,29 @@ fn apply_range(model: &mut gguf::Model, start: u64, end: u64) -> Result<(), Stri
     Ok(())
 }
 
-/// `tools/dsv41/pack_gguf.py` reads the shards by name from their folder.
+/// A DeepSeek-V4.1 range has a pack of its own (`pack_gguf.py --layers`: its layers renumbered from 0, the tensors
+/// still read in place from the whole model's files), beside the whole model's: Flash-Next's ranges share the whole
+/// pack and cut the stage at run time (`--stage-layers`), strata-dsv41 has no such option.
+fn range_pack_dir(pack: PathBuf, model: &gguf::Model) -> PathBuf {
+    match model.stage {
+        Some(stage) if model.range && model.architecture == gguf::DEEPSEEK41_ARCHITECTURE => {
+            let name = pack
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            pack.with_file_name(format!("{name}-L{}-{}", stage.start, stage.end))
+        }
+        _ => pack,
+    }
+}
+
+/// `tools/dsv41/pack_gguf.py` reads the shards by name from their folder. A range of the whole model is packed as
+/// a slice would be (`--layers`).
 fn deepseek41_pack_args(
     shards: &[PathBuf],
     pack: &Path,
     drafter: Option<&Path>,
+    range: Option<gguf::Stage>,
 ) -> Result<Vec<String>, String> {
     let folder = shards
         .first()
@@ -1740,6 +1764,10 @@ fn deepseek41_pack_args(
             .file_name()
             .ok_or_else(|| format!("no file name in {}", shard.display()))?;
         args.push(name.to_string_lossy().into_owned());
+    }
+    if let Some(stage) = range {
+        args.push("--layers".to_string());
+        args.push(format!("{}-{}", stage.start, stage.end));
     }
     if let Some(drafter) = drafter {
         // The noise token and the markov rank are constants of the model the IST-DAS files do not carry; Strata's
@@ -1990,6 +2018,10 @@ mod tests {
             snapshot.service()["stage_ranges"][0],
             gguf::STRATA_ARCHITECTURE
         );
+        assert_eq!(
+            snapshot.service()["stage_ranges"][1],
+            gguf::DEEPSEEK41_ARCHITECTURE
+        );
         assert_eq!(snapshot.service()["vision"], true);
         assert_eq!(snapshot.service()["pom_settings"][1], "hidden_state_dtype");
         snapshot.port = None;
@@ -2058,6 +2090,21 @@ mod tests {
 
         assert!(apply_range(&mut whole(gguf::STRATA_ARCHITECTURE), 40, 48).is_err());
         assert!(apply_range(&mut whole(gguf::QWEN36_ARCHITECTURE), 0, 23).is_err());
+        let mut deepseek = whole(gguf::DEEPSEEK41_ARCHITECTURE);
+        apply_range(&mut deepseek, 14, 19).unwrap();
+        assert!(
+            deepseek.range && !deepseek.stage.unwrap().first() && !deepseek.stage.unwrap().last()
+        );
+        assert_eq!(
+            range_pack_dir(PathBuf::from("/b/packs/m-1a2b"), &deepseek),
+            PathBuf::from("/b/packs/m-1a2b-L14-19"),
+            "a DeepSeek-V4.1 range has a pack of its own"
+        );
+        assert_eq!(
+            range_pack_dir(PathBuf::from("/b/packs/m-1a2b"), &model),
+            PathBuf::from("/b/packs/m-1a2b"),
+            "a Flash-Next range shares the whole model's pack"
+        );
         let mut slice = whole(gguf::STRATA_ARCHITECTURE);
         slice.stage = Some(gguf::Stage {
             start: 0,
@@ -2142,6 +2189,7 @@ mod tests {
             &[PathBuf::from("/m/a.gguf")],
             Path::new("/p"),
             Some(Path::new("/d/dspark.gguf")),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2260,13 +2308,25 @@ mod tests {
     }
 
     #[test]
+    fn a_deepseek41_range_packs_only_its_layers() {
+        let shards = vec![PathBuf::from("/m/IQ2/a-00001-of-00002.gguf")];
+        let range = gguf::Stage {
+            start: 8,
+            end: 13,
+            total: 40,
+        };
+        let args = deepseek41_pack_args(&shards, Path::new("/p"), None, Some(range)).unwrap();
+        assert_eq!(args[args.len() - 2..], ["--layers", "8-13"]);
+    }
+
+    #[test]
     fn deepseek41_packs_with_its_own_tool_from_the_model_folder() {
         let shards = vec![
             PathBuf::from("/m/IQ2/a-00001-of-00002.gguf"),
             PathBuf::from("/m/IQ2/a-00002-of-00002.gguf"),
         ];
         assert_eq!(
-            deepseek41_pack_args(&shards, Path::new("/p"), None).unwrap(),
+            deepseek41_pack_args(&shards, Path::new("/p"), None, None).unwrap(),
             [
                 "--model",
                 "/m/IQ2",
