@@ -1330,7 +1330,7 @@ def apply_pom_settings(argv: list[str]) -> None:
     # strata-dsv41 names the VRAM reserve --reserve-mib; Strata's rules write the Qwen engine's --vram-reserve-mib,
     # which it refuses ("unknown option") and the load never starts. They write it in "user_args" too, which the
     # server merges over "args" at every start (strata_control/user_args.py): renamed in both, or the merge brings the
-    # Qwen name back
+    # Qwen name back.
     if cfg.get("arch") == "deepseek41":
         for key in ("args", "user_args"):
             listed = cfg.get(key)

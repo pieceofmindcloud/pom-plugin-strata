@@ -1701,7 +1701,6 @@ fn pack_needs_compat_bf16(model: &gguf::Model) -> bool {
 
 /// A range of the whole model becomes this load's stage: the same first,
 /// middle and last stage rules as a slice, cut by the engine at run time.
-/// Only Qwen3.8-Flash-Next is split across machines.
 fn apply_range(model: &mut gguf::Model, start: u64, end: u64) -> Result<(), String> {
     if model.stage.is_some() {
         return Err("a range is cut from the whole model; this file is already a POM slice".into());

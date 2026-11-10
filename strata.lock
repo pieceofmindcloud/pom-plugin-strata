@@ -3,7 +3,7 @@
 # The llama.cpp commit is the one Strata's setup.py pins (LLAMA_CPP_COMMIT);
 # only its ggml (engine build) and gguf-py (pack tools) are used.
 STRATA_REPOSITORY=https://github.com/pieceofmindcloud/Strata.git
-STRATA_BRANCH=pom
+STRATA_BRANCH=develop
 LLAMA_CPP_COMMIT=3cf03257f219afbe7334045ff7c6a06ac68c627d
 # Strata's app (apps/host: the web shell with chats, tasks, workspaces and the agent) runs on this portable Node.js,
 # which the runtime carries (scripts/build-app.sh). The agent is the DeepSeek Harness from npm at this exact version,
