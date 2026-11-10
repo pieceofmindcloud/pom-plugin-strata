@@ -3,18 +3,21 @@
 # the node downloads and verifies), the plugin library pinned to that archive,
 # and the per-platform manifest of POM's "Add from GitHub" flow.
 #
-# Upload every file it prints to the GitHub release v<version> of this
-# repository: the library, pom-plugin-linux-x86_64.json and the runtime
-# archives (CUDA, and HIP for AMD cards).
+# One platform per run, on that platform (the library is native):
+# linux-x86_64 (CUDA, and HIP for AMD cards), macos-aarch64 (Metal) and
+# windows-x86_64 (CUDA). Upload every file it prints to the GitHub release
+# v<version> of this repository: the library, pom-plugin-<platform>.json and
+# the runtime archives.
 #
 # STRATA_RUNTIME_ARCHIVE / STRATA_RUNTIME_HIP_ARCHIVE: runtime archives built
-# beforehand (scripts/build-runtime.sh --archive [--hip], as the release
-# workflow builds them on their own runners); without them both are built here.
-# STRATA_PACKAGE_HIP=0 leaves the HIP runtime out.
+# beforehand (scripts/build-runtime.sh --archive [--hip], as the runtime
+# workflow builds them on their own runners); without them they are built here.
+# STRATA_PACKAGE_HIP=0 leaves the HIP runtime out (only Linux has one).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 version=""
+platform="linux-x86_64"
 output="${root}/dist-release"
 repository="${STRATA_PLUGIN_REPOSITORY:-pieceofmindcloud/pom-plugin-strata}"
 
@@ -25,7 +28,7 @@ die() {
 
 while (($# > 0)); do
   case "$1" in
-    --platform) [[ "$2" == linux-x86_64 ]] || die 'only linux-x86_64 is supported'; shift 2 ;;
+    --platform) platform="$2"; shift 2 ;;
     --version) version="$2"; shift 2 ;;
     --output) output="$2"; shift 2 ;;
     --repository) repository="$2"; shift 2 ;;
@@ -34,6 +37,12 @@ while (($# > 0)); do
   esac
 done
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || die 'version must be a semantic version without the v prefix'
+case "$platform" in
+  linux-x86_64) os="linux"; arch="x86_64" ;;
+  macos-aarch64) os="macos"; arch="aarch64"; STRATA_PACKAGE_HIP=0 ;;
+  windows-x86_64) os="windows"; arch="x86_64"; STRATA_PACKAGE_HIP=0 ;;
+  *) die "unsupported platform: $platform" ;;
+esac
 command -v jq >/dev/null 2>&1 || die 'jq is required'
 [[ "$(jq -er '.plugin_code' "$root/ui/manifest.json")" == "$(jq -er '.plugin_code' "$root/release/manifest.json")" ]] \
   || die 'release manifest plugin code does not match the UI manifest'
@@ -44,7 +53,7 @@ runtime_pin() {
   if [[ -n "$given" ]]; then
     [[ -f "$given" ]] || die "no runtime archive at $given"
     printf 'runtime_asset=%s\nruntime_sha256=%s\nruntime_size=%s\n' "$given" \
-      "$(sha256sum "$given" | awk '{print $1}')" "$(wc -c < "$given" | tr -d '[:space:]')"
+      "$("$root/scripts/sha256.sh" "$given")" "$(wc -c < "$given" | tr -d '[:space:]')"
   else
     RUNTIME_VERSION="$version" "$root/scripts/build-runtime.sh" --archive --version "$version" "$@"
   fi
@@ -65,11 +74,11 @@ if [[ "${STRATA_PACKAGE_HIP:-1}" != 0 ]]; then
   export STRATA_RUNTIME_HIP_URL="https://github.com/${repository}/releases/download/v${version}/$(basename "$hip_asset")"
 fi
 
-build_output="$("$root/scripts/build.sh" --platform linux-x86_64 --output "$output")"
+build_output="$("$root/scripts/build.sh" --platform "$platform" --output "$output")"
 artifact="$(printf '%s\n' "$build_output" | sed -n 's/^artifact=//p')"
 sha256="$(printf '%s\n' "$build_output" | sed -n 's/^sha256=//p')"
 size="$(printf '%s\n' "$build_output" | sed -n 's/^size=//p')"
-public_manifest="${output}/pom-plugin-linux-x86_64.json"
+public_manifest="${output}/pom-plugin-${platform}.json"
 jq -n \
   --slurpfile contract "$root/release/manifest.json" \
   --arg release_id "v${version}" \
@@ -77,7 +86,8 @@ jq -n \
   --arg asset "$(basename "$artifact")" \
   --arg sha256 "$sha256" \
   --argjson size "$size" \
-  '($contract[0]) + {release_id: $release_id, version: $version, os: "linux", arch: "x86_64",
+  --arg os "$os" --arg arch "$arch" \
+  '($contract[0]) + {release_id: $release_id, version: $version, os: $os, arch: $arch,
      asset: $asset, sha256: $sha256, size: $size}' > "$public_manifest"
 
 printf 'artifact=%s\npublic_manifest=%s\nruntime_asset=%s\nruntime_url=%s\nhip_runtime_asset=%s\nsha256=%s\nsize=%s\nversion=%s\n' \

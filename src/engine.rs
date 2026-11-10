@@ -61,12 +61,19 @@ pub struct LoadRequest {
     pub session_dir: Option<PathBuf>,
     /// The vision projector (mmproj) the deployment chose: the engine reads images with it. `None` = text only.
     pub mmproj_path: Option<PathBuf>,
+    /// The drafter the deployment chose (`draft_architectures`). None leaves it out.
+    pub mtp_draft_path: Option<PathBuf>,
     /// The machine's part in the POM's prefill/decode split (`prefill` or `decode`; `None` = both). The bridge keeps
     /// the sessions on for it: the split hands a prompt's state from one machine to the other as a session.
     pub role: Option<String>,
     /// The split's threshold (the deployment's `prefill_min_tokens`): the bridge of a prefill machine reads a turn
     /// only when the part the decode machine lacks has this many tokens. `None` = the bridge's default.
     pub prefill_min_tokens: Option<u32>,
+    /// A range of the whole model this machine serves as one stage
+    /// (`{start_layer, end_layer}`, inclusive): Strata cuts it from the whole
+    /// model and its whole-model pack at run time (`--stage-layers`), with no
+    /// slice file. `None` = the whole model, or a slice file as it is.
+    pub range: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,14 +141,14 @@ impl LoadRequest {
         if self.gpus.is_empty() && !self.amd_gpus.is_empty() {
             runtime::Backend::Hip
         } else {
-            runtime::Backend::Cuda
+            runtime::Backend::Main
         }
     }
 
     /// The cards of this load, numbered as its backend's runtime numbers them.
     pub fn backend_gpus(&self) -> &[u32] {
         match self.backend() {
-            runtime::Backend::Cuda => &self.gpus,
+            runtime::Backend::Main => &self.gpus,
             runtime::Backend::Hip => &self.amd_gpus,
         }
     }
@@ -226,7 +233,19 @@ impl LoadRequest {
         let prefill_min_tokens = value["prefill_min_tokens"]
             .as_u64()
             .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32);
+        let range = match &value["range"] {
+            Value::Null => None,
+            range => {
+                let start = range["start_layer"].as_u64();
+                let end = range["end_layer"].as_u64();
+                match (start, end) {
+                    (Some(start), Some(end)) if start <= end => Some((start, end)),
+                    _ => return Err("range needs start_layer <= end_layer".into()),
+                }
+            }
+        };
         Ok(Self {
+            range,
             role,
             prefill_min_tokens,
             model_path,
@@ -262,6 +281,25 @@ impl LoadRequest {
                     if !path.is_file() {
                         return Err(format!(
                             "the vision projector {} is not on this machine",
+                            path.display()
+                        ));
+                    }
+                    Some(path)
+                }
+                None => None,
+            },
+            mtp_draft_path: match value["mtp_draft_path"]
+                .as_str()
+                .filter(|path| !path.is_empty())
+            {
+                Some(path) => {
+                    let path = PathBuf::from(path);
+                    if !path.is_absolute() {
+                        return Err("mtp_draft_path must be absolute".into());
+                    }
+                    if !path.is_file() {
+                        return Err(format!(
+                            "the drafter {} is not on this machine",
                             path.display()
                         ));
                     }
@@ -423,6 +461,12 @@ impl Snapshot {
             "stages": true,
             // Only Flash-Next runs in slices: the POM offers Qwen3.6 as the whole model only (stage_architectures).
             "stage_architectures": gguf::STAGE_ARCHITECTURES,
+            // The architectures whose stage it can also cut from the whole model (`range` in `engine.load`): the
+            // machine keeps the whole file, no slice is written - Flash-Next with Strata's --stage-layers, DeepSeek-V4.1
+            // with a pack of the range's layers read in place (range_pack_dir).
+            "stage_ranges": [gguf::STRATA_ARCHITECTURE, gguf::DEEPSEEK41_ARCHITECTURE],
+            // Where the POM offers a drafter file to choose: the other families' drafts are the engine's own.
+            "draft_architectures": [gguf::DEEPSEEK41_ARCHITECTURE],
             // The POM settings that apply to those stages (the nodes carry the hidden state between them), and the
             // prefill/decode role of a machine that runs the whole model.
             "pom_settings": [
@@ -439,7 +483,7 @@ impl Snapshot {
 }
 
 enum Command_ {
-    Load(LoadRequest),
+    Load(Box<LoadRequest>),
     Unload,
     Stop,
 }
@@ -512,7 +556,7 @@ impl Engine {
     pub fn load(&self, request: LoadRequest) -> Result<(), String> {
         gguf::inspect(&request.model_path)?;
         self.commands
-            .send(Command_::Load(request))
+            .send(Command_::Load(Box::new(request)))
             .map_err(|_| "the engine manager stopped".to_owned())
     }
 
@@ -564,12 +608,34 @@ impl Group {
                 Ok(())
             });
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // its own process group and no console window of its own
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        }
         // The plugin host talks to the POM over its own stdin/stdout: a child
         // must never inherit them.
         command.stdin(Stdio::null());
         Ok(Self {
             child: command.spawn()?,
         })
+    }
+
+    /// Windows has no process group to signal: ends the child's whole tree
+    /// (the bridge, Strata's server and the engine it started).
+    #[cfg(windows)]
+    fn kill_tree(&self) {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &self.child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .status();
     }
 
     /// Copies the child's output, line by line, to the Strata log file and to
@@ -617,8 +683,8 @@ impl Group {
     pub(crate) fn stop(mut self, grace: Duration) {
         #[cfg(unix)]
         self.signal(libc::SIGTERM);
-        #[cfg(not(unix))]
-        let _ = self.child.kill();
+        #[cfg(windows)]
+        self.kill_tree();
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
             if self.exited().is_some() {
@@ -643,7 +709,7 @@ enum Work {
     None,
     Packing {
         group: Group,
-        request: LoadRequest,
+        request: Box<LoadRequest>,
     },
     Serving {
         group: Group,
@@ -709,8 +775,8 @@ impl Manager {
                 .filter(|dir| runtime::is_runtime(dir))
         });
         self.update(|snapshot| snapshot.runtime_hip = hip);
-        let cuda = runtime::local_runtime(runtime::Backend::Cuda).or_else(|| {
-            runtime::installed_dir(&self.base, runtime::Backend::Cuda)
+        let cuda = runtime::local_runtime(runtime::Backend::Main).or_else(|| {
+            runtime::installed_dir(&self.base, runtime::Backend::Main)
                 .filter(|dir| runtime::is_runtime(dir))
         });
         if let Some(dir) = cuda {
@@ -721,7 +787,7 @@ impl Manager {
             });
             return;
         }
-        if !runtime::has_release(runtime::Backend::Cuda) {
+        if !runtime::has_release(runtime::Backend::Main) {
             self.update(|snapshot| {
                 snapshot.runtime_error = Some(
                     "no Strata runtime: this is a development build without build/runtime \
@@ -731,7 +797,7 @@ impl Manager {
             });
             return;
         }
-        self.install(runtime::Backend::Cuda);
+        self.install(runtime::Backend::Main);
     }
 
     /// Downloads the pinned runtime of `backend` on a thread (poll_installer).
@@ -765,7 +831,7 @@ impl Manager {
         self.find_runtime();
         loop {
             match self.commands.recv_timeout(POLL) {
-                Ok(Command_::Load(request)) => self.load(request),
+                Ok(Command_::Load(request)) => self.load(*request),
                 Ok(Command_::Unload) => self.unload(),
                 Ok(Command_::Stop) | Err(RecvTimeoutError::Disconnected) => {
                     self.unload();
@@ -870,17 +936,15 @@ impl Manager {
     }
 
     fn python_command(&self, runtime: &Path) -> Result<Command, String> {
-        let python = std::env::var_os("STRATA_PYTHON").unwrap_or_else(|| "python3".into());
+        // STRATA_PYTHON, else the runtime's own (macOS, Windows), else the node's (a Linux POM image has 3.12)
+        let python = std::env::var_os("STRATA_PYTHON")
+            .or_else(|| runtime::python(runtime).map(PathBuf::into_os_string))
+            .unwrap_or_else(|| "python3".into());
+        let python_path = std::env::join_paths([runtime.join("pylib"), runtime.join("strata")])
+            .map_err(|error| format!("bad runtime path: {error}"))?;
         let mut command = Command::new(python);
         command
-            .env(
-                "PYTHONPATH",
-                format!(
-                    "{}:{}",
-                    runtime.join("pylib").display(),
-                    runtime.join("strata").display()
-                ),
-            )
+            .env("PYTHONPATH", python_path)
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env(
@@ -939,10 +1003,15 @@ impl Manager {
 
     /// The load once the runtime of its backend is here.
     fn load_with(&mut self, runtime: PathBuf, mut request: LoadRequest) {
-        let model = match gguf::inspect(&request.model_path) {
+        let mut model = match gguf::inspect(&request.model_path) {
             Ok(model) => model,
             Err(error) => return self.fail(error),
         };
+        if let Some((start, end)) = request.range {
+            if let Err(error) = apply_range(&mut model, start, end) {
+                return self.fail(error);
+            }
+        }
         if let Some(stage) = model.stage {
             match &request.link {
                 None => return self.fail("a POM slice needs the stage link the POM gives".into()),
@@ -986,8 +1055,9 @@ impl Manager {
             );
             request.role = None;
         }
-        let pack = self.pack_dir(&request.model_path);
-        if pack_ready(&pack, &model) {
+        let pack = range_pack_dir(self.pack_dir(&request.model_path), &model);
+        let drafter = request.mtp_draft_path.as_deref();
+        if pack_ready(&pack, &model, drafter) {
             return self.serve(runtime, request, &model, pack);
         }
         self.append_log(&format!(
@@ -1009,7 +1079,16 @@ impl Manager {
         };
         command.arg(runtime.join(tool));
         if deepseek41 {
-            match deepseek41_pack_args(&model.shards, &pack) {
+            let drafter = deepseek41_drafter(&model, request.mtp_draft_path.as_deref());
+            if let Some(path) = drafter {
+                self.append_log(&format!("[pom] DSpark drafter: {}", path.display()));
+            }
+            let range = model.stage.filter(|_| model.range);
+            let engram = model
+                .ple_shard
+                .as_deref()
+                .filter(|table| !model.shards.iter().any(|shard| shard.as_path() == *table));
+            match deepseek41_pack_args(&model.shards, &pack, drafter, range, engram) {
                 Ok(args) => command.args(args),
                 Err(error) => return self.fail(error),
             };
@@ -1020,9 +1099,7 @@ impl Manager {
                 .arg("--out")
                 .arg(&pack);
         }
-        if !qwen36 && (model.shards.len() > 2 || model.stage.is_some()) {
-            // Unsloth's files keep small projections as Q8_0; the engine reads them as BF16.
-            // (A slice no longer says how many files its model had: the flag only converts what needs it.)
+        if pack_needs_compat_bf16(&model) {
             command.arg("--compat-bf16");
         }
         match Group::spawn(&mut command) {
@@ -1038,7 +1115,10 @@ impl Manager {
                     Phase::Preparing,
                     Some("preparing the model for Strata".into()),
                 );
-                self.work = Work::Packing { group, request };
+                self.work = Work::Packing {
+                    group,
+                    request: Box::new(request),
+                };
             }
             Err(error) => self.fail(format!("the pack tool did not start: {error}")),
         }
@@ -1098,7 +1178,8 @@ impl Manager {
                 );
             }
             let prev = request.link.as_ref().and_then(|link| link.prev_port);
-            let args = deepseek41_engine_args(&pack, request.context, prev);
+            let drafter = deepseek41_drafter(model, request.mtp_draft_path.as_deref()).is_some();
+            let args = deepseek41_engine_args(&pack, request.context, prev, drafter);
             if model.stage.is_some_and(|stage| !stage.last()) {
                 return self.serve_stage(runtime, request, args, port, "engine/strata-dsv41");
             }
@@ -1141,7 +1222,15 @@ impl Manager {
             "--native".into(),
             request.model_path.display().to_string(),
         ];
-        if model.shards.len() <= 2 {
+        if model.range {
+            if let Some(stage) = model.stage {
+                args.push("--stage-layers".into());
+                args.push(format!("{}-{}", stage.start, stage.end));
+            }
+        }
+        // A stage past layer 1 never runs the PLE block: no table to read.
+        let ple_needed = !(model.range && model.stage.is_some_and(|stage| stage.start > 1));
+        if model.shards.len() <= 2 && ple_needed {
             if let Some(ple) = &model.ple_shard {
                 args.push("--ple-gguf".into());
                 args.push(ple.display().to_string());
@@ -1229,7 +1318,7 @@ impl Manager {
             "engine/strata"
         };
         let mut config = json!({
-            "exe": runtime.join(engine).display().to_string(),
+            "exe": runtime::exe(&runtime, engine).display().to_string(),
             "args": args,
             "cwd": self.base.join("run").display().to_string(),
             "tokenizer": pack.join("tokenizer").display().to_string(),
@@ -1246,18 +1335,14 @@ impl Manager {
         }
         // Several GPUs share the model (or this stage's layers): the bridge adds the layer split for a list.
         // The cards are numbered as the backend's runtime numbers them (HIP_VISIBLE_DEVICES for AMD).
-        match request.backend_gpus() {
-            [] => {}
-            [first] => config["gpu"] = json!(first),
-            // Strata's own path for another family runs on one card (its setup names one): the first chosen
-            [first, ..] if arch.is_some() => config["gpu"] = json!(first),
-            many => config["gpu"] = json!(many),
+        if let Some(gpu) = config_gpu(request.backend_gpus(), arch) {
+            config["gpu"] = gpu;
         }
         config["gpus_asked"] = json!(!request.backend_gpus().is_empty());
         // Vision: the projector is read on the CPU, so the image encoder does not take VRAM from the model.
         // Strata's vision section names its encoder, the projector and the model the projector belongs to.
         if let Some(mmproj) = request.mmproj_path.as_ref().filter(|_| !deepseek41) {
-            let encoder = runtime.join("engine/strata-vision");
+            let encoder = runtime::exe(&runtime, "engine/strata-vision");
             if !encoder.is_file() {
                 return self.fail(format!(
                     "this Strata runtime has no vision encoder ({}): build the runtime again \
@@ -1271,6 +1356,9 @@ impl Manager {
                 "model": request.model_path.display().to_string(),
                 "gpu": false,
             });
+        }
+        if cfg!(target_os = "macos") {
+            config["backend"] = json!("metal");
         }
         if request.backend() == runtime::Backend::Hip {
             config["backend"] = json!("hip");
@@ -1382,7 +1470,7 @@ impl Manager {
         else {
             return self.fail("the earlier stage has no link secret".into());
         };
-        let mut command = Command::new(runtime.join(engine));
+        let mut command = Command::new(runtime::exe(&runtime, engine));
         command
             .arg("--serve")
             .arg("--stage-serve")
@@ -1413,10 +1501,18 @@ impl Manager {
                     .env("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
                     .env("CUDA_VISIBLE_DEVICES", list.join(","));
             }
-            if gpus.len() > 1 {
+            // strata-dsv41 spreads its layers over every card it sees and has no --layer-split ("unknown option")
+            if gpus.len() > 1 && engine != "engine/strata-dsv41" {
                 command.args(["--layer-split", "auto"]);
             }
         }
+        // The bridge applies the deployment's engine settings to a whole model or the last stage; an earlier stage
+        // runs the engine alone, and of those settings only the VRAM reserve is about it (the rest are about
+        // answering). Without this it was dropped, and the stage left the engine's default free.
+        command.args(vram_reserve_args(
+            &request.settings,
+            engine == "engine/strata-dsv41",
+        ));
         if request.backend() == runtime::Backend::Hip {
             let lib = runtime.join("lib");
             let path = match std::env::var_os("LD_LIBRARY_PATH") {
@@ -1492,15 +1588,23 @@ impl Manager {
                 let Some(status) = group.exited() else {
                     return;
                 };
-                let request = request.clone();
+                let request = (**request).clone();
                 self.work = Work::None;
-                let pack = self.pack_dir(&request.model_path);
-                let (Some(runtime), Ok(model)) =
+                let (Some(runtime), Ok(mut model)) =
                     (self.runtime(), gguf::inspect(&request.model_path))
                 else {
                     return self.fail("the model or the runtime went away".into());
                 };
-                if !status.success() || !pack_ready(&pack, &model) {
+                // The range the load asked for, again: the model was read anew.
+                if let Some((start, end)) = request.range {
+                    if let Err(error) = apply_range(&mut model, start, end) {
+                        return self.fail(error);
+                    }
+                }
+                let pack = range_pack_dir(self.pack_dir(&request.model_path), &model);
+                if !status.success()
+                    || !pack_ready(&pack, &model, request.mtp_draft_path.as_deref())
+                {
                     return self.fail(format!(
                         "preparing the model for Strata failed ({status}); see the Strata log"
                     ));
@@ -1577,8 +1681,77 @@ fn copy_lines(stream: Box<dyn std::io::Read + Send>, log: &Path) {
 
 /// The pack tool writes `native_experts.txt` and the tokenizer last; for
 /// Qwen3.6-35B-A3B the folder holds only the tokenizer.
-/// `tools/dsv41/pack_gguf.py` reads the shards by name from their folder.
-fn deepseek41_pack_args(shards: &[PathBuf], pack: &Path) -> Result<Vec<String>, String> {
+/// The config's cards. Qwen3.6's own path runs on one card (its setup names one), the first chosen; the others
+/// spread the model over a list, the Qwen engine by the bridge's layer split, DeepSeek-V4.1's by itself.
+fn config_gpu(gpus: &[u32], arch: Option<&str>) -> Option<Value> {
+    match gpus {
+        [] => None,
+        [first] => Some(json!(first)),
+        [first, ..] if arch == Some(gguf::QWEN36_ARCHITECTURE) => Some(json!(first)),
+        many => Some(json!(many)),
+    }
+}
+
+/// Unsloth's Qwen files keep small projections as Q8_0; the engine reads them as BF16. A slice no longer says
+/// how many files its model had, and the flag only converts what needs it. Only `iq_pack.py` takes it.
+fn pack_needs_compat_bf16(model: &gguf::Model) -> bool {
+    model.architecture == gguf::STRATA_ARCHITECTURE
+        && (model.shards.len() > 2 || (model.stage.is_some() && !model.range))
+}
+
+/// A range of the whole model becomes this load's stage: the same first,
+/// middle and last stage rules as a slice, cut by the engine at run time.
+fn apply_range(model: &mut gguf::Model, start: u64, end: u64) -> Result<(), String> {
+    if model.stage.is_some() {
+        return Err("a range is cut from the whole model; this file is already a POM slice".into());
+    }
+    if model.architecture != gguf::STRATA_ARCHITECTURE
+        && model.architecture != gguf::DEEPSEEK41_ARCHITECTURE
+    {
+        return Err(
+            "Strata splits only Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash across machines".into(),
+        );
+    }
+    if start > end || end >= model.layers {
+        return Err(format!(
+            "the range {start}-{end} is not inside the model's {} layers",
+            model.layers
+        ));
+    }
+    model.stage = Some(gguf::Stage {
+        start,
+        end,
+        total: model.layers,
+    });
+    model.range = true;
+    Ok(())
+}
+
+/// A DeepSeek-V4.1 range has a pack of its own (`pack_gguf.py --layers`: its layers renumbered from 0, the tensors
+/// still read in place from the whole model's files), beside the whole model's: Flash-Next's ranges share the whole
+/// pack and cut the stage at run time (`--stage-layers`), strata-dsv41 has no such option.
+fn range_pack_dir(pack: PathBuf, model: &gguf::Model) -> PathBuf {
+    match model.stage {
+        Some(stage) if model.range && model.architecture == gguf::DEEPSEEK41_ARCHITECTURE => {
+            let name = pack
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            pack.with_file_name(format!("{name}-L{}-{}", stage.start, stage.end))
+        }
+        _ => pack,
+    }
+}
+
+/// `tools/dsv41/pack_gguf.py` reads the shards by name from their folder. A range of the whole model is packed as
+/// a slice would be (`--layers`).
+fn deepseek41_pack_args(
+    shards: &[PathBuf],
+    pack: &Path,
+    drafter: Option<&Path>,
+    range: Option<gguf::Stage>,
+    engram: Option<&Path>,
+) -> Result<Vec<String>, String> {
     let folder = shards
         .first()
         .and_then(|first| first.parent())
@@ -1596,11 +1769,76 @@ fn deepseek41_pack_args(shards: &[PathBuf], pack: &Path) -> Result<Vec<String>, 
             .ok_or_else(|| format!("no file name in {}", shard.display()))?;
         args.push(name.to_string_lossy().into_owned());
     }
+    if let Some(table) = engram {
+        args.push("--engram".to_string());
+        args.push(table.display().to_string());
+    }
+    if let Some(stage) = range {
+        args.push("--layers".to_string());
+        args.push(format!("{}-{}", stage.start, stage.end));
+    }
+    if let Some(drafter) = drafter {
+        // The noise token and the markov rank are constants of the model the IST-DAS files do not carry; Strata's
+        // setup states them too, and a pack with noise id 0 drafts deep less often.
+        args.extend([
+            "--dspark-gguf".to_string(),
+            drafter.display().to_string(),
+            "--dspark-noise-token".to_string(),
+            "128799".to_string(),
+            "--dspark-markov-rank".to_string(),
+            "256".to_string(),
+        ]);
+    }
     Ok(args)
 }
 
+/// The drafter the deployment chose, for the stage with the head: it reads layers 37-39 and borrows the head, so the
+/// earlier stages have no use for it.
+fn deepseek41_drafter<'a>(model: &gguf::Model, chosen: Option<&'a Path>) -> Option<&'a Path> {
+    if model.stage.is_some_and(|stage| !stage.last()) {
+        return None;
+    }
+    chosen
+}
+
+/// A pack made for no drafter, or for another one, is made again. One that has a drafter serves without it too: the
+/// engine leaves it out with `--dspark none`.
+fn deepseek41_pack_ready(pack: &Path, drafter: Option<&Path>) -> bool {
+    if !pack.join("ds4.txt").is_file() || !pack.join("tokenizer/vocab.json").is_file() {
+        return false;
+    }
+    let Ok(tensors) = std::fs::read_to_string(pack.join("tensors.txt")) else {
+        return false;
+    };
+    drafter.is_none_or(|drafter| {
+        tensors.contains(" mtp.0.")
+            && drafter
+                .file_name()
+                .is_some_and(|name| tensors.contains(&*name.to_string_lossy()))
+    })
+}
+
+/// The deployment's `vram_reserve_mib`, as the engine's option: `strata-dsv41` names it `--reserve-mib`, the Qwen
+/// engine `--vram-reserve-mib` (the bridge renames it the same way for a whole model). Empty when not set.
+fn vram_reserve_args(settings: &serde_json::Map<String, Value>, deepseek41: bool) -> Vec<String> {
+    let Some(mib) = settings.get("vram_reserve_mib").and_then(Value::as_u64) else {
+        return Vec::new();
+    };
+    let flag = if deepseek41 {
+        "--reserve-mib"
+    } else {
+        "--vram-reserve-mib"
+    };
+    vec![flag.to_owned(), mib.to_string()]
+}
+
 /// What `strata-dsv41` takes: it places the experts itself and has no flag for the rest of the Qwen engine's.
-fn deepseek41_engine_args(pack: &Path, context: u32, prev_port: Option<u16>) -> Vec<String> {
+fn deepseek41_engine_args(
+    pack: &Path,
+    context: u32,
+    prev_port: Option<u16>,
+    drafter: bool,
+) -> Vec<String> {
     let mut args = vec![
         "--pack".to_string(),
         pack.display().to_string(),
@@ -1611,14 +1849,15 @@ fn deepseek41_engine_args(pack: &Path, context: u32, prev_port: Option<u16>) -> 
         args.push("--stage-prev".to_string());
         args.push(format!("127.0.0.1:{port}"));
     }
+    // Asked for outright: "auto" leaves it out where the routed experts are far more than the GPUs hold.
+    args.push("--dspark".to_string());
+    args.push(if drafter { "on" } else { "none" }.to_string());
     args
 }
 
-fn pack_ready(pack: &Path, model: &gguf::Model) -> bool {
+fn pack_ready(pack: &Path, model: &gguf::Model, drafter: Option<&Path>) -> bool {
     if model.architecture == gguf::DEEPSEEK41_ARCHITECTURE {
-        return pack.join("ds4.txt").is_file()
-            && pack.join("tensors.txt").is_file()
-            && pack.join("tokenizer/vocab.json").is_file();
+        return deepseek41_pack_ready(pack, deepseek41_drafter(model, drafter));
     }
     if model.architecture == gguf::QWEN36_ARCHITECTURE {
         return pack.join("tokenizer/vocab.json").is_file()
@@ -1673,10 +1912,19 @@ fn conversation_cache_args(request: &LoadRequest) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// An absolute path in the form `path.is_absolute()` takes on the platform: Windows wants a drive.
+    fn abs(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_string()
+        }
+    }
+
     #[test]
     fn conversation_parking_follows_the_deployment_on_a_whole_model_only() {
         let load = |settings: Value| {
-            LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "settings": settings}))
+            LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf"), "settings": settings}))
                 .unwrap()
         };
         let parked = load(
@@ -1709,7 +1957,7 @@ mod tests {
     #[test]
     fn a_load_request_is_read_with_safe_defaults() {
         let request = LoadRequest::from_json(&json!({
-            "model_path": "/models/Q-IQ3_XXS-00001-of-00002.gguf",
+            "model_path": abs("/models/Q-IQ3_XXS-00001-of-00002.gguf"),
             "model_label": "qwen3.8-flash-next",
             "n_ctx": 65536,
             "gpus": [0, 1, 99],
@@ -1726,30 +1974,31 @@ mod tests {
         assert!(!request.settings.contains_key("kv_cache"));
         assert!(request.settings.contains_key("fit_max_tokens"));
         let plain =
-            LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "kv": "q4_0"})).unwrap();
+            LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf"), "kv": "q4_0"})).unwrap();
         assert_eq!(plain.model_label, "x");
         assert_eq!(plain.context, DEFAULT_CONTEXT);
         assert_eq!(plain.kv, "int8");
         assert!(LoadRequest::from_json(&json!({"model_path": "relative.gguf"})).is_err());
         // the prefill/decode role: both is no role, an unknown one is refused
-        let role =
-            |role: &str| LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "role": role}));
+        let role = |role: &str| {
+            LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf"), "role": role}))
+        };
         assert_eq!(role("prefill").unwrap().role.as_deref(), Some("prefill"));
         assert_eq!(role("both").unwrap().role, None);
         assert_eq!(role("shared").unwrap().role.as_deref(), Some("shared"));
         assert!(role("decode").is_err());
         let threshold = LoadRequest::from_json(
-            &json!({"model_path": "/m/x.gguf", "role": "prefill", "prefill_min_tokens": 2048}),
+            &json!({"model_path": abs("/m/x.gguf"), "role": "prefill", "prefill_min_tokens": 2048}),
         )
         .unwrap();
         assert_eq!(threshold.prefill_min_tokens, Some(2048));
         assert!(role("other").is_err());
         assert!(LoadRequest::from_json(
-            &json!({"model_path": "/m/x.gguf", "mmproj_path": "rel.gguf"})
+            &json!({"model_path": abs("/m/x.gguf"), "mmproj_path": "rel.gguf"})
         )
         .is_err());
         assert!(LoadRequest::from_json(
-            &json!({"model_path": "/m/x.gguf", "mmproj_path": "/no/such/mmproj.gguf"})
+            &json!({"model_path": abs("/m/x.gguf"), "mmproj_path": "/no/such/mmproj.gguf"})
         )
         .is_err());
         assert!(LoadRequest::from_json(&json!({})).is_err());
@@ -1783,6 +2032,14 @@ mod tests {
         assert_eq!(snapshot.service()["kind"], "inference");
         assert_eq!(snapshot.service()["status"], "waiting");
         assert_eq!(snapshot.service()["stages"], true);
+        assert_eq!(
+            snapshot.service()["stage_ranges"][0],
+            gguf::STRATA_ARCHITECTURE
+        );
+        assert_eq!(
+            snapshot.service()["stage_ranges"][1],
+            gguf::DEEPSEEK41_ARCHITECTURE
+        );
         assert_eq!(snapshot.service()["vision"], true);
         assert_eq!(snapshot.service()["pom_settings"][1], "hidden_state_dtype");
         snapshot.port = None;
@@ -1803,19 +2060,283 @@ mod tests {
         let amd = |ordinal: u32| json!({"vendor": "amd", "ordinal": ordinal, "index": ordinal + 1});
         let nvidia = json!({"vendor": "nvidia", "ordinal": 0, "index": 0});
         let both = LoadRequest::from_json(&json!({
-            "model_path": "/m/x.gguf", "gpus": [0], "gpu_devices": [nvidia, amd(0)]
+            "model_path": abs("/m/x.gguf"), "gpus": [0], "gpu_devices": [nvidia, amd(0)]
         }))
         .unwrap();
-        assert_eq!(both.backend(), runtime::Backend::Cuda);
+        assert_eq!(both.backend(), runtime::Backend::Main);
         assert_eq!(both.backend_gpus(), &[0]);
         let radeon = LoadRequest::from_json(&json!({
-            "model_path": "/m/x.gguf", "gpus": [], "gpu_devices": [amd(0), amd(1)]
+            "model_path": abs("/m/x.gguf"), "gpus": [], "gpu_devices": [amd(0), amd(1)]
         }))
         .unwrap();
         assert_eq!(radeon.backend(), runtime::Backend::Hip);
         assert_eq!(radeon.backend_gpus(), &[0, 1]);
-        let none = LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"})).unwrap();
-        assert_eq!(none.backend(), runtime::Backend::Cuda);
+        let none = LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf")})).unwrap();
+        assert_eq!(none.backend(), runtime::Backend::Main);
+    }
+
+    /// A range of the whole Flash-Next model becomes its stage; a slice file, another family or a range past the
+    /// last layer is refused. The whole model's pack stays the plain one.
+    #[test]
+    fn a_range_of_the_whole_model_becomes_its_stage() {
+        let whole = |architecture: &str| gguf::Model {
+            architecture: architecture.into(),
+            shards: vec![
+                PathBuf::from("/m/a-00001-of-00002.gguf"),
+                PathBuf::from("/m/a-00002-of-00002.gguf"),
+            ],
+            ple_shard: None,
+            layers: 48,
+            stage: None,
+            range: false,
+        };
+        let mut model = whole(gguf::STRATA_ARCHITECTURE);
+        apply_range(&mut model, 24, 47).unwrap();
+        assert_eq!(
+            model.stage,
+            Some(gguf::Stage {
+                start: 24,
+                end: 47,
+                total: 48
+            })
+        );
+        assert!(model.range && model.stage.unwrap().last() && !model.stage.unwrap().first());
+        assert!(
+            !pack_needs_compat_bf16(&model),
+            "a range shares the whole model's pack"
+        );
+
+        assert!(apply_range(&mut whole(gguf::STRATA_ARCHITECTURE), 40, 48).is_err());
+        assert!(apply_range(&mut whole(gguf::QWEN36_ARCHITECTURE), 0, 23).is_err());
+        let mut deepseek = whole(gguf::DEEPSEEK41_ARCHITECTURE);
+        apply_range(&mut deepseek, 14, 19).unwrap();
+        assert!(
+            deepseek.range && !deepseek.stage.unwrap().first() && !deepseek.stage.unwrap().last()
+        );
+        assert_eq!(
+            range_pack_dir(PathBuf::from("/b/packs/m-1a2b"), &deepseek),
+            PathBuf::from("/b/packs/m-1a2b-L14-19"),
+            "a DeepSeek-V4.1 range has a pack of its own"
+        );
+        assert_eq!(
+            range_pack_dir(PathBuf::from("/b/packs/m-1a2b"), &model),
+            PathBuf::from("/b/packs/m-1a2b"),
+            "a Flash-Next range shares the whole model's pack"
+        );
+        let mut slice = whole(gguf::STRATA_ARCHITECTURE);
+        slice.stage = Some(gguf::Stage {
+            start: 0,
+            end: 23,
+            total: 48,
+        });
+        assert!(apply_range(&mut slice, 0, 23).is_err());
+
+        let request = LoadRequest::from_json(&json!({
+            "model_path": "/m/x.gguf", "range": {"start_layer": 0, "end_layer": 23}
+        }))
+        .unwrap();
+        assert_eq!(request.range, Some((0, 23)));
+        assert!(LoadRequest::from_json(&json!({
+            "model_path": "/m/x.gguf", "range": {"start_layer": 9, "end_layer": 3}
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn deepseek41_uses_the_chosen_drafter_on_the_stage_with_the_head_only() {
+        let slice = PathBuf::from("/m/cd91.gguf");
+        let model = |stage: Option<gguf::Stage>| gguf::Model {
+            architecture: gguf::DEEPSEEK41_ARCHITECTURE.into(),
+            shards: vec![slice.clone()],
+            ple_shard: None,
+            layers: 40,
+            stage,
+            range: false,
+        };
+        let chosen = PathBuf::from("/d/dspark.gguf");
+        let last = gguf::Stage {
+            start: 20,
+            end: 39,
+            total: 40,
+        };
+        let first = gguf::Stage {
+            start: 0,
+            end: 19,
+            total: 40,
+        };
+        assert_eq!(
+            deepseek41_drafter(&model(Some(last)), Some(&chosen)),
+            Some(chosen.as_path())
+        );
+        assert_eq!(
+            deepseek41_drafter(&model(None), Some(&chosen)),
+            Some(chosen.as_path())
+        );
+        assert_eq!(deepseek41_drafter(&model(Some(first)), Some(&chosen)), None);
+        assert_eq!(deepseek41_drafter(&model(Some(last)), None), None);
+    }
+
+    #[test]
+    fn the_drafter_choice_is_read_and_checked() {
+        let file = std::env::temp_dir().join(format!("pom-dspark-{}.gguf", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let ok = LoadRequest::from_json(
+            &json!({"model_path": abs("/m/x.gguf"), "mtp_draft_path": file}),
+        )
+        .unwrap();
+        assert_eq!(ok.mtp_draft_path.as_deref(), Some(file.as_path()));
+        assert_eq!(
+            LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf")}))
+                .unwrap()
+                .mtp_draft_path,
+            None
+        );
+        assert!(LoadRequest::from_json(
+            &json!({"model_path": abs("/m/x.gguf"), "mtp_draft_path": "rel.gguf"})
+        )
+        .is_err());
+        assert!(LoadRequest::from_json(
+            &json!({"model_path": abs("/m/x.gguf"), "mtp_draft_path": "/no/such.gguf"})
+        )
+        .is_err());
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn deepseek41_pack_names_the_drafter_and_the_constants_its_gguf_lacks() {
+        let args = deepseek41_pack_args(
+            &[PathBuf::from("/m/a.gguf")],
+            Path::new("/p"),
+            Some(Path::new("/d/dspark.gguf")),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            args[args.len() - 6..],
+            [
+                "--dspark-gguf",
+                "/d/dspark.gguf",
+                "--dspark-noise-token",
+                "128799",
+                "--dspark-markov-rank",
+                "256",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pack_is_made_again_for_another_drafter() {
+        let pack = std::env::temp_dir().join(format!("pom-ds41-pack-{}", std::process::id()));
+        std::fs::create_dir_all(pack.join("tokenizer")).unwrap();
+        std::fs::write(pack.join("ds4.txt"), b"x").unwrap();
+        std::fs::write(pack.join("tokenizer/vocab.json"), b"{}").unwrap();
+        std::fs::write(
+            pack.join("tensors.txt"),
+            "file 0 a.gguf\nt layers.0.x F32 0 0 4 1\n",
+        )
+        .unwrap();
+        let chosen = PathBuf::from("/d/dspark-q8.gguf");
+        let other = PathBuf::from("/d/dspark-bf16.gguf");
+        assert!(deepseek41_pack_ready(&pack, None));
+        assert!(!deepseek41_pack_ready(&pack, Some(&chosen)));
+        std::fs::write(
+            pack.join("tensors.txt"),
+            "file 0 a.gguf\nfile 1 ../d/dspark-q8.gguf\nt mtp.0.main_proj.weight F32 1 0 4 1\n",
+        )
+        .unwrap();
+        assert!(deepseek41_pack_ready(&pack, Some(&chosen)));
+        assert!(!deepseek41_pack_ready(&pack, Some(&other)));
+        assert!(
+            deepseek41_pack_ready(&pack, None),
+            "the engine leaves the drafter out with --dspark none"
+        );
+        let _ = std::fs::remove_dir_all(pack);
+    }
+
+    #[test]
+    fn deepseek41_turns_the_drafter_on_or_leaves_it_out() {
+        let on = deepseek41_engine_args(Path::new("/p"), 8192, None, true);
+        assert_eq!(on[on.len() - 2..], ["--dspark", "on"]);
+        let off = deepseek41_engine_args(Path::new("/p"), 8192, None, false);
+        assert_eq!(off[off.len() - 2..], ["--dspark", "none"]);
+    }
+
+    #[test]
+    fn only_qwen36_is_held_to_the_first_card() {
+        assert_eq!(config_gpu(&[], None), None);
+        assert_eq!(
+            config_gpu(&[1], Some(gguf::QWEN36_ARCHITECTURE)),
+            Some(json!(1))
+        );
+        assert_eq!(
+            config_gpu(&[0, 1], Some(gguf::QWEN36_ARCHITECTURE)),
+            Some(json!(0))
+        );
+        assert_eq!(config_gpu(&[0, 1], None), Some(json!([0, 1])));
+        assert_eq!(
+            config_gpu(&[0, 1], Some(gguf::DEEPSEEK41_ARCHITECTURE)),
+            Some(json!([0, 1]))
+        );
+    }
+
+    #[test]
+    fn only_the_qwen_pack_tool_takes_the_bf16_compatibility_flag() {
+        let stage = gguf::Stage {
+            start: 20,
+            end: 39,
+            total: 40,
+        };
+        let model = |architecture: &str, shards: usize, stage: Option<gguf::Stage>| gguf::Model {
+            architecture: architecture.into(),
+            shards: vec![PathBuf::from("/m/a.gguf"); shards],
+            ple_shard: None,
+            layers: 40,
+            stage,
+            range: false,
+        };
+        assert!(pack_needs_compat_bf16(&model(
+            gguf::STRATA_ARCHITECTURE,
+            1,
+            Some(stage)
+        )));
+        assert!(pack_needs_compat_bf16(&model(
+            gguf::STRATA_ARCHITECTURE,
+            3,
+            None
+        )));
+        assert!(!pack_needs_compat_bf16(&model(
+            gguf::STRATA_ARCHITECTURE,
+            2,
+            None
+        )));
+        assert!(!pack_needs_compat_bf16(&model(
+            gguf::DEEPSEEK41_ARCHITECTURE,
+            1,
+            Some(stage)
+        )));
+        assert!(!pack_needs_compat_bf16(&model(
+            gguf::DEEPSEEK41_ARCHITECTURE,
+            6,
+            None
+        )));
+        assert!(!pack_needs_compat_bf16(&model(
+            gguf::QWEN36_ARCHITECTURE,
+            3,
+            None
+        )));
+    }
+
+    #[test]
+    fn a_deepseek41_range_packs_only_its_layers() {
+        let shards = vec![PathBuf::from("/m/IQ2/a-00001-of-00002.gguf")];
+        let range = gguf::Stage {
+            start: 8,
+            end: 13,
+            total: 40,
+        };
+        let args = deepseek41_pack_args(&shards, Path::new("/p"), None, Some(range), None).unwrap();
+        assert_eq!(args[args.len() - 2..], ["--layers", "8-13"]);
     }
 
     #[test]
@@ -1825,7 +2346,7 @@ mod tests {
             PathBuf::from("/m/IQ2/a-00002-of-00002.gguf"),
         ];
         assert_eq!(
-            deepseek41_pack_args(&shards, Path::new("/p")).unwrap(),
+            deepseek41_pack_args(&shards, Path::new("/p"), None, None, None).unwrap(),
             [
                 "--model",
                 "/m/IQ2",
@@ -1839,9 +2360,31 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_coder_passes_the_separate_engram_and_range() {
+        let shards = vec![PathBuf::from("/m/IQ2/Coder-00001-of-00006.gguf")];
+        let table = Path::new("/m/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf");
+        let range = gguf::Stage {
+            start: 20,
+            end: 39,
+            total: 40,
+        };
+        let args =
+            deepseek41_pack_args(&shards, Path::new("/p"), None, Some(range), Some(table)).unwrap();
+        assert_eq!(
+            args[6..],
+            [
+                "--engram",
+                "/m/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf",
+                "--layers",
+                "20-39"
+            ]
+        );
+    }
+
+    #[test]
     fn deepseek41_starts_from_the_pack_and_links_to_the_earlier_stage() {
         assert_eq!(
-            deepseek41_engine_args(Path::new("/p"), 8192, Some(4100)),
+            deepseek41_engine_args(Path::new("/p"), 8192, Some(4100), false),
             [
                 "--pack",
                 "/p",
@@ -1849,19 +2392,35 @@ mod tests {
                 "8192",
                 "--stage-prev",
                 "127.0.0.1:4100",
+                "--dspark",
+                "none",
             ]
         );
         assert_eq!(
-            deepseek41_engine_args(Path::new("/p"), 8192, None),
-            ["--pack", "/p", "--max-context", "8192"]
+            deepseek41_engine_args(Path::new("/p"), 8192, None, false),
+            ["--pack", "/p", "--max-context", "8192", "--dspark", "none"]
         );
+    }
+
+    /// An earlier stage runs the engine alone: the deployment's VRAM reserve reaches it in the engine's own name.
+    #[test]
+    fn an_earlier_stage_takes_the_vram_reserve_in_its_engine_s_name() {
+        let settings = json!({"vram_reserve_mib": 500, "reasoning_effort": "none"});
+        let settings = settings.as_object().unwrap();
+        assert_eq!(vram_reserve_args(settings, true), ["--reserve-mib", "500"]);
+        assert_eq!(
+            vram_reserve_args(settings, false),
+            ["--vram-reserve-mib", "500"]
+        );
+        let none = json!({"reasoning_effort": "none"});
+        assert!(vram_reserve_args(none.as_object().unwrap(), true).is_empty());
     }
 
     #[test]
     fn a_stage_link_is_read_and_checked() {
         let token = "t".repeat(32);
         let request = LoadRequest::from_json(&json!({
-            "model_path": "/m/tail.gguf",
+            "model_path": abs("/m/tail.gguf"),
             "link": {"token": token, "prev_port": 4100, "max_inflight": 4}
         }))
         .unwrap();
@@ -1869,7 +2428,7 @@ mod tests {
         assert_eq!(link.prev_port, Some(4100));
         assert_eq!(link.max_inflight, Some(4));
         assert_eq!(link.token.as_deref(), Some(token.as_str()));
-        let first = LoadRequest::from_json(&json!({"model_path": "/m/head.gguf", "link": {}}))
+        let first = LoadRequest::from_json(&json!({"model_path": abs("/m/head.gguf"), "link": {}}))
             .unwrap()
             .link
             .unwrap();
@@ -1880,12 +2439,15 @@ mod tests {
             json!({"token": token, "prev_port": 4100, "max_inflight": 0}),
         ] {
             assert!(
-                LoadRequest::from_json(&json!({"model_path": "/m/x.gguf", "link": bad})).is_err()
+                LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf"), "link": bad}))
+                    .is_err()
             );
         }
-        assert!(LoadRequest::from_json(&json!({"model_path": "/m/x.gguf"}))
-            .unwrap()
-            .link
-            .is_none());
+        assert!(
+            LoadRequest::from_json(&json!({"model_path": abs("/m/x.gguf")}))
+                .unwrap()
+                .link
+                .is_none()
+        );
     }
 }

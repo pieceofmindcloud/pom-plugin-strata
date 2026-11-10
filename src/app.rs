@@ -14,6 +14,7 @@
 //! starts only once that configuration has arrived.
 
 use crate::engine::Group;
+use crate::runtime;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -324,7 +325,7 @@ impl Manager {
     }
 
     fn launch(&mut self, gateway: Gateway, runtime: PathBuf) -> Result<Running, String> {
-        let node = runtime.join("node/bin/node");
+        let node = runtime::exe(&runtime, "node/bin/node");
         let meta: Value = std::fs::read_to_string(runtime.join("app/APP.json"))
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
@@ -477,6 +478,9 @@ impl Manager {
         if !link.exists() {
             #[cfg(unix)]
             std::os::unix::fs::symlink("../..", &link).map_err(|error| error.to_string())?;
+            // a junction needs no privilege, where a Windows symlink does
+            #[cfg(windows)]
+            junction(&link, package.join("../.."))?;
         }
         Ok(package)
     }
@@ -487,7 +491,7 @@ pub fn has_app(runtime: &Path) -> bool {
     runtime.join("app/server/index.mjs").is_file()
         && runtime.join("app/dist/index.html").is_file()
         && runtime.join("app/APP.json").is_file()
-        && runtime.join("node/bin/node").is_file()
+        && runtime::exe(runtime, "node/bin/node").is_file()
 }
 
 fn valid_version(version: &str) -> bool {
@@ -497,6 +501,28 @@ fn valid_version(version: &str) -> bool {
         && version
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+}
+
+/// A directory junction at `link` to `target` (Windows: `mklink /J`, which needs no privilege).
+#[cfg(windows)]
+fn junction(link: &Path, target: PathBuf) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let status = Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link)
+        .arg(&target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x0800_0000)
+        .status()
+        .map_err(|error| error.to_string())?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("cannot link {} to {}", link.display(), target.display()))
 }
 
 fn path_with(dir: &Path) -> std::ffi::OsString {
@@ -684,13 +710,17 @@ mod tests {
     fn the_gateway_comes_from_host_configure() {
         let gateway = Gateway::from_configure(&json!({
             "gateway": {"openai_base_url": "http://127.0.0.1:8080/v1/", "api_key": "k"},
-            "workspace_root": "/data/workspace",
+            "workspace_root": if cfg!(windows) { "C:/data/workspace" } else { "/data/workspace" },
         }))
         .unwrap();
         assert_eq!(gateway.openai_base_url, "http://127.0.0.1:8080/v1");
         assert_eq!(
             gateway.workspace_root,
-            Some(PathBuf::from("/data/workspace"))
+            Some(PathBuf::from(if cfg!(windows) {
+                "C:/data/workspace"
+            } else {
+                "/data/workspace"
+            }))
         );
         assert!(Gateway::from_configure(&json!({"gateway": {"openai_base_url": "x"}})).is_none());
         let relative = Gateway::from_configure(&json!({

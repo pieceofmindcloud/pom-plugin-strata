@@ -23,47 +23,61 @@ fi
 rm -rf "$out.tmp"
 mkdir -p "$out.tmp/engine" "$out.tmp/strata" "$build"
 
-echo "== engine: CUDA $(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p'), archs $archs"
-cmake -G Ninja "${launcher[@]}" -S /src -B "$build" \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DSTRATA_ENABLE_CUDA=ON \
-  -DSTRATA_BUILD_TESTS=OFF \
-  -DSTRATA_PORTABLE=ON \
-  -DSTRATA_Q6K_EXPERTS=ON \
-  -DSTRATA_MMQ_KQUANTS=ON \
-  -DSTRATA_BUILD_DSV41=ON \
-  -DCMAKE_CUDA_ARCHITECTURES="$archs" \
-  -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
-  -DCMAKE_PROJECT_INCLUDE=/plugin/cmake/pom-static-cuda.cmake \
-  -DSTRATA_GGML_DIR=/src/third_party/llama.cpp
-cmake --build "$build" --target strata strata-dsv41 -j "$jobs"
-install -m 0755 "$build/strata" "$out.tmp/engine/strata"
-install -m 0755 "$build/strata-dsv41" "$out.tmp/engine/strata-dsv41"
+# A compiled engine kept under the same ENGINE_KEY (scripts/runtime-key.sh: the Strata and llama.cpp commits, the
+# architectures and these build files) is taken as it is: only the runtime around it is assembled again.
+engine_cache=/work/engine/cuda
+if [[ -n "${ENGINE_KEY:-}" && -f "$engine_cache/ENGINE.key" && "$(cat "$engine_cache/ENGINE.key")" == "$ENGINE_KEY" ]]; then
+  echo "== engine: reused ($ENGINE_KEY)"
+  cp -a "$engine_cache/engine/." "$out.tmp/engine/"
+else
+  echo "== engine: CUDA $(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p'), archs $archs"
+  cmake -G Ninja "${launcher[@]}" -S /src -B "$build" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DSTRATA_ENABLE_CUDA=ON \
+    -DSTRATA_BUILD_TESTS=OFF \
+    -DSTRATA_PORTABLE=ON \
+    -DSTRATA_Q6K_EXPERTS=ON \
+    -DSTRATA_MMQ_KQUANTS=ON \
+    -DSTRATA_BUILD_DSV41=ON \
+    -DCMAKE_CUDA_ARCHITECTURES="$archs" \
+    -DCMAKE_CUDA_RUNTIME_LIBRARY=Static \
+    -DCMAKE_PROJECT_INCLUDE=/plugin/cmake/pom-static-cuda.cmake
+  # Strata's current engine vendors its own ggml with the trellis kernels. The separately
+  # pinned llama.cpp checkout below is only for the CPU vision encoder and gguf-py.
+  cmake --build "$build" --target strata strata-dsv41 -j "$jobs"
+  install -m 0755 "$build/strata" "$out.tmp/engine/strata"
+  install -m 0755 "$build/strata-dsv41" "$out.tmp/engine/strata-dsv41"
 
-# The engine may need the driver and the C/C++ runtime, and nothing of CUDA:
-# a POM node image has no CUDA shared library to give it.
-if ldd "$out.tmp/engine/strata" "$out.tmp/engine/strata-dsv41" | grep -E 'libcu(dart|blas|blasLt)' ; then
-  echo "the engine links a CUDA shared library; it must use the static ones" >&2
-  exit 1
-fi
-if ldd "$out.tmp/engine/strata" "$out.tmp/engine/strata-dsv41" | grep 'not found' | grep -v 'libcuda.so.1' ; then
-  echo "the engine has unresolved libraries" >&2
-  exit 1
-fi
+  # The engine may need the driver and the C/C++ runtime, and nothing of CUDA:
+  # a POM node image has no CUDA shared library to give it.
+  if ldd "$out.tmp/engine/strata" "$out.tmp/engine/strata-dsv41" | grep -E 'libcu(dart|blas|blasLt)' ; then
+    echo "the engine links a CUDA shared library; it must use the static ones" >&2
+    exit 1
+  fi
+  if ldd "$out.tmp/engine/strata" "$out.tmp/engine/strata-dsv41" | grep 'not found' | grep -v 'libcuda.so.1' ; then
+    echo "the engine has unresolved libraries" >&2
+    exit 1
+  fi
 
-# The vision encoder (llama.cpp's mtmd at the engine's pinned commit) runs on the CPU: the plugin reads images there,
-# so the model keeps the whole card (engine.rs, the config's vision section). Portable: AVX2 baseline, no OpenMP.
-echo "== vision encoder"
-cmake -G Ninja "${launcher[@]}" -S /src/tools/vision -B /work/build-vision \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DLLAMA_DIR=/src/third_party/llama.cpp \
-  -DSTRATA_PORTABLE=ON \
-  -DSTRATA_VISION_CUDA=OFF
-cmake --build /work/build-vision --target strata-vision -j "$jobs"
-install -m 0755 /work/build-vision/bin/strata-vision "$out.tmp/engine/strata-vision"
-if ldd "$out.tmp/engine/strata-vision" | grep 'not found' ; then
-  echo "the vision encoder has unresolved libraries" >&2
-  exit 1
+  # The vision encoder (llama.cpp's mtmd at the engine's pinned commit) runs on the CPU: the plugin reads images there,
+  # so the model keeps the whole card (engine.rs, the config's vision section). Portable: AVX2 baseline, no OpenMP.
+  echo "== vision encoder"
+  cmake -G Ninja "${launcher[@]}" -S /src/tools/vision -B /work/build-vision \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLLAMA_DIR=/src/third_party/llama.cpp \
+    -DSTRATA_PORTABLE=ON \
+    -DSTRATA_VISION_CUDA=OFF
+  cmake --build /work/build-vision --target strata-vision -j "$jobs"
+  install -m 0755 /work/build-vision/bin/strata-vision "$out.tmp/engine/strata-vision"
+  if ldd "$out.tmp/engine/strata-vision" | grep 'not found' ; then
+    echo "the vision encoder has unresolved libraries" >&2
+    exit 1
+  fi
+  if [[ -n "${ENGINE_KEY:-}" ]]; then
+    rm -rf "$engine_cache" && mkdir -p "$engine_cache"
+    cp -a "$out.tmp/engine" "$engine_cache/engine"
+    printf '%s' "$ENGINE_KEY" > "$engine_cache/ENGINE.key"
+  fi
 fi
 
 echo "== server and tools"
@@ -93,6 +107,7 @@ meta = {
     "cuda_architectures": os.environ["CUDA_ARCHITECTURES"].split(";"),
     "python": "%d.%d" % sys.version_info[:2],
     "runtime_version": os.environ.get("RUNTIME_VERSION", ""),
+    "engine_key": os.environ.get("ENGINE_KEY", ""),
 }
 with open(os.path.join(root, "RUNTIME.json"), "w") as f:
     json.dump(meta, f, indent=1)

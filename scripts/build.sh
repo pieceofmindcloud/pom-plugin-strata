@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Builds the plugin library for Linux x86_64 (the only platform Strata's CUDA
-# engine runs on here). The Strata runtime is not part of the library: see
-# scripts/build-runtime.sh and scripts/package.sh.
+# Builds the plugin library for one platform, on that platform: Linux x86_64
+# (CUDA and HIP), macOS aarch64 (Metal, Apple Silicon) or Windows x86_64 (CUDA).
+# The Strata runtime is not part of the library: see scripts/build-runtime.sh
+# and scripts/package.sh.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -11,7 +12,7 @@ profile="release"
 
 usage() {
   printf '%s\n' \
-    'Usage: scripts/build.sh --platform linux-x86_64 [options]' \
+    'Usage: scripts/build.sh --platform <linux-x86_64|macos-aarch64|windows-x86_64> [options]' \
     '  --output <dir>   artifact directory (default: dist-release)' \
     '  --debug          build the debug profile' \
     'Environment: STRATA_RUNTIME_URL, STRATA_RUNTIME_SHA256, STRATA_RUNTIME_SIZE pin the' \
@@ -33,15 +34,15 @@ while (($# > 0)); do
   esac
 done
 
-[[ "$platform" == linux-x86_64 ]] || die 'only linux-x86_64 is supported'
-target="x86_64-unknown-linux-gnu"
-if [[ "$profile" == release ]]; then
-  cargo_args=(build --locked --release --target "$target")
-  artifact="${root}/target/${target}/release/libpom_plugin_strata.so"
-else
-  cargo_args=(build --locked --target "$target")
-  artifact="${root}/target/${target}/debug/libpom_plugin_strata.so"
-fi
+case "$platform" in
+  linux-x86_64) target="x86_64-unknown-linux-gnu"; library="libpom_plugin_strata.so"; ext="so" ;;
+  macos-aarch64) target="aarch64-apple-darwin"; library="libpom_plugin_strata.dylib"; ext="dylib" ;;
+  windows-x86_64) target="x86_64-pc-windows-msvc"; library="pom_plugin_strata.dll"; ext="dll" ;;
+  *) die "unsupported platform: $platform" ;;
+esac
+cargo_args=(build --locked --target "$target")
+[[ "$profile" == debug ]] || cargo_args+=(--release)
+artifact="${root}/target/${target}/${profile}/${library}"
 
 "$root/scripts/build-ui.sh"
 (
@@ -51,9 +52,9 @@ fi
 [[ -f "$artifact" ]] || die "artifact not found: $artifact"
 
 mkdir -p "$output"
-destination="${output}/pom-plugin-strata-${platform}.so"
+destination="${output}/pom-plugin-strata-${platform}.${ext}"
 cp "$artifact" "$destination"
-sha256="$(sha256sum "$destination" | awk '{print $1}')"
+sha256="$("$root/scripts/sha256.sh" "$destination")"
 size="$(wc -c < "$destination" | tr -d '[:space:]')"
 printf 'artifact=%s\nsha256=%s\nsize=%s\nplatform=%s\ntarget=%s\n' \
   "$destination" "$sha256" "$size" "$platform" "$target"

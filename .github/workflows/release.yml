@@ -1,10 +1,17 @@
 name: Publish release
 
-# Manual entry point. The library is built pinned to the two Strata runtimes
-# (CUDA and HIP) and the three go to the GitHub release v<version>. The
-# runtimes are the latest ones of the release `strata-runtime`, which
-# runtime.yml builds (50+ minutes); with "build_runtime" this run builds them
-# first, the same way.
+# Manual entry point. One release v<version> with a library per selected
+# platform, each built on its own runner and pinned to that platform's Strata
+# runtimes, which go to the release beside it:
+#   linux-x86_64   .so,    CUDA and HIP runtimes
+#   macos-aarch64  .dylib, Metal runtime (Apple Silicon)
+#   windows-x86_64 .dll,   CUDA runtime
+#
+# The library never compiles Strata: the runtimes are the latest ones of the
+# release `strata-runtime`, which runtime.yml builds. With "build_runtime"
+# this run calls runtime.yml first, which rebuilds only the runtimes whose
+# Strata commit or build files changed (and reuses a cached engine when only
+# the bridge changed), so a release of a plugin change alone builds no engine.
 on:
   workflow_dispatch:
     inputs:
@@ -12,30 +19,103 @@ on:
         description: 'Version, without the v (e.g. 0.2.0)'
         type: string
         required: true
+      linux:
+        description: 'Linux x86_64 (CUDA, HIP)'
+        type: boolean
+        default: true
+      macos:
+        description: 'macOS aarch64 (Metal, Apple Silicon)'
+        type: boolean
+        default: true
+      windows:
+        description: 'Windows x86_64 (CUDA)'
+        type: boolean
+        default: true
       prerelease:
         description: 'Publish as a prerelease'
         type: boolean
         default: true
       build_runtime:
-        description: 'Build the Strata runtimes first (else: the latest of the strata-runtime release)'
+        description: 'Bring the Strata runtimes up to date first (else: the latest of the strata-runtime release as is)'
         type: boolean
         default: false
+      mac_runner:
+        description: 'Where the macOS build runs: macos-26 (GitHub), macos-15 (GitHub, older SDK) or macbook (self-hosted)'
+        type: choice
+        options: [macos-26, macos-15, macbook]
+        default: macos-26
+      strata_commits:
+        description: 'With build_runtime: pin backends to a Strata commit, e.g. cuda=<sha>,hip=<sha>,cuda-windows=<sha>'
+        type: string
+        default: ''
 
 permissions:
   contents: write
 
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      backends: ${{ steps.plan.outputs.backends }}
+    steps:
+      - id: plan
+        shell: bash
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] \
+            || { echo "version must be X.Y.Z without the v: $VERSION" >&2; exit 2; }
+          # runs-on as JSON: a GitHub label, or the self-hosted MacBook's labels
+          case "$MAC_RUNNER" in
+            macbook) mac='["self-hosted","macOS","ARM64","macbook","metal"]' ;;
+            macos-15|macos-26) mac="\"$MAC_RUNNER\"" ;;
+            *) echo "mac_runner: unknown $MAC_RUNNER" >&2; exit 2 ;;
+          esac
+          entries=() backends=()
+          # name runner platform ext runtimes(space separated)
+          add() {
+            [[ "$2" == true ]] || return 0
+            entries+=("$(jq -cn --arg platform "$1" --argjson runner "$3" --arg ext "$4" --arg runtimes "$5" \
+              '{platform:$platform, runner:$runner, ext:$ext, runtimes:$runtimes}')")
+          }
+          add linux-x86_64   "$LINUX"   '"ubuntu-24.04"' so    'strata-runtime-linux-x86_64.tar.gz strata-runtime-hip-linux-x86_64.tar.gz'
+          add macos-aarch64  "$MACOS"   "$mac"           dylib 'strata-runtime-macos-aarch64.tar.gz'
+          add windows-x86_64 "$WINDOWS" '"windows-2022"' dll   'strata-runtime-windows-x86_64.tar.gz'
+          [[ "$LINUX" != true ]] || backends+=(cuda hip)
+          [[ "$MACOS" != true ]] || backends+=(metal)
+          [[ "$WINDOWS" != true ]] || backends+=(cuda-windows)
+          ((${#entries[@]})) || { echo 'select at least one platform' >&2; exit 2; }
+          echo "matrix=$(printf '%s\n' "${entries[@]}" | jq -cs '{include: .}')" >> "$GITHUB_OUTPUT"
+          echo "backends=$(IFS=,; echo "${backends[*]}")" >> "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ inputs.version }}
+          LINUX: ${{ inputs.linux }}
+          MACOS: ${{ inputs.macos }}
+          WINDOWS: ${{ inputs.windows }}
+          MAC_RUNNER: ${{ inputs.mac_runner }}
+
   runtime:
     name: Strata runtimes
+    needs: plan
     if: ${{ inputs.build_runtime }}
     uses: ./.github/workflows/runtime.yml
+    with:
+      platforms: ${{ needs.plan.outputs.backends }}
+      strata_commits: ${{ inputs.strata_commits }}
+      mac_runner: ${{ inputs.mac_runner }}
 
   package:
-    name: Package ${{ inputs.version }}
-    needs: runtime
-    # the runtimes were built by this run, or are taken from strata-runtime
-    if: ${{ !cancelled() && (needs.runtime.result == 'success' || needs.runtime.result == 'skipped') }}
-    runs-on: ubuntu-24.04
+    name: Package ${{ matrix.platform }} ${{ inputs.version }}
+    needs: [plan, runtime]
+    # the runtimes were brought up to date by this run, or are taken from strata-runtime as they are
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.runtime.result == 'success' || needs.runtime.result == 'skipped') }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,7 +123,19 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # The self-hosted MacBook has a pom-release `cargo` wrapper in ~/.cargo/bin that stops unless
+      # POM_RELEASE_REAL_CARGO names the cargo it wraps: the toolchain's own cargo is that one, and it
+      # goes first on PATH so this job runs it directly.
+      - name: The toolchain's cargo (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: |
+          real="$(rustup which cargo)"
+          echo "POM_RELEASE_REAL_CARGO=$real" >> "$GITHUB_ENV"
+          dirname "$real" >> "$GITHUB_PATH"
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
 
       # The plugin screens are bundled and embedded in the library.
       - uses: actions/setup-node@v4
@@ -52,49 +144,61 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
-      - uses: actions/download-artifact@v4
-        if: ${{ inputs.build_runtime }}
-        with:
-          pattern: runtime-*
-          path: runtimes
-          merge-multiple: true
+      - name: Tools (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: brew install bash
 
-      - name: Take the latest runtimes
-        if: ${{ !inputs.build_runtime }}
-        shell: bash
+      # Always from strata-runtime: runtime.yml (when this run called it) published there what it built, and kept the
+      # runtimes that were already up to date.
+      - name: Take the runtimes
         run: |
-          gh release download strata-runtime --repo "${{ github.repository }}" --dir runtimes \
-            --pattern 'strata-runtime-linux-x86_64.tar.gz' --pattern 'strata-runtime-hip-linux-x86_64.tar.gz' \
+          patterns=()
+          for asset in $RUNTIMES; do patterns+=(--pattern "$asset"); done
+          gh release download strata-runtime --repo "$GITHUB_REPOSITORY" --dir runtimes "${patterns[@]}" \
             || { echo 'no runtimes in the strata-runtime release: run "Build Strata runtime" first, or this one with build_runtime' >&2; exit 1; }
+          for asset in $RUNTIMES; do
+            [[ -f "runtimes/$asset" ]] || { echo "strata-runtime has no $asset: build it with \"Build Strata runtime\"" >&2; exit 1; }
+            echo "$asset: $(tar -xzOf "runtimes/$asset" runtime/RUNTIME.json | tr -d '\n ')"
+          done
         env:
           GH_TOKEN: ${{ github.token }}
-
-      - name: Runtimes in this release
-        shell: bash
-        run: |
-          for archive in runtimes/*.tar.gz; do
-            echo "$(basename "$archive"): $(tar -xzOf "$archive" runtime/RUNTIME.json | tr -d '\n ')"
-          done
+          RUNTIMES: ${{ matrix.runtimes }}
 
       - name: Build and package
-        id: package
-        shell: bash
         run: |
-          ./scripts/package.sh --platform linux-x86_64 --version "${{ inputs.version }}" \
+          set -- $RUNTIMES
+          export STRATA_RUNTIME_ARCHIVE="runtimes/$1"
+          if [[ -n "${2:-}" ]]; then export STRATA_RUNTIME_HIP_ARCHIVE="runtimes/$2"; fi
+          ./scripts/package.sh --platform "${{ matrix.platform }}" --version "${{ inputs.version }}" \
             --repository "${{ github.repository }}" | tee package.txt
           mkdir -p release
-          cp "$(sed -n 's/^artifact=//p' package.txt)" \
-             "$(sed -n 's/^public_manifest=//p' package.txt)" \
-             runtimes/strata-runtime-linux-x86_64.tar.gz \
-             runtimes/strata-runtime-hip-linux-x86_64.tar.gz release/
+          cp "$(sed -n 's/^artifact=//p' package.txt)" "$(sed -n 's/^public_manifest=//p' package.txt)" release/
+          for asset in $RUNTIMES; do cp "runtimes/$asset" release/; done
         env:
-          STRATA_RUNTIME_ARCHIVE: runtimes/strata-runtime-linux-x86_64.tar.gz
-          STRATA_RUNTIME_HIP_ARCHIVE: runtimes/strata-runtime-hip-linux-x86_64.tar.gz
+          RUNTIMES: ${{ matrix.runtimes }}
 
       - name: Test
-        shell: bash
         run: cargo test --locked
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Release v${{ inputs.version }}
+    needs: package
+    # every selected platform must have packaged: a release never goes out with some of them missing
+    if: ${{ !cancelled() && needs.package.result == 'success' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ inputs.version }}
@@ -103,20 +207,23 @@ jobs:
           files: release/*
 
   license-server:
-    name: License server v${{ inputs.version }}
-    needs: package
+    name: License server ${{ matrix.platform }} v${{ inputs.version }}
+    needs: [plan, release]
     # Prereleases never reach the license server.
-    # (the runtimes job may be skipped: only the package's result counts)
-    if: ${{ !cancelled() && needs.package.result == 'success' && !inputs.prerelease }}
+    if: ${{ !cancelled() && needs.release.result == 'success' && !inputs.prerelease }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       # Downloads the release back, checks the library against the manifest published with it and only then uploads it.
-      - name: Publish linux-x86_64 to the license server
+      - name: Publish ${{ matrix.platform }} to the license server
         shell: bash
-        run: ./scripts/publish-to-license-server.sh --version "v${{ inputs.version }}" --reason "release v${{ inputs.version }}"
+        run: ./scripts/publish-to-license-server.sh --version "v${{ inputs.version }}" --platform "${{ matrix.platform }}" --reason "release v${{ inputs.version }}"
         env:
           GH_TOKEN: ${{ github.token }}
           POM_RELEASE_TOKEN: ${{ secrets.POM_RELEASE_TOKEN }}

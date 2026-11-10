@@ -236,6 +236,53 @@ pub fn shards_of(first: &Path) -> Result<Vec<PathBuf>, String> {
         .collect()
 }
 
+/// Some DeepSeek sets declare six split files, but keep the sixth (the Engram
+/// table) as a separately named file beside the quant folder. Only accept it
+/// when all five model parts and the table itself are present. Other missing
+/// model parts remain an error.
+fn deepseek_external_engram(first: &Path, header: &Header) -> Option<(Vec<PathBuf>, PathBuf)> {
+    if header.architecture.as_deref() != Some(DEEPSEEK41_ARCHITECTURE) {
+        return None;
+    }
+    let (stem, index, count) = split_name(first)?;
+    if index != 1 || count < 2 || header.split_count != Some(u64::from(count)) {
+        return None;
+    }
+    let directory = first.parent()?;
+    let width = first
+        .file_name()?
+        .to_str()?
+        .rsplit_once("-of-")?
+        .1
+        .trim_end_matches(".gguf")
+        .len();
+    let shards: Vec<_> = (1..count)
+        .map(|part| directory.join(format!("{stem}-{part:0width$}-of-{count:0width$}.gguf")))
+        .collect();
+    if shards.iter().any(|path| !path.is_file()) {
+        return None;
+    }
+    for folder in [Some(directory), directory.parent()].into_iter().flatten() {
+        let table = folder.join("DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf");
+        if let Ok(table_header) = read_header(&table) {
+            let named_engram = matches!(
+                table_header.architecture.as_deref(),
+                Some("deepseek41-engram" | "engram")
+            ) && table_header.tensors.iter().any(|name| name == PLE_TENSOR);
+            // Converted ISTA-DAS Engram files have no architecture: identify
+            // the last shard by its split metadata and only tensor instead.
+            let converted_engram = table_header.architecture.is_none()
+                && table_header.split_count == Some(u64::from(count))
+                && table_header.split_no == Some(u64::from(count - 1))
+                && table_header.tensors == [PLE_TENSOR];
+            if named_engram || converted_engram {
+                return Some((shards, table));
+            }
+        }
+    }
+    None
+}
+
 /// The layers a POM slice holds of the whole model, which Strata runs as one
 /// stage of a split across machines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,15 +312,25 @@ pub struct Model {
     /// The shard that holds the n-gram table, when there is one.
     pub ple_shard: Option<PathBuf>,
     pub layers: u64,
-    /// Set for a POM slice: the layers it holds.
+    /// Set for a POM slice: the layers it holds. Also set for a range of the
+    /// whole model the POM asked for (`range`).
     pub stage: Option<Stage>,
+    /// `stage` is a range cut from this whole model at run time
+    /// (`--stage-layers`), not a slice file.
+    pub range: bool,
 }
 
 /// Checks that `first` is a model (or a POM slice of one) Strata can run and
 /// finds its shards.
 pub fn inspect(first: &Path) -> Result<Model, String> {
-    let shards = shards_of(first)?;
     let header = read_header(first).map_err(|error| format!("{}: {error}", first.display()))?;
+    let (shards, external_engram) = match shards_of(first) {
+        Ok(shards) => (shards, None),
+        Err(error) => match deepseek_external_engram(first, &header) {
+            Some((shards, table)) => (shards, Some(table)),
+            None => return Err(error),
+        },
+    };
     let architecture = match header.architecture.as_deref() {
         Some(arch) if ARCHITECTURES.contains(&arch) => arch.to_owned(),
         Some(other) => {
@@ -312,7 +369,7 @@ pub fn inspect(first: &Path) -> Result<Model, String> {
         .map(|stage| stage.total)
         .or(header.block_count)
         .ok_or("the model declares no layer count")?;
-    let mut ple_shard = None;
+    let mut ple_shard = external_engram;
     for shard in &shards {
         let tensors = if shard == first {
             header.tensors.clone()
@@ -332,6 +389,7 @@ pub fn inspect(first: &Path) -> Result<Model, String> {
         ple_shard,
         layers,
         stage,
+        range: false,
     })
 }
 
@@ -346,17 +404,23 @@ mod tests {
     }
 
     pub fn write_model(path: &Path, arch: &str, extra: &[(&str, u32)], tensors: &[&str]) {
+        write_gguf(path, Some(arch), extra, tensors);
+    }
+
+    fn write_gguf(path: &Path, arch: Option<&str>, extra: &[(&str, u32)], tensors: &[&str]) {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&3u32.to_le_bytes());
         out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-        out.extend_from_slice(&((2 + extra.len()) as u64).to_le_bytes());
-        string(&mut out, "general.architecture");
-        out.extend_from_slice(&8u32.to_le_bytes());
-        string(&mut out, arch);
-        string(&mut out, &format!("{arch}.block_count"));
-        out.extend_from_slice(&4u32.to_le_bytes());
-        out.extend_from_slice(&48u32.to_le_bytes());
+        out.extend_from_slice(&((arch.is_some() as usize * 2 + extra.len()) as u64).to_le_bytes());
+        if let Some(arch) = arch {
+            string(&mut out, "general.architecture");
+            out.extend_from_slice(&8u32.to_le_bytes());
+            string(&mut out, arch);
+            string(&mut out, &format!("{arch}.block_count"));
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&48u32.to_le_bytes());
+        }
         for (key, value) in extra {
             string(&mut out, key);
             out.extend_from_slice(&4u32.to_le_bytes());
@@ -457,6 +521,47 @@ mod tests {
         );
         let stage = inspect(&slice).unwrap().stage.unwrap();
         assert!(stage.last() && !stage.first());
+    }
+
+    #[test]
+    fn deepseek_coder_uses_its_separate_engram_last_shard() {
+        let dir = temp_dir("deepseek-coder");
+        let quant = dir.join("IQ2_XXS");
+        std::fs::create_dir(&quant).unwrap();
+        let first = quant.join("Coder-00001-of-00006.gguf");
+        for index in 1..=5 {
+            let shard = quant.join(format!("Coder-{index:05}-of-00006.gguf"));
+            write_model(&shard, "deepseek41", &[("split.count", 6)], &[]);
+        }
+        // Without the separate Engram, the set is incomplete; a sixth shard
+        // or an unrelated file must not silently stand in for it.
+        assert!(inspect(&first).unwrap_err().contains("missing model part"));
+        let table = dir.join("DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf");
+        write_model(&table, "llama", &[], &[PLE_TENSOR]);
+        assert!(inspect(&first).unwrap_err().contains("missing model part"));
+        write_model(&table, "deepseek41-engram", &[], &[PLE_TENSOR]);
+        let model = inspect(&first).unwrap();
+        assert_eq!(model.shards.len(), 5);
+        assert_eq!(model.ple_shard.as_deref(), Some(table.as_path()));
+        write_gguf(
+            &table,
+            None,
+            &[("split.count", 6), ("split.no", 5)],
+            &[PLE_TENSOR],
+        );
+        assert_eq!(
+            inspect(&first).unwrap().ple_shard.as_deref(),
+            Some(table.as_path())
+        );
+        write_gguf(
+            &table,
+            None,
+            &[("split.count", 6), ("split.no", 4)],
+            &[PLE_TENSOR],
+        );
+        assert!(inspect(&first).unwrap_err().contains("missing model part"));
+        std::fs::remove_file(quant.join("Coder-00004-of-00006.gguf")).unwrap();
+        assert!(inspect(&first).unwrap_err().contains("missing model part"));
     }
 
     #[test]

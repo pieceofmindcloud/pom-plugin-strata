@@ -473,6 +473,59 @@ class SessionSaveSetting(unittest.TestCase):
         self.assertEqual(self.run_with(cfg), cfg)
         self.assertFalse(B.SESSIONS_ON)
 
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_deepseek41_takes_the_vram_reserve_as_reserve_mib(self):
+        written = self.run_with({"model": "m", "arch": "deepseek41", "args": ["--pack", "p"],
+                                 "pom_settings": {"vram_reserve_mib": 500}})
+        self.assertNotIn("--vram-reserve-mib", written["args"])     # strata-dsv41 refuses it: unknown option
+        self.assertEqual(written["args"][written["args"].index("--reserve-mib") + 1], "500")
+        # Strata's rules keep the value in user_args too, which the server merges over args at every start: the merge
+        # must not bring the Qwen name back
+        merged = S.user_args.merge(written["args"], written.get("user_args") or [])
+        self.assertNotIn("--vram-reserve-mib", merged)
+        self.assertEqual(merged[merged.index("--reserve-mib") + 1], "500")
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_other_engines_keep_vram_reserve_mib(self):
+        written = self.run_with({"model": "m", "args": ["--pack", "p"], "pom_settings": {"vram_reserve_mib": 500}})
+        self.assertEqual(written["args"][written["args"].index("--vram-reserve-mib") + 1], "500")
+        self.assertNotIn("--reserve-mib", written["args"])
+
+
+class ClientConversation(unittest.TestCase):
+    """A request with tools: the POM forwards the conversation as its client sent it, and the engine's own template
+    renders the tools (DeepSeek-V4.1 looped on the Qwen form the flattened prompt teaches)."""
+
+    svc = types.SimpleNamespace(anthropic_think_unasked=True)
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_without_one_the_flattened_prompt_is_the_turn(self):
+        self.assertIsNone(B.client_conversation(self.svc, {"prompt": "User: oi"}))
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_an_openai_conversation_gives_its_messages_and_tools(self):
+        messages, tools, _ = B.client_conversation(self.svc, {"chat": {"api": "openai", "request": {
+            "messages": [{"role": "user", "content": "write a file"}],
+            "tools": [{"type": "function", "function": {"name": "write", "description": "writes",
+                                                        "parameters": {"type": "object"}}}]}}})
+        self.assertEqual(messages[-1]["role"], "user")
+        self.assertTrue(tools and "write" in json.dumps(tools))
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_an_anthropic_conversation_gives_its_system_and_tools(self):
+        messages, tools, _ = B.client_conversation(self.svc, {"chat": {"api": "anthropic", "request": {
+            "system": "be brief",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "write a file"}]}],
+            "tools": [{"name": "write", "description": "writes", "input_schema": {"type": "object"}}]}}})
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertTrue(tools and "write" in json.dumps(tools))
+
+    @unittest.skipIf(B is None, "needs the Strata checkout on PYTHONPATH")
+    def test_a_malformed_one_is_refused(self):
+        for chat in ({"api": "other", "request": {}}, {"api": "openai"}, "x"):
+            with self.assertRaises(ValueError):
+                B.client_conversation(self.svc, {"chat": chat})
+
 
 if __name__ == "__main__":
     unittest.main()
