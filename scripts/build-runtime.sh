@@ -156,15 +156,16 @@ elif ((hip && native)); then
   asset_name=strata-runtime-hip-linux-x86_64.tar.gz
 elif ((hip)); then
   image="pom-plugin-strata-runtime:rocm${rocm_version}"
-  docker build --quiet --build-arg ROCM_VERSION="$rocm_version" \
-    -f "$root/docker/runtime-hip.Dockerfile" -t "$image" "$root" >/dev/null
+  # the image's build is shown: a failed apt step said nothing but its exit code when it was quiet
+  docker build --progress=plain --build-arg ROCM_VERSION="$rocm_version" \
+    -f "$root/docker/runtime-hip.Dockerfile" -t "$image" "$root"
   runtime_dir=runtime-hip
   asset_name=strata-runtime-hip-linux-x86_64.tar.gz
   arch_env=(-e HIP_ARCHITECTURES="$hip_archs")
 else
   image="pom-plugin-strata-runtime:cuda${cuda_version}"
-  docker build --quiet --build-arg CUDA_VERSION="$cuda_version" \
-    -f "$root/docker/runtime.Dockerfile" -t "$image" "$root" >/dev/null
+  docker build --progress=plain --build-arg CUDA_VERSION="$cuda_version" \
+    -f "$root/docker/runtime.Dockerfile" -t "$image" "$root"
   runtime_dir=runtime
   asset_name=strata-runtime-linux-x86_64.tar.gz
   arch_env=(-e CUDA_ARCHITECTURES="$archs")
