@@ -133,23 +133,29 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) host_os=windows ;;
   *) host_os=linux ;;
 esac
-# On a CI runner the resolver Docker hands an image build failed to resolve archive.ubuntu.com and
-# security.ubuntu.com (apt exit 100) while the NVIDIA repository resolved. The host resolves the Ubuntu hosts and
-# the build gets their addresses (--add-host); a host that cannot resolve them either sends the sources to the
-# Azure mirror the GitHub runners use (UBUNTU_MIRROR overrides).
+# On the CI runner no ubuntu.com name resolved (archive, security, even the Azure mirror; the NVIDIA repository
+# did): apt stopped with exit 100. When archive.ubuntu.com does not resolve here, the Ubuntu sources of the image
+# go to the first official mirror that does (UBUNTU_MIRROR overrides), and the resolved Ubuntu hosts are handed to
+# the build (--add-host), whose resolver can differ from the host's.
 docker_build_args=(--progress=plain)
-if [[ -z "${UBUNTU_MIRROR:-}" ]] && ! getent ahostsv4 archive.ubuntu.com >/dev/null 2>&1 \
-  && getent ahostsv4 azure.archive.ubuntu.com >/dev/null 2>&1; then
-  UBUNTU_MIRROR=http://azure.archive.ubuntu.com/ubuntu
+resolves() { [[ -n "$( (getent ahostsv4 "$1" 2>/dev/null || true) | awk 'NR == 1 { print $1 }')" ]]; }
+if [[ -z "${UBUNTU_MIRROR:-}" ]] && ! resolves archive.ubuntu.com; then
+  for mirror in http://azure.archive.ubuntu.com/ubuntu http://mirrors.edge.kernel.org/ubuntu \
+    http://mirror.math.princeton.edu/pub/ubuntu; do
+    host="${mirror#http://}"
+    if resolves "${host%%/*}"; then
+      UBUNTU_MIRROR="$mirror"
+      break
+    fi
+  done
 fi
 if [[ -n "${UBUNTU_MIRROR:-}" ]]; then
-  echo "build-runtime: Ubuntu packages from $UBUNTU_MIRROR"
+  echo "build-runtime: archive.ubuntu.com does not resolve here: Ubuntu packages from $UBUNTU_MIRROR"
   docker_build_args+=(--build-arg "UBUNTU_MIRROR=$UBUNTU_MIRROR")
 fi
-for apt_host in archive.ubuntu.com security.ubuntu.com azure.archive.ubuntu.com; do
+for apt_host in archive.ubuntu.com security.ubuntu.com; do
   # (getent exits 2 for a name it cannot resolve: not fatal here)
   apt_ip="$( (getent ahostsv4 "$apt_host" 2>/dev/null || true) | awk 'NR == 1 { print $1 }')"
-  echo "build-runtime: $apt_host -> ${apt_ip:-unresolved}"
   [[ -z "$apt_ip" ]] || docker_build_args+=(--add-host "$apt_host:$apt_ip")
 done
 if [[ "$host_os" != linux ]]; then
