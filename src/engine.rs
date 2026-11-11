@@ -1194,8 +1194,9 @@ impl Manager {
             );
         }
         if model.architecture == gguf::QWEN36_ARCHITECTURE && model.range {
-            // A stage of a split Qwen3.6: strata-q36 cuts it from the whole file (--stage-layers), one session and no
-            // MTP drafts (the drafts need the whole model's hidden state on one machine).
+            // A stage of a split Qwen3.6: strata-q36 cuts it from the whole file (--stage-layers), one session; the
+            // last stage drafts from the file's MTP block (two per step, as the whole model), its verify windows
+            // going through the earlier stage.
             let Some(stage) = model.stage else {
                 return self.fail("a Qwen3.6 range without its layers".into());
             };
@@ -1219,6 +1220,7 @@ impl Manager {
             };
             args.push("--stage-prev".into());
             args.push(format!("127.0.0.1:{prev}"));
+            args.extend(["--mtp", "2"].map(str::to_owned));
             return self.start_server(
                 runtime,
                 request,
