@@ -8,7 +8,10 @@ ARG ROCM_VERSION=7.2.4
 FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}-complete
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# A CI runner's mirror sometimes drops a download (exit 100 with no other change): apt retries each file, and a
+# failed update is tried again once before the build gives up.
+RUN echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries
+RUN (apt-get update || (sleep 30 && apt-get update)) && apt-get install -y --no-install-recommends \
       build-essential \
       ca-certificates \
       ccache \
