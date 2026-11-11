@@ -2132,12 +2132,12 @@ mod tests {
         assert!(apply_range(&mut slice, 0, 23).is_err());
 
         let request = LoadRequest::from_json(&json!({
-            "model_path": "/m/x.gguf", "range": {"start_layer": 0, "end_layer": 23}
+            "model_path": abs("/m/x.gguf"), "range": {"start_layer": 0, "end_layer": 23}
         }))
         .unwrap();
         assert_eq!(request.range, Some((0, 23)));
         assert!(LoadRequest::from_json(&json!({
-            "model_path": "/m/x.gguf", "range": {"start_layer": 9, "end_layer": 3}
+            "model_path": abs("/m/x.gguf"), "range": {"start_layer": 9, "end_layer": 3}
         }))
         .is_err());
     }
