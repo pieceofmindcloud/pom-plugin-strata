@@ -133,6 +133,23 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) host_os=windows ;;
   *) host_os=linux ;;
 esac
+# On a CI runner the resolver Docker hands an image build failed to resolve archive.ubuntu.com and
+# security.ubuntu.com (apt exit 100) while the NVIDIA repository resolved. The host resolves the Ubuntu hosts and
+# the build gets their addresses (--add-host); a host that cannot resolve them either sends the sources to the
+# Azure mirror the GitHub runners use (UBUNTU_MIRROR overrides).
+docker_build_args=(--progress=plain)
+if [[ -z "${UBUNTU_MIRROR:-}" ]] && ! getent ahostsv4 archive.ubuntu.com >/dev/null 2>&1 \
+  && getent ahostsv4 azure.archive.ubuntu.com >/dev/null 2>&1; then
+  UBUNTU_MIRROR=http://azure.archive.ubuntu.com/ubuntu
+fi
+if [[ -n "${UBUNTU_MIRROR:-}" ]]; then
+  echo "build-runtime: Ubuntu packages from $UBUNTU_MIRROR"
+  docker_build_args+=(--build-arg "UBUNTU_MIRROR=$UBUNTU_MIRROR")
+fi
+for apt_host in archive.ubuntu.com security.ubuntu.com azure.archive.ubuntu.com; do
+  apt_ip="$(getent ahostsv4 "$apt_host" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+  [[ -z "$apt_ip" ]] || docker_build_args+=(--add-host "$apt_host:$apt_ip")
+done
 if [[ "$host_os" != linux ]]; then
   ((hip == 0)) || { echo 'build-runtime: --hip builds on Linux only' >&2; exit 2; }
   runtime_dir=runtime
@@ -156,15 +173,14 @@ elif ((hip && native)); then
   asset_name=strata-runtime-hip-linux-x86_64.tar.gz
 elif ((hip)); then
   image="pom-plugin-strata-runtime:rocm${rocm_version}"
-  # the image's build is shown: a failed apt step said nothing but its exit code when it was quiet
-  docker build --progress=plain --build-arg ROCM_VERSION="$rocm_version" \
+  docker build "${docker_build_args[@]}" --build-arg ROCM_VERSION="$rocm_version" \
     -f "$root/docker/runtime-hip.Dockerfile" -t "$image" "$root"
   runtime_dir=runtime-hip
   asset_name=strata-runtime-hip-linux-x86_64.tar.gz
   arch_env=(-e HIP_ARCHITECTURES="$hip_archs")
 else
   image="pom-plugin-strata-runtime:cuda${cuda_version}"
-  docker build --progress=plain --build-arg CUDA_VERSION="$cuda_version" \
+  docker build "${docker_build_args[@]}" --build-arg CUDA_VERSION="$cuda_version" \
     -f "$root/docker/runtime.Dockerfile" -t "$image" "$root"
   runtime_dir=runtime
   asset_name=strata-runtime-linux-x86_64.tar.gz
