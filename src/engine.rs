@@ -464,7 +464,8 @@ impl Snapshot {
             // The architectures whose stage it can also cut from the whole model (`range` in `engine.load`): the
             // machine keeps the whole file, no slice is written - Flash-Next with Strata's --stage-layers, DeepSeek-V4.1
             // with a pack of the range's layers read in place (range_pack_dir).
-            "stage_ranges": [gguf::STRATA_ARCHITECTURE, gguf::DEEPSEEK41_ARCHITECTURE],
+            // Qwen3.6 (strata-q36) cuts its stage from the whole file too (--stage-layers), one session, no drafts.
+            "stage_ranges": [gguf::STRATA_ARCHITECTURE, gguf::DEEPSEEK41_ARCHITECTURE, gguf::QWEN36_ARCHITECTURE],
             // Where the POM offers a drafter file to choose: the other families' drafts are the engine's own.
             "draft_architectures": [gguf::DEEPSEEK41_ARCHITECTURE],
             // The POM settings that apply to those stages (the nodes carry the hidden state between them), and the
@@ -1192,6 +1193,41 @@ impl Manager {
                 Some(gguf::DEEPSEEK41_ARCHITECTURE),
             );
         }
+        if model.architecture == gguf::QWEN36_ARCHITECTURE && model.range {
+            // A stage of a split Qwen3.6: strata-q36 cuts it from the whole file (--stage-layers), one session and no
+            // MTP drafts (the drafts need the whole model's hidden state on one machine).
+            let Some(stage) = model.stage else {
+                return self.fail("a Qwen3.6 range without its layers".into());
+            };
+            let mut args: Vec<String> = vec![
+                "--native".into(),
+                request.model_path.display().to_string(),
+                "--stage-layers".into(),
+                format!("{}-{}", stage.start, stage.end),
+                "--max-context".into(),
+                request.context.to_string(),
+                "--prefill".into(),
+                "auto".into(),
+            ];
+            if !stage.last() {
+                return self.serve_stage(runtime, request, args, port, "engine/strata");
+            }
+            let Some(prev) = request.link.as_ref().and_then(|link| link.prev_port) else {
+                return self.fail(
+                    "the last stage of a split Qwen3.6 has no link to the earlier stage".into(),
+                );
+            };
+            args.push("--stage-prev".into());
+            args.push(format!("127.0.0.1:{prev}"));
+            return self.start_server(
+                runtime,
+                request,
+                args,
+                pack,
+                port,
+                Some(gguf::QWEN36_ARCHITECTURE),
+            );
+        }
         if model.architecture == gguf::QWEN36_ARCHITECTURE {
             // Strata's setup starts it so (install_own_path): the GGUF as it is, the experts that fit in VRAM and
             // the rest on the CPU, two drafts per step from the file's MTP block.
@@ -1707,9 +1743,11 @@ fn apply_range(model: &mut gguf::Model, start: u64, end: u64) -> Result<(), Stri
     }
     if model.architecture != gguf::STRATA_ARCHITECTURE
         && model.architecture != gguf::DEEPSEEK41_ARCHITECTURE
+        && model.architecture != gguf::QWEN36_ARCHITECTURE
     {
         return Err(
-            "Strata splits only Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash across machines".into(),
+            "Strata splits only Qwen3.8-Flash-Next, Qwen3.6-35B-A3B and DeepSeek-V4.1-Flash across machines"
+                .into(),
         );
     }
     if start > end || end >= model.layers {
@@ -2040,6 +2078,10 @@ mod tests {
             snapshot.service()["stage_ranges"][1],
             gguf::DEEPSEEK41_ARCHITECTURE
         );
+        assert_eq!(
+            snapshot.service()["stage_ranges"][2],
+            gguf::QWEN36_ARCHITECTURE
+        );
         assert_eq!(snapshot.service()["vision"], true);
         assert_eq!(snapshot.service()["pom_settings"][1], "hidden_state_dtype");
         snapshot.port = None;
@@ -2107,7 +2149,11 @@ mod tests {
         );
 
         assert!(apply_range(&mut whole(gguf::STRATA_ARCHITECTURE), 40, 48).is_err());
-        assert!(apply_range(&mut whole(gguf::QWEN36_ARCHITECTURE), 0, 23).is_err());
+        // Qwen3.6 splits too (strata-q36 --stage-layers); its 48 layers bound the range like any other.
+        let mut qwen36 = whole(gguf::QWEN36_ARCHITECTURE);
+        apply_range(&mut qwen36, 0, 23).unwrap();
+        assert!(qwen36.range && qwen36.stage.unwrap().first() && !qwen36.stage.unwrap().last());
+        assert!(apply_range(&mut whole(gguf::QWEN36_ARCHITECTURE), 30, 48).is_err());
         let mut deepseek = whole(gguf::DEEPSEEK41_ARCHITECTURE);
         apply_range(&mut deepseek, 14, 19).unwrap();
         assert!(
