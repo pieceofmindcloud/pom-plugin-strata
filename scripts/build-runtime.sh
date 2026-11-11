@@ -147,7 +147,9 @@ if [[ -n "${UBUNTU_MIRROR:-}" ]]; then
   docker_build_args+=(--build-arg "UBUNTU_MIRROR=$UBUNTU_MIRROR")
 fi
 for apt_host in archive.ubuntu.com security.ubuntu.com azure.archive.ubuntu.com; do
-  apt_ip="$(getent ahostsv4 "$apt_host" 2>/dev/null | awk 'NR == 1 { print $1 }')"
+  # (getent exits 2 for a name it cannot resolve: not fatal here)
+  apt_ip="$( (getent ahostsv4 "$apt_host" 2>/dev/null || true) | awk 'NR == 1 { print $1 }')"
+  echo "build-runtime: $apt_host -> ${apt_ip:-unresolved}"
   [[ -z "$apt_ip" ]] || docker_build_args+=(--add-host "$apt_host:$apt_ip")
 done
 if [[ "$host_os" != linux ]]; then
