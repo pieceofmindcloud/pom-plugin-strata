@@ -84,6 +84,21 @@ fn all() -> Vec<Setting> {
         Setting {
             min: Some(0.0),
             ..setting(
+                "sampling.presence_penalty",
+                "number",
+                (
+                    "Default presence_penalty",
+                    "presence_penalty for requests that send none (empty: the model card's, 1.5 on Qwen without thinking). 0 lets Qwen3.6 draft with its MTP block: its engine drafts only for greedy requests without penalties.",
+                ),
+                (
+                    "presence_penalty padrão",
+                    "presence_penalty das requisições que não enviam nenhum (vazio: o do model card, 1.5 no Qwen sem raciocínio). 0 deixa o Qwen3.6 fazer rascunhos com o bloco MTP: o motor dele só faz rascunhos em requisições gulosas sem penalidades.",
+                ),
+            )
+        },
+        Setting {
+            min: Some(0.0),
+            ..setting(
                 "reasoning_budget_tokens",
                 "integer",
                 ("Thinking budget", "Caps the thinking of every request at this many tokens (empty: no cap)."),
@@ -292,11 +307,11 @@ mod tests {
     fn the_schema_names_every_key_once_with_both_languages() {
         let schema = schema();
         let entries = schema.as_array().unwrap();
-        assert_eq!(entries.len(), 20);
+        assert_eq!(entries.len(), 21);
         let mut keys: Vec<&str> = entries.iter().map(|e| e["key"].as_str().unwrap()).collect();
         keys.sort();
         keys.dedup();
-        assert_eq!(keys.len(), 20);
+        assert_eq!(keys.len(), 21);
         for entry in entries {
             assert!(entry["label"]["en"].is_string() && entry["label"]["pt-BR"].is_string());
         }
@@ -313,9 +328,10 @@ mod tests {
     #[test]
     fn only_published_keys_are_kept() {
         let kept = select(
-            &json!({"sampling.top_k": 20, "open_browser": true, "host": "0.0.0.0", "lazy_load": null}),
+            &json!({"sampling.top_k": 20, "sampling.presence_penalty": 0, "open_browser": true, "host": "0.0.0.0", "lazy_load": null}),
         );
-        assert_eq!(kept.len(), 1);
+        assert_eq!(kept.len(), 2);
         assert_eq!(kept["sampling.top_k"], 20);
+        assert_eq!(kept["sampling.presence_penalty"], 0);
     }
 }
