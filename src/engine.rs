@@ -515,6 +515,17 @@ fn random_key() -> String {
 
 impl Engine {
     pub fn start(base: PathBuf) -> Self {
+        Self::start_in(base.clone(), base)
+    }
+
+    /// An audit engine (GPU work metering, `engine.audit.*`): a stage of a
+    /// model loaded for a re-execution, in its own folder `base`, with the
+    /// runtime and packs of the main engine's folder `store`.
+    pub fn start_audit(base: PathBuf, store: PathBuf) -> Self {
+        Self::start_in(base, store)
+    }
+
+    fn start_in(base: PathBuf, store: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(base.join("run"));
         let shared = Arc::new(Mutex::new(Snapshot {
             phase: Phase::Idle,
@@ -538,7 +549,7 @@ impl Engine {
         let thread_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("pom-plugin-strata-engine".into())
-            .spawn(move || Manager::new(base, thread_shared, receiver).run())
+            .spawn(move || Manager::new(base, store, thread_shared, receiver).run())
             .expect("start the engine manager");
         Self {
             shared,
@@ -723,6 +734,10 @@ enum Work {
 
 struct Manager {
     base: PathBuf,
+    /// Where the runtime, the packs and the drafters live: `base`, except for
+    /// an audit engine, which works in its own folder but shares the main
+    /// engine's (`Engine::start_audit`).
+    store: PathBuf,
     shared: Arc<Mutex<Snapshot>>,
     commands: Receiver<Command_>,
     work: Work,
@@ -732,9 +747,15 @@ struct Manager {
 }
 
 impl Manager {
-    fn new(base: PathBuf, shared: Arc<Mutex<Snapshot>>, commands: Receiver<Command_>) -> Self {
+    fn new(
+        base: PathBuf,
+        store: PathBuf,
+        shared: Arc<Mutex<Snapshot>>,
+        commands: Receiver<Command_>,
+    ) -> Self {
         Self {
             base,
+            store,
             shared,
             commands,
             work: Work::None,
@@ -772,12 +793,12 @@ impl Manager {
     fn find_runtime(&mut self) {
         // the HIP runtime is looked for, never downloaded, here: a load on AMD cards installs it (load)
         let hip = runtime::local_runtime(runtime::Backend::Hip).or_else(|| {
-            runtime::installed_dir(&self.base, runtime::Backend::Hip)
+            runtime::installed_dir(&self.store, runtime::Backend::Hip)
                 .filter(|dir| runtime::is_runtime(dir))
         });
         self.update(|snapshot| snapshot.runtime_hip = hip);
         let cuda = runtime::local_runtime(runtime::Backend::Main).or_else(|| {
-            runtime::installed_dir(&self.base, runtime::Backend::Main)
+            runtime::installed_dir(&self.store, runtime::Backend::Main)
                 .filter(|dir| runtime::is_runtime(dir))
         });
         if let Some(dir) = cuda {
@@ -804,7 +825,7 @@ impl Manager {
     /// Downloads the pinned runtime of `backend` on a thread (poll_installer).
     fn install(&mut self, backend: runtime::Backend) {
         let (sender, receiver) = channel();
-        let base = self.base.clone();
+        let base = self.store.clone();
         let shared = Arc::clone(&self.shared);
         self.set_phase(
             Phase::Installing,
@@ -1148,11 +1169,11 @@ impl Manager {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        self.base.join("packs").join(format!("{stem}-{tag}"))
+        self.store.join("packs").join(format!("{stem}-{tag}"))
     }
 
     fn mtp_dir(&self, model: &Path) -> Option<PathBuf> {
-        let mut candidates = vec![self.base.join("mtp/rt")];
+        let mut candidates = vec![self.store.join("mtp/rt")];
         for ancestor in model.ancestors().skip(1).take(3) {
             candidates.push(ancestor.join("mtp/rt"));
         }
