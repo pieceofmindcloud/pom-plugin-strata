@@ -282,6 +282,7 @@ class DeferredSaves(unittest.TestCase):
         os.environ["POM_STRATA_SESSIONS"] = self.tmp.name
         B.slot_bases.clear()
         B.deferred_saves.clear()
+        B.decode_saves.clear()
         # no background saver here: the tests run save_deferred themselves, so each step is seen as it happens
         self.saver_started = B._saver_started
         B._saver_started = True
@@ -381,13 +382,53 @@ class DeferredSaves(unittest.TestCase):
         self.assertIn(0, B.deferred_saves)
         self.assertFalse(svc.slot_busy[0])        # the guard gave the slot back after the pick
 
-    def test_with_one_slot_the_other_conversation_waits_for_the_save(self):
+    def test_with_no_free_slot_a_waiting_conversation_takes_the_saves_slot(self):
+        # Under load the engine is never idle, so the save would only expire while another conversation waited for
+        # the slot (217 s of engine admission on a node set to prefill, which kept such a slot for 300 s).
         svc = FakeService(slots=1)
         svc.slot_held[0] = [1, 2, 3, 4]
         B.defer_save(svc, "conv", [1, 2, 3], 0, [1, 2, 3, 4])
         engine = B.batch_engine(svc)
         with engine.slot_cv:
+            self.assertEqual(engine.pick_slot([9, 9, 9]), 0)
+        self.assertEqual(B.deferred_saves, {})
+        self.assertEqual(svc.engine.calls, [])
+
+    def test_the_oldest_save_gives_its_slot_up_first(self):
+        svc = FakeService(slots=2)
+        svc.slot_held[0] = [1, 2, 3, 4]
+        svc.slot_held[1] = [5, 6, 7, 8]
+        B.defer_save(svc, "old", [1, 2, 3], 0, [1, 2, 3, 4])
+        B.defer_save(svc, "new", [5, 6, 7], 1, [5, 6, 7, 8])
+        B.deferred_saves[0] = B.deferred_saves[0][:3] + (B.deferred_saves[1][3] - 5,)
+        engine = B.batch_engine(svc)
+        with engine.slot_cv:
+            self.assertEqual(engine.pick_slot([9, 9, 9]), 0)
+        self.assertEqual(list(B.deferred_saves), [1])
+        self.assertEqual(svc.slot_busy, [False, False])
+
+    def test_a_save_a_decode_machine_waits_for_keeps_its_slot(self):
+        svc = FakeService(slots=1)
+        svc.slot_held[0] = [1, 2, 3, 4]
+        B.defer_save(svc, "conv", [1, 2, 3], 0, [1, 2, 3, 4], for_decode=True)
+        engine = B.batch_engine(svc)
+        with engine.slot_cv:
             self.assertIsNone(engine.pick_slot([9, 9, 9]))
+        self.assertIn(0, B.deferred_saves)
+        self.assertFalse(svc.slot_busy[0])
+
+    def test_only_a_save_for_a_decode_machine_waits_past_the_short_limit(self):
+        svc = FakeService(slots=2)
+        svc.slot_busy[1] = True                    # the engine is busy: no save can be written
+        B.defer_save(svc, "turn", [1], 0, [1, 2])
+        B.defer_save(svc, "prefill", [3], 1, [3, 4], for_decode=True)
+        past = time.monotonic() - B.DEFER_MAX_S - 1
+        for slot in (0, 1):
+            B.deferred_saves[slot] = B.deferred_saves[slot][:3] + (past,)
+        with mock.patch.object(B, "ROLE", "prefill"):
+            self.assertFalse(B.save_deferred(svc))
+        self.assertEqual(list(B.deferred_saves), [1])
+        self.assertEqual(B.decode_saves, {1})
 
     def test_the_conversations_own_next_turn_takes_its_slot_and_supersedes_the_save(self):
         svc = FakeService(slots=1)
@@ -398,6 +439,27 @@ class DeferredSaves(unittest.TestCase):
             self.assertEqual(engine.pick_slot([1, 2, 3, 4, 5]), 0)
         self.assertEqual(B.deferred_saves, {})
         self.assertEqual(svc.engine.calls, [])
+
+    def test_a_turn_is_queued_only_when_no_slot_is_free_for_it(self):
+        svc = FakeService(slots=2)
+        with mock.patch.object(B, "in_flight_count", return_value=1):
+            self.assertIsNone(B.admission_queue(svc))
+            svc.slot_busy[0] = True
+            self.assertIsNone(B.admission_queue(svc))
+            svc.slot_busy[1] = True
+            self.assertEqual(B.admission_queue(svc), {"slots": 2, "busy": 2, "kept": 0, "ahead": 0})
+
+    def test_a_slot_kept_for_a_decode_machine_and_the_turns_ahead_count(self):
+        svc = FakeService(slots=2)
+        B.defer_save(svc, "prefill", [1], 0, [1, 2], for_decode=True)
+        with mock.patch.object(B, "in_flight_count", return_value=1):
+            self.assertIsNone(B.admission_queue(svc))      # slot 1 is free
+        with mock.patch.object(B, "in_flight_count", return_value=2):
+            # another turn arrived first and takes slot 1; slot 0 waits for its save
+            self.assertEqual(B.admission_queue(svc), {"slots": 2, "busy": 0, "kept": 1, "ahead": 1})
+        B.defer_save(svc, "turn", [3], 1, [3, 4])
+        with mock.patch.object(B, "in_flight_count", return_value=1):
+            self.assertIsNone(B.admission_queue(svc))      # an ordinary save gives its slot up
 
     def test_a_conversation_is_pending_until_its_save_is_written(self):
         svc = FakeService()

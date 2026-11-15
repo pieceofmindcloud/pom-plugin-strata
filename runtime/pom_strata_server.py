@@ -110,6 +110,9 @@ SESSION_PIECE = 64 << 20
 # not written within DEFER_MAX_S is dropped: a session is a cache, and the next turn re-reads its prompt.
 deferred_saves: dict[int, tuple[str, list[int], list[int], float]] = {}
 DEFER_MAX_S = 10.0
+# the deferred saves a decode machine waits for (a prefill-only turn): they keep their slot up to PREFILL_DEFER_MAX_S,
+# even against another conversation waiting for a slot. Every other deferred save gives its slot up to a waiting turn.
+decode_saves: set[int] = set()
 _saver_started = False
 # the conversations whose deferred save is being written now (save_deferred); with deferred_saves, what
 # session_pending reports
@@ -312,11 +315,24 @@ def guard_pick(engine) -> None:
             marked.append(slot)
         try:
             slot = original(prompt)
+            if slot is None:
+                # no slot is free but some only wait for a save: a turn waiting here outranks a cache. The oldest
+                # save a decode machine does not wait for gives its slot up (the conversation's next turn re-reads
+                # its prompt or fetches it); under load the engine is never idle, so that save would only expire.
+                spare = [s for s in marked if s not in decode_saves]
+                if spare:
+                    taken = min(spare, key=lambda s: deferred_saves[s][3])
+                    engine.slot_busy[taken] = False
+                    marked.remove(taken)
+                    slot = original(prompt)
+                    if slot is not None and slot != taken:
+                        engine.slot_busy[taken] = True
+                        marked.append(taken)
         finally:
             for kept in marked:
                 engine.slot_busy[kept] = False
         if slot is not None and slot in deferred_saves:
-            key = deferred_saves.pop(slot)[0]
+            key = forget_deferred(slot)
             print(f"pom: session {key}: its slot takes the next turn, its save is superseded", file=sys.stderr,
                   flush=True)
         return slot
@@ -356,10 +372,34 @@ def keep_prefill(svc, key: str, prompt: list[int], wait_s: float = 10.0) -> bool
                       f"{wait_s:.0f} s ({state})", file=sys.stderr, flush=True)
                 return False
             engine.slot_cv.wait(min(0.1, left))
-    return defer_save(svc, key, list(prompt), slot, held)
+    return defer_save(svc, key, list(prompt), slot, held, for_decode=True)
 
 
-def defer_save(svc, key: str, prompt: list[int], slot: int, held: list[int]) -> bool:
+def admission_queue(svc) -> dict | None:
+    """Whether a turn starting now waits for a batch slot: every slot is busy or kept for a decode machine's save, or
+    the turns ahead of it take the free ones. The node's gateway reads the answer (`{"queued": ...}`) and may move a
+    turn that waits to a less busy machine before this one reads it. None: a slot is free for it (or no batch)."""
+    engine = batch_engine(svc)
+    if engine is None:
+        return None
+    with engine.slot_cv:
+        slots = len(engine.slot_busy)
+        busy = sum(1 for taken in engine.slot_busy if taken)
+        kept = sum(1 for s in decode_saves if s < slots and not engine.slot_busy[s])
+    # the turns in flight here besides this one that hold no slot yet are ahead of it
+    ahead = max(0, in_flight_count() - 1 - busy)
+    if slots - busy - kept - ahead > 0:
+        return None
+    return {"slots": slots, "busy": busy, "kept": kept, "ahead": ahead}
+
+
+def forget_deferred(slot: int) -> str:
+    """Drops the deferred save of `slot` (the caller holds slot_cv) and returns its conversation."""
+    decode_saves.discard(slot)
+    return deferred_saves.pop(slot)[0]
+
+
+def defer_save(svc, key: str, prompt: list[int], slot: int, held: list[int], for_decode: bool = False) -> bool:
     """A turn that ended in a batch slot, saved later: the slot keeps the turn (guard_pick) and save_deferred writes it
     while the engine is idle. Nothing is read or written here, so the turn returns at once. True: deferred."""
     global _saver_started
@@ -368,6 +408,10 @@ def defer_save(svc, key: str, prompt: list[int], slot: int, held: list[int]) -> 
         return False
     with engine.slot_cv:
         deferred_saves[slot] = (key, list(prompt), list(held), time.monotonic())
+        if for_decode:
+            decode_saves.add(slot)
+        else:
+            decode_saves.discard(slot)
         guard_pick(engine)
         engine.slot_cv.notify_all()
     if not _saver_started:
@@ -558,9 +602,12 @@ def save_deferred(svc) -> bool:
         return False
     with engine.slot_cv:
         now = time.monotonic()
-        limit = PREFILL_DEFER_MAX_S if ROLE == "prefill" else DEFER_MAX_S
-        for slot in [s for s, item in deferred_saves.items() if now - item[3] > limit]:
-            key = deferred_saves.pop(slot)[0]
+        # the long wait is only for a save a decode machine waits for; a turn this machine answered itself (a node
+        # that also decodes) keeps its slot no longer than any other machine's
+        limit_of = lambda s: PREFILL_DEFER_MAX_S if s in decode_saves else DEFER_MAX_S  # noqa: E731
+        for slot in [s for s, item in deferred_saves.items() if now - item[3] > limit_of(s)]:
+            limit = limit_of(slot)
+            key = forget_deferred(slot)
             print(f"pom: session {key} not saved: no idle engine within {limit:.0f} s", file=sys.stderr,
                   flush=True)
         # a request in flight (queued or generating) may already own a slot the engine has not marked busy yet, and
@@ -568,6 +615,7 @@ def save_deferred(svc) -> bool:
         if not deferred_saves or any(engine.slot_busy) or in_flight_count():
             return False
         slot = min(deferred_saves, key=lambda s: deferred_saves[s][3])
+        decode_saves.discard(slot)
         key, prompt, held, _ = deferred_saves.pop(slot)
         engine.slot_busy[slot] = True            # the save's own reservation: the slot is not picked meanwhile
         _writing.add(key)
@@ -1200,13 +1248,19 @@ def make_handler(original):
                                          "timings": {"prompt_ms": read["prompt_ms"]}}})
                     return
                 turn: dict = {}
+                if not prefill_only:
+                    queued = admission_queue(svc)
+                    if queued is not None:
+                        # before the engine takes the turn: the gateway may still move it to a free machine
+                        self._line({"queued": queued})
 
                 def turn_hook(slot, held):
                     # the engine's turn is ending in `slot`, which still holds it: its save is deferred to an idle
                     # engine (defer_save), so the turn's answer does not wait for the disk. The done line says so
                     # (`session.deferred`), and the node syncs the conversation once session_pending is false
                     turn["ran"] = True
-                    turn["deferred"] = defer_save(svc, session, list(ids), slot, held)
+                    turn["deferred"] = defer_save(svc, session, list(ids), slot, held,
+                                                  for_decode=bool(prefill_only))
                 pending_done = None
                 first_event_at = None
 
